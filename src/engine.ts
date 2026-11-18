@@ -2252,7 +2252,13 @@ export class Rotator {
     if (!seat) throw Object.assign(new Error(`Unknown account ${seatKey}`), { code: 'invalid_params' })
     return this.withLock(seat.provider, async () => {
       const from = view.active[seat.provider]
-      if (from !== seat.key) await this.selectOn(seat.provider, seat.accountId, server)
+      if (from !== seat.key) {
+        await this.selectOn(seat.provider, seat.accountId, server)
+        // A selection the user just made by hand is not changed again by advice (switch-back, a
+        // Low account, expiring quota) within the switch cooldown: half a minute later would be a
+        // flap, with Orca's restart prompt shown twice. A limit is still handled at once.
+        this.state.lastAutoSwitchAt = { ...(this.state.lastAutoSwitchAt ?? {}), [scopedKey(server, seat.provider)]: this.deps.now() }
+      }
       // Still under the lock: whatever automatic move waits behind this one sees what `chosen`
       // did (the panel's switch turns the service's automatic hand-off off) before it acts.
       await chosen?.(seat.provider)

@@ -243,6 +243,11 @@ export async function activateWith(
   orca.events.on('agent.status.changed', (payload) => rotator.onAgentStatus(payload as StatusEvent))
   // The panel lists the service of the agent in the focused workspace first.
   orca.events.on('workspace.changed', async () => {
+    // The panel's Status line switch is per workspace: tell it the state of the one in focus now.
+    await consoleLine
+      .status()
+      .then((state) => orca.panels.post('rotator.consoleLine', state))
+      .catch(() => undefined)
     if (await rotator.refreshFocus()) rotator.publishNow()
   })
 

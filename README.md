@@ -257,7 +257,11 @@ and these are ignored.
 ## UI
 
 - **Status bar:** `Claude 2/3 · 7%·18% | Codex 1/3 · 0%`. The tone turns to warning at 80 % and to
-  danger while a session is parked. Click it to move Claude to the next account.
+  danger while a session is parked. Click it to move Claude to the next account. A selection
+  made this way (or with the commands) is not changed again by advice (switch-back, a Low
+  account, expiring quota) until the switch cooldown has passed; a limit is still handled at
+  once. With switch-back on, the plugin then returns to the earlier account in your order: use
+  the panel's *Switch to this account* for a choice that stays.
 - **Panel** (gauge icon, right sidebar), laid out after Orca's own style guide (quiet and
   monochrome, colour only for state):
   - one section per service, in Orca's order except that the service of the agent in the current
@@ -267,7 +271,9 @@ and these are ignored.
     light, "n of m ready" and, when it has more than one account, that service's auto hand-off
     toggle; the Claude section also has a
     *Status line* switch that installs or removes the console status line in the focused
-    workspace (the same as the install and remove commands);
+    workspace (the same as the install and remove commands); it follows the focused workspace as
+    you change it, and where the line cannot be installed (no focused workspace, or one that is
+    not on this computer) the switch is disabled and one muted line says why;
   - each account, the one in use first, then the usable ones with the most headroom first, then
     the drained and limited ones; each with a status light (solid green in use, hollow green
     ready, amber low, red limited or drained, grey idle), its 5-hour, weekly and model windows as
@@ -283,7 +289,9 @@ and these are ignored.
     the plugin never undoes a choice you made by hand: no switch-back, no threshold or limit
     handling, until you turn *Auto hand-off* for the service on again. The block says so while it
     is off, and a desktop notification reminds you at the time. A limited standby cannot be
-    chosen until its cooldown is cleared. Otherwise the panel only
+    chosen until its cooldown is cleared. The panel then says what the switch did; if only the
+    re-read of the list afterwards fails, it says so apart from that ("Couldn't refresh the
+    list; it updates shortly."), never as a failed switch. Otherwise the panel only
     displays: other selection changes come from the plugin, the status-bar click or the commands;
   - the automatic-switching toggle and when usage was last read;
   - parked sessions;
@@ -550,7 +558,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 231 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 237 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

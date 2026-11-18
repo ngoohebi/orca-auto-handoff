@@ -37,5 +37,8 @@ declare module 'orca' {
   interface PluginPanelEvents {
     /** Posted to every open panel when anything the panel shows changes. */
     'rotator.changed': Snapshot
+    /** Posted when the focused workspace changes: the console status line state there, so the
+     *  panel's switch never shows the previous workspace's. */
+    'rotator.consoleLine': ConsoleLineState
   }
 }

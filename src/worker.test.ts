@@ -3641,3 +3641,28 @@ test('per server: a session in the middle of a turn on a paired server does not 
   assert.deepEqual(selects(w), ['select claude c2'])
   await worker.deactivate()
 })
+
+test('the next-account command (the status-bar click): switch-back does not undo it at the next tick; it waits out the switch cooldown', async () => {
+  // "Follow my order" (and the legacy drain) go back to an earlier account that is healthy. The
+  // user just left that account by hand: going back half a minute later is a flap, with Orca's
+  // restart prompt shown twice.
+  for (const settings of [{ chain: 'claude:c1,claude:c2,claude:c3' }, { switch_cooldown_minutes: 5, min_headroom_gap: 11 }] as Record<string, string | number>[]) {
+    const label = JSON.stringify(settings)
+    const w = world({ panes: [], tails: {}, claudeUsage: { session: 5, weekly: 5 }, settings })
+    const worker = await w.mount()
+    assert.match(String(await worker.command('rotator.next')), /Claude: new launches use two@example.test/, label)
+    assert.deepEqual(selects(w), ['select claude c2'], label)
+    for (let i = 0; i < 4; i++) {
+      w.advance(30_000)
+      await w.rotator.tick()
+    }
+    assert.deepEqual(selects(w), ['select claude c2'], label)
+    assert.deepEqual(notes(w), [], label)
+    // After the switch cooldown the mode's own rule applies again, and says why.
+    w.advance(4 * MIN)
+    await w.rotator.tick()
+    assert.deepEqual(selects(w), ['select claude c2', 'select claude c1'], label)
+    assert.match(lastNote(w), /one is available again/, label)
+    await worker.deactivate()
+  }
+})

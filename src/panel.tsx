@@ -67,13 +67,37 @@ async function load(refresh = false): Promise<void> {
   set(consoleLine, await readConsoleLine())
 }
 
-async function act(key: string, fn: () => Promise<string | void>): Promise<void> {
+/** How long *Yes, switch* may take. The worker answers only once the pane in the tab has moved:
+ *  it closes the pane and waits for the resumed session (over a minute at worst), and a request
+ *  gets 30 s by default, after which a switch that worked would read as failed. */
+const SWITCH_TIMEOUT_MS = 120_000
+
+/** Said after an action that worked when the list could not be read again afterwards. */
+const NOT_REFRESHED = "Couldn't refresh the list; it updates shortly."
+
+/** Runs one action and says what it did. `reload` reads the panel again afterwards: when only
+ *  that fails the action still worked, so its own result is said, with the reload problem apart
+ *  from it (the worker's next push brings the list up to date). */
+async function act(key: string, fn: () => Promise<string | void>, reload?: () => Promise<void>): Promise<void> {
   set(busy, key)
   try {
-    const text = await fn()
-    if (text) set(message, text)
-  } catch (error) {
-    set(message, `Failed: ${String((error as Error)?.message ?? error)}`)
+    let text: string | void
+    try {
+      text = await fn()
+    } catch (error) {
+      set(message, `Failed: ${String((error as Error)?.message ?? error)}`)
+      return
+    }
+    let refreshed = true
+    if (reload) {
+      try {
+        await reload()
+      } catch {
+        refreshed = false
+      }
+    }
+    if (!refreshed) set(message, `${text ? text.replace(/[.\s]+$/, '') : 'Done'}. ${NOT_REFRESHED}`)
+    else if (text) set(message, text)
   } finally {
     set(busy, null)
   }
@@ -85,6 +109,8 @@ const FOCUS_POLL_MS = 3_000
 
 export function setup(ctx: PanelContext): void {
   ctx.subscriptions.push(plugin.on('rotator.changed', (payload) => set(snapshot, payload)))
+  // The Status line switch is per workspace: the worker says when the focused one changes.
+  ctx.subscriptions.push(plugin.on('rotator.consoleLine', (payload) => set(consoleLine, payload)))
   const timer = setInterval(() => {
     void plugin
       .request('rotator.focus', {})
@@ -97,7 +123,9 @@ export function setup(ctx: PanelContext): void {
   // Never keep a Node host (the test runner) alive for the poll.
   ;(timer as unknown as { unref?: () => void }).unref?.()
   ctx.subscriptions.push({ dispose: () => clearInterval(timer) })
-  void load()
+  // The first read can race the worker's restart: the worker's next push then fills the list,
+  // and the Status line switch is still read.
+  void load().catch(async () => set(consoleLine, await readConsoleLine()))
 }
 
 // ---- wording ------------------------------------------------------------------------------
@@ -319,11 +347,11 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
                     disabled={read(busy) !== null}
                     onPress={() => {
                       set(confirming, null)
-                      void act(`switch:${seat.key}`, async () => {
-                        const { message } = await plugin.request('rotator.switchTo', { seatKey: seat.key })
-                        await load()
-                        return message
-                      })
+                      void act(
+                        `switch:${seat.key}`,
+                        async () => (await plugin.request('rotator.switchTo', { seatKey: seat.key }, { timeoutMs: SWITCH_TIMEOUT_MS })).message,
+                        () => load()
+                      )
                     }}
                   >
                     Yes, switch
@@ -370,6 +398,17 @@ function ConsoleLineRow() {
         }
       />
     </Row>
+  )
+}
+
+/** Why the Status line switch is disabled, as the worker gives it: one short muted line. */
+function ConsoleLineReason() {
+  const state = read(consoleLine)
+  if (!state || state.workspace || !state.reason) return null
+  return (
+    <Text size="xs" muted>
+      {`Status line: ${state.reason.charAt(0).toLowerCase()}${state.reason.slice(1)}`}
+    </Text>
   )
 }
 
@@ -428,6 +467,7 @@ function ServiceSection({ provider, snap, now }: { provider: Provider; snap: Sna
         </Row>
         {provider === 'claude' ? <ConsoleLineRow /> : null}
       </Row>
+      {provider === 'claude' ? <ConsoleLineReason /> : null}
       {!on && seats.length > 1 ? (
         <Callout tone="warning" title={`Automatic hand-off for ${PROVIDER_NAME[provider]} is off`}>
           Accounts are not rotated and limits are not handled. Turn Auto hand-off {PROVIDER_NAME[provider]} on to resume.

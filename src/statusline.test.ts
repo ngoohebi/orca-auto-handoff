@@ -587,6 +587,62 @@ test('worker: install and uninstall edit the focused workspace, the status file 
   }
 })
 
+test('worker: when the focused workspace changes, the panel is told the status line state of the new one', async () => {
+  const files = memoryFiles('/home/u')
+  let focused: string | null = 'w1'
+  const host = mockHost({
+    results: {
+      'agents.list': { agents: [] },
+      'workspace.list': {
+        workspaces: [
+          { id: 'w1', kind: 'worktree', name: 'app', path: '/repo', branch: 'main', hostId: 'local' },
+          { id: 'w2', kind: 'worktree', name: 'docs', path: '/docs', branch: 'main', hostId: 'local' },
+          { id: 'w3', kind: 'worktree', name: 'far', path: '/srv/far', branch: 'main', hostId: 'ssh:build-box' }
+        ],
+        truncated: false
+      },
+      'workspace.readContext': () => (focused ? { workspaceId: focused, branch: 'main', displayName: focused, terminals: [] } : null),
+      'statusBar.update': { ok: true }
+    }
+  })
+  const mod = {
+    default: async (orca: OrcaWorkerApi) => {
+      await activateWith(
+        orca,
+        {
+          cli: { listAccounts: async () => ({ claude: { accounts: [{ id: 'aaa', email: 'me@example.com' }], activeAccountId: 'aaa' }, rateLimits: {} }), select: async () => undefined, closeTerminal: async () => undefined, sendText: async () => undefined, git: async () => '' },
+          now: () => NOW,
+          sleep: async () => undefined
+        },
+        { tick: false, files }
+      )
+    }
+  }
+  const worker = await mountWorker(mod, { host })
+  try {
+    await worker.command('rotator.installStatusLine')
+    const told = () => worker.posts.filter((p) => p.event === 'rotator.consoleLine').map((p) => p.payload)
+    const move = async (to: string | null) => {
+      focused = to
+      await worker.emit('workspace.changed', { context: to ? { workspaceId: to, branch: 'main', displayName: to, terminals: [] } : null })
+    }
+    const before = told().length
+    await move('w2')
+    assert.deepEqual(told().at(-1), { installed: false, workspace: 'docs' })
+    await move('w1')
+    assert.deepEqual(told().at(-1), { installed: true, workspace: 'app' })
+    // Where it cannot be installed, the reason goes with it.
+    await move('w3')
+    assert.deepEqual(told().at(-1), { installed: false, reason: 'The focused workspace is not on this computer' })
+    await move(null)
+    assert.deepEqual(told().at(-1), { installed: false, reason: 'No focused workspace' })
+    // Once per change.
+    assert.equal(told().length, before + 4)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
 test('worker: the console status line is not installed for a workspace on another machine', async () => {
   const mount = async (workspace: Record<string, unknown>, projects?: Record<string, unknown>[]) => {
     const files = memoryFiles('/home/u')

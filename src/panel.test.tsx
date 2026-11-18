@@ -236,3 +236,118 @@ test('a project on an SSH target: the panel says Orca manages no accounts there'
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
+
+const twoClaude: Snapshot['seats'] = [
+  { key: 'claude:a', provider: 'claude', accountId: 'a', label: 'inuse@example.test', active: true, usage: { known: true, session: { usedPercent: 50, resetsAt: NOW + 3_600_000 } } },
+  { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'spare@example.test', active: false, usage: { known: true, session: { usedPercent: 5, resetsAt: NOW + 3_600_000 } } }
+]
+
+test('"Yes, switch" that worked says so even when the list cannot be read again; only a switch that failed says Failed', async () => {
+  let reads = 0
+  let refuse = false
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => {
+        // The first read draws the panel; every later one fails.
+        if (reads++ > 0) throw new Error('worker restarting')
+        return snapshot({ seats: twoClaude })
+      },
+      'rotator.consoleLine': () => ({ installed: false, workspace: 'app' }),
+      'rotator.switchTo': () => {
+        if (refuse) throw new Error('orca account select failed')
+        return { message: 'Claude: new launches use spare@example.test; this pane moved (resumed)' }
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.press({ text: 'Switch to this account' })
+  await view.press({ text: 'Yes, switch' })
+  assert.equal(reads, 2)
+  // The switch's own result, then the reload problem, calmly and apart from it.
+  assert.ok(view.find({ text: "Claude: new launches use spare@example.test; this pane moved (resumed). Couldn't refresh the list; it updates shortly." }))
+  assert.equal(view.findAll({ text: /Failed/ }).length, 0)
+  assert.equal(view.findAll({ text: /worker restarting/ }).length, 0)
+  // The controls work again.
+  assert.equal(view.find({ text: 'Switch to this account' })?.disabled, false)
+  // A switch that itself failed is still reported as failed, with its own error.
+  refuse = true
+  await view.press({ text: 'Switch to this account' })
+  await view.press({ text: 'Yes, switch' })
+  assert.ok(view.find({ text: 'Failed: orca account select failed' }))
+  assert.equal(view.findAll({ text: /Couldn't refresh/ }).length, 0)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('the Status line switch follows the focused workspace, and says why when it cannot be used there', async () => {
+  const toggled: boolean[] = []
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snapshot(),
+      'rotator.consoleLine': ({ enabled }) => {
+        if (typeof enabled === 'boolean') toggled.push(enabled)
+        return { installed: true, workspace: 'app' }
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  assert.equal(view.valueOf({ label: 'Status line' }), true)
+  assert.equal(view.find({ label: 'Status line' })?.disabled, false)
+  assert.equal(view.findAll({ text: /^Status line: / }).length, 0)
+  // The user moves to a workspace without the line: the worker says so, nothing is asked again.
+  await view.post('rotator.consoleLine', { installed: false, workspace: 'other' })
+  assert.equal(view.valueOf({ label: 'Status line' }), false)
+  assert.equal(view.find({ label: 'Status line' })?.disabled, false)
+  // ...then to one on another machine: the switch is off, disabled, and one muted line says why.
+  await view.post('rotator.consoleLine', { installed: false, reason: 'The focused workspace is not on this computer' })
+  assert.equal(view.find({ label: 'Status line' })?.props.checked, false)
+  assert.equal(view.find({ label: 'Status line' })?.disabled, true)
+  const why = view.findAll({ text: 'Status line: the focused workspace is not on this computer' })
+  assert.equal(why.length, 1)
+  assert.equal(why[0]!.props.muted, true)
+  // Back on a workspace of this computer the reason goes.
+  await view.post('rotator.consoleLine', { installed: true, workspace: 'app' })
+  assert.equal(view.valueOf({ label: 'Status line' }), true)
+  assert.equal(view.findAll({ text: /^Status line: / }).length, 0)
+  assert.deepEqual(toggled, [])
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('a first read that fails is not an unhandled error: the worker\u2019s next push fills the panel, Status line switch included', async () => {
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => {
+        throw new Error('worker restarting')
+      },
+      'rotator.consoleLine': () => ({ installed: true, workspace: 'app' })
+    }
+  })
+  const view = await mount(panel, { host })
+  assert.deepEqual(view.summary(), ['Skeleton "Loading accounts"'])
+  await view.post('rotator.changed', snapshot())
+  assert.ok(view.find({ text: 'one@example.test' }))
+  assert.equal(view.valueOf({ label: 'Status line' }), true)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('"Yes, switch" gives the worker longer than the 30 s a request gets by default: moving the pane waits for the resumed session', async () => {
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snapshot({ seats: twoClaude }),
+      'rotator.consoleLine': () => ({ installed: false, workspace: 'app' }),
+      'rotator.switchTo': () => ({ message: 'Claude: new launches use spare@example.test; this pane moved (resumed)' })
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.press({ text: 'Switch to this account' })
+  await view.press({ text: 'Yes, switch' })
+  const call = (host.callsOf('plugin.request') as { name: string; timeoutMs?: number }[]).find((c) => c.name === 'rotator.switchTo')
+  // The worker closes the pane (up to 10 s) and waits for the resumed session (up to 60 s) before
+  // it answers; a request that timed out would read as a failed switch that in fact worked.
+  assert.ok((call?.timeoutMs ?? 30_000) >= 90_000, `timeoutMs ${call?.timeoutMs}`)
+  assert.ok(view.find({ text: /this pane moved \(resumed\)/ }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
