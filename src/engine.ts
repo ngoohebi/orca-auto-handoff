@@ -224,6 +224,13 @@ function hostFromWorkspaceIdentity(id: string | null | undefined): string | unde
 
 type ServerView = { view: AccountView; at: number; error?: string }
 
+/** The stored key of what is remembered per account or per service (`health`, `leftLow`,
+ *  `lastAutoSwitchAt`, `probation`): the bare key on this computer, as it always was, and
+ *  `<server>|<key>` on a paired server, whose accounts are other accounts under the same keys. */
+export function scopedKey(server: string | undefined, key: string): string {
+  return server ? `${server}|${key}` : key
+}
+
 export class Rotator {
   state: RotatorState = emptyState()
   private view: AccountView | null = null
@@ -394,8 +401,23 @@ export class Rotator {
     return this.samplesOn(server)[seat.key]?.recent ?? []
   }
 
+  /** What is remembered about one account of `server`. */
+  private healthOf(seatKey: string, server: string | undefined): SeatHealth | undefined {
+    return this.state.health[scopedKey(server, seatKey)]
+  }
+
+  /** The health of `server`'s accounts by seat key, as selector.ts reads it. This computer's is
+   *  the stored map itself (a paired server's entries carry a prefix no seat key has). */
+  private healthOn(server: string | undefined): Record<string, SeatHealth> {
+    if (!server) return this.state.health
+    const prefix = scopedKey(server, '')
+    const own: Record<string, SeatHealth> = {}
+    for (const [key, h] of Object.entries(this.state.health)) if (key.startsWith(prefix)) own[key.slice(prefix.length)] = h
+    return own
+  }
+
   private leaving(seat: Seat, server: string | undefined, config: Config, now: number) {
-    return shouldLeave(seat, this.state.health[seat.key], this.recentOf(seat, server), config, now)
+    return shouldLeave(seat, this.healthOf(seat.key, server), this.recentOf(seat, server), config, now)
   }
 
   /** Accounts a move that is only advice must not go to: left as Low within their 5-hour window,
@@ -405,27 +427,31 @@ export class Rotator {
     if (!this.looksAhead(config)) return avoid
     for (const seat of view.seats) {
       if (seat.provider !== provider) continue
-      const left = this.state.leftLow?.[seat.key]
+      const left = this.state.leftLow?.[scopedKey(server, seat.key)]
       if (left && left.until > now) avoid.add(seat.key)
-      else if (assess(seat, this.state.health[seat.key], this.recentOf(seat, server), config, now).state === 'low') avoid.add(seat.key)
+      else if (assess(seat, this.healthOf(seat.key, server), this.recentOf(seat, server), config, now).state === 'low') avoid.add(seat.key)
     }
     return avoid
   }
 
-  /** How many sessions run on each account of this service now (`agents.list` per workspace,
-   *  placed by `paneSeat`). Empty when Orca cannot say. `busyOnly` counts only sessions in the
-   *  middle of a turn. */
-  private async paneCounts(provider: Provider, view: AccountView, busyOnly = false): Promise<Record<string, number>> {
+  /** How many sessions run on each account of this service on `server` now (`agents.list` per
+   *  workspace, placed by `paneSeat`). Empty when Orca cannot say. `busyOnly` counts only sessions
+   *  in the middle of a turn. */
+  private async paneCounts(provider: Provider, view: AccountView, server: string | undefined, busyOnly = false): Promise<Record<string, number>> {
     const counts: Record<string, number> = {}
     try {
       const { workspaces } = await this.deps.host.call('workspace.list')
       const seen = new Set<string>()
-      for (const ws of workspaces as { id: string }[]) {
+      for (const ws of workspaces as { id: string; hostId?: string | null }[]) {
+        // A session on another server, or on an SSH target, runs on other accounts.
+        if ((parseServer(ws.hostId) ?? (await this.serverOfWorkspace(ws.id))) !== server) continue
+        if (await this.sshTargetOfWorkspace(ws.id)) continue
         const { agents } = await this.deps.host.call('agents.list', { workspaceId: ws.id }).catch(() => ({ agents: [] as any[] }))
         for (const row of agents) {
           if (!row.terminalId || seen.has(row.terminalId) || providerOf(row.agent) !== provider) continue
           seen.add(row.terminalId)
-          if (busyOnly && row.state !== 'working') continue
+          // Anything but between turns: `blocked` (a permission question) is mid-turn too.
+          if (busyOnly && (row.state === 'waiting' || row.state === 'done')) continue
           const seat = this.seatOf(row.terminalId, provider, view)
           if (seat) counts[seat.key] = (counts[seat.key] ?? 0) + 1
         }
@@ -439,27 +465,40 @@ export class Rotator {
   /** What Smart ranks with: the history, the pane counts and the accounts left as Low. */
   private async smartContext(provider: Provider, view: AccountView, server: string | undefined, now: number): Promise<SmartContext> {
     const avoid = new Set<string>()
-    for (const [key, left] of Object.entries(this.state.leftLow ?? {})) if (left.until > now) avoid.add(key)
-    return { samples: this.samplesOn(server), panes: await this.paneCounts(provider, view), avoid }
+    for (const seat of view.seats) {
+      const left = this.state.leftLow?.[scopedKey(server, seat.key)]
+      if (left && left.until > now) avoid.add(seat.key)
+    }
+    return { samples: this.samplesOn(server), panes: await this.paneCounts(provider, view, server), avoid }
   }
 
   /** A seat left because it was running Low is not a target again within its 5-hour window. */
-  private markLeftLow(seat: Seat, now: number): void {
+  private markLeftLow(seat: Seat, now: number, server: string | undefined): void {
     const session = seat.usage.session
     const until = session && session.resetsAt !== null && session.resetsAt > now ? session.resetsAt : now + FIVE_HOURS_MS
     const entry: { at: number; until: number; used?: number } = { at: now, until }
     if (session) entry.used = session.usedPercent
-    this.state.leftLow = { ...(this.state.leftLow ?? {}), [seat.key]: entry }
+    this.state.leftLow = { ...(this.state.leftLow ?? {}), [scopedKey(server, seat.key)]: entry }
   }
 
   /** Ends "left as Low" when the window is over, or a live reading taken since shows that the
    *  window has started again (a later reset time, or usage that fell). */
-  private clearLeftLow(seats: readonly Seat[], now: number): boolean {
+  private clearLeftLow(seats: readonly Seat[], now: number, server: string | undefined): boolean {
     const marks = this.state.leftLow
     if (!marks) return false
     let changed = false
     for (const [key, left] of Object.entries(marks)) {
-      const seat = seats.find((s) => s.key === key)
+      // `seats` are the accounts of `server`: a mark of another server is not theirs to judge.
+      // It only ends with its window.
+      const mine = server ? key.startsWith(scopedKey(server, '')) : !key.includes('|')
+      if (!mine) {
+        if (left.until <= now) {
+          delete marks[key]
+          changed = true
+        }
+        continue
+      }
+      const seat = seats.find((s) => scopedKey(server, s.key) === key)
       const u = seat?.usage
       const live = !!u && u.known && (u.source === undefined || u.source === 'live') && (u.asOf === undefined || u.asOf > left.at)
       const session = live ? u!.session : undefined
@@ -656,9 +695,9 @@ export class Rotator {
         let sampled = pruneSamples(this.samples, parsed.seats.map((s) => s.key))
         for (const seat of parsed.seats) if (addSample(this.samples, seat, now)) sampled = true
         if (sampled) await this.deps.saveSamples(this.samples).catch(() => undefined)
-        const freed = this.clearLeftLow(parsed.seats, now)
+        const freed = this.clearLeftLow(parsed.seats, now, server)
         if (this.clearStrikesByReading(parsed.seats, config, now) || freed) await this.save()
-      }
+      } else if (this.clearLeftLow(parsed.seats, now, server)) await this.save()
       nextView = parsed
       nextAt = now
       nextError = undefined
@@ -722,17 +761,17 @@ export class Rotator {
   }
 
   /** The provider's probation, while it lasts. */
-  private probation(provider: Provider, now: number): { key: string; until: number } | undefined {
-    const p = this.state.probation?.[provider]
+  private probation(provider: Provider, now: number, server: string | undefined): { key: string; until: number } | undefined {
+    const p = this.state.probation?.[scopedKey(server, provider)]
     return p && p.until > now ? p : undefined
   }
 
   /** An automatic move landed on a seat the plugin has no numbers for: hold further advisory moves
    *  of this provider for a while, and count a limit banner on that seat as a strike. */
-  private startProbation(target: Seat, config: Config, now: number): void {
+  private startProbation(target: Seat, config: Config, now: number, server: string | undefined): void {
     if (target.usage.known) return
     const until = now + Math.max(MIN_PROBATION_MS, 2 * config.switchCooldownMinutes * 60_000)
-    this.state.probation = { ...(this.state.probation ?? {}), [target.provider]: { key: target.key, until } }
+    this.state.probation = { ...(this.state.probation ?? {}), [scopedKey(server, target.provider)]: { key: target.key, until } }
   }
 
   private selectOn(provider: Provider, accountId: string, server?: string): Promise<void> {
@@ -803,7 +842,8 @@ export class Rotator {
     const key = view.active[provider]
     if (key) {
       this.state.paneSeat[terminalId] = key
-      void this.save()
+      // The hook does not wait for the save; a storage failure must not go unhandled.
+      void this.save().catch((error) => this.deps.log(`could not save the account of ${terminalId}: ${String((error as Error)?.message ?? error)}`))
     }
   }
 
@@ -972,9 +1012,9 @@ export class Rotator {
       // A turn that finished without a limit on a seat the pane is known to run on: the seat
       // works, so its strikes are over.
       if (turnEnded && seat && at.known) {
-        const h = this.state.health[seat.key]
+        const h = this.healthOf(seat.key, pane.server)
         if (h && strikesOf(h, this.deps.now()) > 0 && this.deps.now() - (h.strikeAt ?? 0) >= STRIKE_SETTLE_MS) {
-          this.dropStrikes(seat.key)
+          this.dropStrikes(scopedKey(pane.server, seat.key))
           await this.save()
         }
       }
@@ -1074,7 +1114,7 @@ export class Rotator {
     const from = this.seatOf(pane.terminalId, pane.agent, view)
     const chain = buildChain(view.seats, pane.agent, config)
     const only = this.modelRoom(chain, signal.model, now)
-    return !!pickNext(chain, from?.key, this.state.health, config, now, { only })
+    return !!pickNext(chain, from?.key, this.healthOn(pane.server), config, now, { only })
   }
 
   private async fallbackModel(pane: PaneInfo, config: Config, signal: Signal, lines: readonly string[]): Promise<boolean> {
@@ -1105,7 +1145,7 @@ export class Rotator {
       await this.withLock(pane.agent, async () => {
         const view = await this.accountsFor(pane.server, true)
         const at = this.locate(pane.terminalId, pane.agent, view)
-        if (at.seat && (at.known || this.plausiblyLimited(at.seat))) await this.coolDown(at.seat, signal, config, reason)
+        if (at.seat && (at.known || this.plausiblyLimited(at.seat))) await this.coolDown(at.seat, signal, config, reason, pane.server)
         await this.deps.notify('Auto Hand-off', `${pane.agent} hit a limit on ${at.seat?.label ?? 'its account'}; switching on rate limit is off.`)
         this.publishNow()
       })
@@ -1117,21 +1157,22 @@ export class Rotator {
   /** A limit banner always cools the seat: until the banner's reset time, else Orca's, else a
    *  guessed time. A banner on a seat without numbers and without a reset time (or on the seat
    *  under probation) is a strike, and each strike doubles the guess. */
-  private async coolDown(seat: Seat, signal: Signal, config: Config, reason: SwapReason): Promise<void> {
+  private async coolDown(seat: Seat, signal: Signal, config: Config, reason: SwapReason, server: string | undefined): Promise<void> {
     const now = this.deps.now()
-    const prev = this.state.health[seat.key]
+    const stored = scopedKey(server, seat.key)
+    const prev = this.state.health[stored]
     const usageReset = [seat.usage.session, seat.usage.weekly]
       .filter((w) => w && w.usedPercent >= 100 && w.resetsAt && w.resetsAt > now)
       .map((w) => w!.resetsAt!)
     const realReset = signal.resetsAt ?? (usageReset.length ? Math.max(...usageReset) : undefined)
     const text = `${reason}: ${signal.line}`
-    const strike = this.probation(seat.provider, now)?.key === seat.key || (!seat.usage.known && realReset === undefined)
+    const strike = this.probation(seat.provider, now, server)?.key === seat.key || (!seat.usage.known && realReset === undefined)
     const stillCooling = !!prev?.cooldownUntil && prev.cooldownUntil > now
     if (strike && stillCooling && strikesOf(prev, now) > 0) {
       // Another pane on the seat showing the same limit: one strike, not two.
       const again = cooled(prev, now, Math.max(prev!.cooldownUntil!, realReset ?? 0), text)
       if (prev!.resetKnown || realReset !== undefined) again.resetKnown = true
-      this.state.health[seat.key] = again
+      this.state.health[stored] = again
       await this.save()
       return
     }
@@ -1143,15 +1184,16 @@ export class Rotator {
       next.strikeAt = now
     }
     if (realReset !== undefined) next.resetKnown = true
-    this.state.health[seat.key] = next
+    this.state.health[stored] = next
     await this.save()
   }
 
   /** A seat left because of a threshold stays out of rotation until the window that is over
    *  resets. Once it is inactive Orca may report no usage for it, and it would look free again:
    *  with every seat over a threshold the session would rotate (and be typed into) forever. */
-  private async coolOverThreshold(seat: Seat, config: Config, now: number): Promise<void> {
+  private async coolOverThreshold(seat: Seat, config: Config, now: number, server: string | undefined): Promise<void> {
     if (!overThreshold(seat, config, now)) return
+    const stored = scopedKey(server, seat.key)
     const resets = (
       [
         [seat.usage.session, config.thresholdFiveHour],
@@ -1162,11 +1204,11 @@ export class Rotator {
       .map(([w]) => w!.resetsAt!)
     const until = Math.max(
       resets.length ? Math.max(...resets) : now + config.defaultCooldownMinutes * 60_000,
-      this.state.health[seat.key]?.cooldownUntil ?? 0
+      this.state.health[stored]?.cooldownUntil ?? 0
     )
-    const next = cooled(this.state.health[seat.key], now, until, 'threshold: over the usage threshold')
+    const next = cooled(this.state.health[stored], now, until, 'threshold: over the usage threshold')
     if (resets.length) next.resetKnown = true
-    this.state.health[seat.key] = next
+    this.state.health[stored] = next
     await this.save()
   }
 
@@ -1207,7 +1249,7 @@ export class Rotator {
         return
       }
       // Right after a move onto a seat without numbers, advice waits; only a real limit moves on.
-      if (advisory && this.probation(pane.agent, this.deps.now())) return
+      if (advisory && this.probation(pane.agent, this.deps.now(), pane.server)) return
       const view = await this.accountsFor(pane.server, true)
       const now = this.deps.now()
       const at = this.locate(pane.terminalId, pane.agent, view)
@@ -1216,7 +1258,7 @@ export class Rotator {
       let preferActive = false
       if (signal && from) {
         if (at.known || this.plausiblyLimited(from)) {
-          await this.coolDown(from, signal, config, reason)
+          await this.coolDown(from, signal, config, reason, pane.server)
         } else {
           // Unknown pane (started before the plugin, or restored) while the active account has
           // plenty of room: the pane is on some other account. Cool nothing; move it to the
@@ -1229,10 +1271,10 @@ export class Rotator {
       // Leaving because the account is about to run out (Low), not because it is at a limit.
       const leave = advisory && from && ahead ? this.leaving(from, pane.server, config, now) : null
       const low = !!leave && leave.leave && !leave.assessment.over
-      if (reason === 'threshold' && from) await this.coolOverThreshold(from, config, now)
+      if (reason === 'threshold' && from) await this.coolOverThreshold(from, config, now, pane.server)
       const chain = buildChain(view.seats, pane.agent, config)
       const healthyActive =
-        preferActive && active && isEligible(active, this.state.health[active.key], config, now) ? active : null
+        preferActive && active && isEligible(active, this.healthOf(active.key, pane.server), config, now) ? active : null
       const context = ahead && config.strategy === 'smart' ? await this.smartContext(pane.agent, view, pane.server, now) : undefined
       // The fresh reading may show the account is fine after all (its window reset since the
       // cached one): then there is nothing to leave.
@@ -1240,7 +1282,7 @@ export class Rotator {
       // A model cap (Smart): an account known to have room in that model's bucket.
       const only = ahead && reason === 'model_cap' ? this.modelRoom(chain, signal?.model, now) : undefined
       const pick = (restrict: ReadonlySet<string> | undefined) =>
-        pickNext(chain, from?.key, this.state.health, config, now, {
+        pickNext(chain, from?.key, this.healthOn(pane.server), config, now, {
           mode: reason === 'manual' ? 'manual' : advisory ? 'advisory' : 'hard',
           sourceExhausted: !!from && exhausted(from, now),
           ...(context ? { smart: context } : {}),
@@ -1274,7 +1316,7 @@ export class Rotator {
         // The short-wait rule: a move re-reads the whole conversation without cache, so when the
         // account being left is back in a few minutes, waiting is cheaper.
         const resumeAt = shortWait(
-          this.sourceReset(from, leave?.assessment, advisory, now),
+          this.sourceReset(from, leave?.assessment, advisory, now, pane.server),
           projectedRunwayMs(this.recentOf(target, pane.server), context?.panes[target.key] ?? 0, now),
           config,
           now
@@ -1299,20 +1341,20 @@ export class Rotator {
       // guards that protect the session: it waited for the lock and a fresh account read too.
       if (reason === 'manual' && (await this.unsafeToMove(pane, lines))) return
       const why = low && from ? this.explained('low', from, target, view, { idle: reason === 'idle', assessment: leave!.assessment }) : undefined
-      if (low && from) this.markLeftLow(from, now)
+      if (low && from) this.markLeftLow(from, now, pane.server)
       await this.moveTo(pane, from, target, reason, lines, signal, view, config, why)
     })
   }
 
   /** When the account being left is usable again, if that is known: the end of the window that
    *  is Low (a move that is advice), or the real end of its cooldown (a limit). */
-  private sourceReset(from: Seat, assessment: Assessment | undefined, advisory: boolean, now: number): number | null {
+  private sourceReset(from: Seat, assessment: Assessment | undefined, advisory: boolean, now: number, server: string | undefined): number | null {
     if (advisory) {
       const win = assessment?.low?.window
       const window = win === 's' ? from.usage.session : win === 'w' ? from.usage.weekly : win === 'm' ? from.usage.model : undefined
       if (window?.resetsAt && window.resetsAt > now) return window.resetsAt
     }
-    const h = this.state.health[from.key]
+    const h = this.healthOf(from.key, server)
     return h?.resetKnown && h.cooldownUntil && h.cooldownUntil > now ? h.cooldownUntil : null
   }
 
@@ -1324,7 +1366,7 @@ export class Rotator {
       const config = await this.deps.config()
       const view = await this.accountsFor(pane.server)
       const now = this.deps.now()
-      if (this.probation(pane.agent, now)) return
+      if (this.probation(pane.agent, now, pane.server)) return
       const at = this.locate(pane.terminalId, pane.agent, view)
       if (!at.seat) return
       const target = await this.expiringTarget(at.seat, pane.agent, view, pane.server, config, now)
@@ -1353,9 +1395,10 @@ export class Rotator {
     const context = await this.smartContext(provider, view, server, now)
     const ordered = Boolean(config.chain.trim())
     const candidate = (seat: Seat, index: number) => {
-      const t = seat.key === from.key ? 'A' : tier(seat, this.state.health[seat.key], config, now)
+      const h = this.healthOf(seat.key, server)
+      const t = seat.key === from.key ? 'A' : tier(seat, h, config, now)
       if (!t) return null
-      return candidateOf(seat, t, strikesOf(this.state.health[seat.key], now), this.state.health[seat.key], context, config, now, {
+      return candidateOf(seat, t, strikesOf(h, now), h, context, config, now, {
         chainIndex: ordered ? index : 0,
         turn: index
       })
@@ -1398,7 +1441,7 @@ export class Rotator {
     if (!gapWaived && !enoughGap(from, target, config, rule === 'low')) return false
     // Moving onto the seat Orca already selected changes nothing for other panes; a selection
     // change is what must not flap.
-    if (view.active[target.provider] !== target.key && !this.canChangeSelection(target.provider, config, now)) return false
+    if (view.active[target.provider] !== target.key && !this.canChangeSelection(target.provider, config, now, pane.server)) return false
     return true
   }
 
@@ -1424,14 +1467,14 @@ export class Rotator {
     return !!row && row.state !== 'waiting' && row.state !== 'done'
   }
 
-  private canChangeSelection(provider: Provider, config: Config, now: number): boolean {
-    const last = this.state.lastAutoSwitchAt?.[provider] ?? 0
+  private canChangeSelection(provider: Provider, config: Config, now: number, server: string | undefined): boolean {
+    const last = this.state.lastAutoSwitchAt?.[scopedKey(server, provider)] ?? 0
     return now - last >= config.switchCooldownMinutes * 60_000
   }
 
-  private noteSelectionChange(provider: Provider, reason: SwapReason, now: number): void {
+  private noteSelectionChange(provider: Provider, reason: SwapReason, now: number, server: string | undefined): void {
     if (reason === 'manual') return
-    this.state.lastAutoSwitchAt = { ...(this.state.lastAutoSwitchAt ?? {}), [provider]: now }
+    this.state.lastAutoSwitchAt = { ...(this.state.lastAutoSwitchAt ?? {}), [scopedKey(server, provider)]: now }
   }
 
   /** Switch-back (Orca issue #33193, tokenmaxx "return to primary"): a pane on a lower seat
@@ -1445,12 +1488,12 @@ export class Rotator {
       if (config.mode !== 'custom' && config.runningSessions !== 'move') return
       const view = await this.accountsFor(pane.server)
       const now = this.deps.now()
-      if (this.probation(pane.agent, now)) return
+      if (this.probation(pane.agent, now, pane.server)) return
       const at = this.locate(pane.terminalId, pane.agent, view)
       if (!at.seat) return
       const chain = buildChain(view.seats, pane.agent, config)
       // A running session only goes back to a seat that is known, or presumed reset.
-      const preferred = preferredOver(chain, at.seat.key, this.state.health, config, now, 'pane', this.avoided(pane.agent, view, pane.server, config, now))
+      const preferred = preferredOver(chain, at.seat.key, this.healthOn(pane.server), config, now, 'pane', this.avoided(pane.agent, view, pane.server, config, now))
       if (!preferred) return
       if (!(await this.advisoryOk(pane, at.seat, preferred, lines, view, config, now, 'switch-back'))) return
       await this.moveTo(pane, at.seat, preferred, 'switch_back', [...lines], undefined, view, config)
@@ -1484,7 +1527,7 @@ export class Rotator {
       this.publishNow()
       return
     }
-    const wakeAt = special?.wakeAt ?? earliestReset(chain, this.state.health, now) ?? now + config.defaultCooldownMinutes * 60_000
+    const wakeAt = special?.wakeAt ?? earliestReset(chain, this.healthOn(pane.server), now) ?? now + config.defaultCooldownMinutes * 60_000
     const entry: WaitingEntry = { terminalId: pane.terminalId, workspaceId: pane.workspaceId, agent: pane.agent, wakeAt }
     if (special?.hold) entry.hold = special.hold
     if (special?.model) entry.model = special.model
@@ -1527,7 +1570,7 @@ export class Rotator {
         await this.selectOn(target.provider, target.accountId, pane.server)
         view.active[target.provider] = target.key
         for (const s of view.seats) if (s.provider === target.provider) s.active = s.key === target.key
-        this.noteSelectionChange(target.provider, reason, this.deps.now())
+        this.noteSelectionChange(target.provider, reason, this.deps.now(), pane.server)
         reselected = true
       }
       if (!config.autoResume) {
@@ -1537,7 +1580,7 @@ export class Rotator {
         // the legacy "Resume the session after a switch" setting.
         const byKnob = config.mode !== 'custom' && config.runningSessions === 'launches'
         this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'selected', ...(from ? { from: from.key } : {}), to: target.key, detail: byKnob ? 'Running sessions: new launches only' : 'auto_resume off', why: explained ?? this.why(reason, from, target, view, { selectionOnly: true, ...(signal?.model ? { model: signal.model } : {}) }) })
-        if (reason !== 'manual') this.startProbation(target, config, this.deps.now())
+        if (reason !== 'manual') this.startProbation(target, config, this.deps.now(), pane.server)
         await this.save()
         this.publishNow()
         await this.deps.notify(
@@ -1589,7 +1632,7 @@ export class Rotator {
         to: target.key,
         why: whyLine
       })
-      if (reason !== 'manual') this.startProbation(target, config, this.deps.now())
+      if (reason !== 'manual') this.startProbation(target, config, this.deps.now(), pane.server)
       await this.save()
       this.publishNow()
       // Why the first message was not typed into the resumed pane, if it was not.
@@ -1620,9 +1663,9 @@ export class Rotator {
       // A seat that could not be switched to is skipped for a while, so the rotation moves on to
       // a usable one instead of retrying a broken one (Orca PR #43578).
       const skipUntil = this.deps.now() + FAILED_SWITCH_SKIP_MS
-      const h = this.state.health[target.key]
+      const h = this.healthOf(target.key, pane.server)
       if (!h?.cooldownUntil || h.cooldownUntil < skipUntil) {
-        this.state.health[target.key] = cooled(h, this.deps.now(), skipUntil, `switch failed: ${message}`)
+        this.state.health[scopedKey(pane.server, target.key)] = cooled(h, this.deps.now(), skipUntil, `switch failed: ${message}`)
       }
       this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', ...(from ? { from: from.key } : {}), to: target.key, detail: message.slice(0, 200) })
       await this.save()
@@ -1824,9 +1867,9 @@ export class Rotator {
         changed = true
       }
     }
-    for (const [provider, p] of Object.entries(this.state.probation ?? {})) {
+    for (const [scope, p] of Object.entries(this.state.probation ?? {})) {
       if (p && p.until <= now) {
-        delete this.state.probation![provider as Provider]
+        delete this.state.probation![scope]
         changed = true
       }
     }
@@ -1842,8 +1885,8 @@ export class Rotator {
         const sooner = w.hold
           ? null
           : w.model
-            ? pickNext(chain, w.fromSeat, this.state.health, config, now, { only: this.modelRoom(chain, w.model, now, true) })
-            : pickNext(chain, undefined, this.state.health, config, now)
+            ? pickNext(chain, w.fromSeat, this.healthOn(wServer), config, now, { only: this.modelRoom(chain, w.model, now, true) })
+            : pickNext(chain, undefined, this.healthOn(wServer), config, now)
         const ready = w.wakeAt <= now || sooner
         if (ready) await this.wake(w)
       }
@@ -1922,17 +1965,17 @@ export class Rotator {
       if (!config.services[provider]) continue
       const view = await this.accountsFor(server)
       const now = this.deps.now()
-      if (this.probation(provider, now)) continue
+      if (this.probation(provider, now, server)) continue
       // At most one such change per switch cooldown (checked first: it costs nothing).
-      if (!this.canChangeSelection(provider, config, now)) continue
+      if (!this.canChangeSelection(provider, config, now, server)) continue
       if (!(await this.launchPlan(provider, view, server, config, now))) continue
       await this.withLock(provider, async () => {
         if (!(await this.allowed(provider))) return
         // A move this waited behind may have changed the selection a moment ago.
-        if (!this.canChangeSelection(provider, config, this.deps.now())) return
+        if (!this.canChangeSelection(provider, config, this.deps.now(), server)) return
         const fresh = await this.accountsFor(server, true)
         const from = fresh.active[provider]
-        if (this.probation(provider, this.deps.now())) return
+        if (this.probation(provider, this.deps.now(), server)) return
         // Only the selection moves, so a seat without numbers (and without strikes) is fine: at
         // worst one new session fails its first turn there, and the seat is struck.
         const plan = await this.launchPlan(provider, fresh, server, config, this.deps.now())
@@ -1943,15 +1986,15 @@ export class Rotator {
         } catch (error) {
           const message = String((error as Error)?.message ?? error)
           this.deps.log(`switch back failed: ${message}`)
-          this.state.health[preferred.key] = cooled(this.state.health[preferred.key], this.deps.now(), this.deps.now() + FAILED_SWITCH_SKIP_MS, `switch failed: ${message}`)
+          this.state.health[scopedKey(server, preferred.key)] = cooled(this.healthOf(preferred.key, server), this.deps.now(), this.deps.now() + FAILED_SWITCH_SKIP_MS, `switch failed: ${message}`)
           await this.save()
           return
         }
         fresh.active[provider] = preferred.key
         for (const s of fresh.seats) if (s.provider === provider) s.active = s.key === preferred.key
-        this.noteSelectionChange(provider, plan.reason, this.deps.now())
-        this.startProbation(preferred, config, this.deps.now())
-        if (plan.leftLow) this.markLeftLow(plan.leftLow, this.deps.now())
+        this.noteSelectionChange(provider, plan.reason, this.deps.now(), server)
+        this.startProbation(preferred, config, this.deps.now(), server)
+        if (plan.leftLow) this.markLeftLow(plan.leftLow, this.deps.now(), server)
         this.record({ provider, reason: plan.reason, result: 'selected', ...(from ? { from } : {}), to: preferred.key, why: plan.why })
         await this.save()
         await this.deps.notify('Auto Hand-off', `${PROVIDER_NAME[provider]}: ${plan.why}. Only new sessions start on ${preferred.label}. ${restartNote(config)}`)
@@ -1973,25 +2016,26 @@ export class Rotator {
     if (chain.length < 2) return null
     const selected = view.seats.find((s) => s.key === view.active[provider])
     const avoid = this.avoided(provider, view, server, config, now)
-    const back = preferredOver(chain, view.active[provider], this.state.health, config, now, 'launch', avoid)
+    const health = this.healthOn(server)
+    const back = preferredOver(chain, view.active[provider], health, config, now, 'launch', avoid)
     if (back) return { target: back, reason: 'switch_back', why: this.why('switch_back', selected, back, view, { selectionOnly: true }) }
     if (!this.looksAhead(config) || !selected) return null
-    const assessment = assess(selected, this.state.health[selected.key], this.recentOf(selected, server), config, now)
+    const assessment = assess(selected, health[selected.key], this.recentOf(selected, server), config, now)
     if (assessment.state === 'out' || assessment.state === 'low') {
       const out = assessment.state === 'out'
       // Sessions between turns move by themselves, and take the selection with them. Only while
       // one is in the middle of a turn there (it cannot be moved) is the selection changed alone.
-      if (!(await this.paneCounts(provider, view, true))[selected.key]) return null
+      if (!(await this.paneCounts(provider, view, server, true))[selected.key]) return null
       const context = config.strategy === 'smart' ? await this.smartContext(provider, view, server, now) : undefined
       // As for any move that is advice: a seat with known room, or, when the selected one cannot
       // work at all (at 100 %, or cooling down), one without numbers and without strikes.
-      const target = pickNext(chain, selected.key, this.state.health, config, now, {
+      const target = pickNext(chain, selected.key, health, config, now, {
         mode: 'advisory',
         sourceExhausted: exhausted(selected, now) || (out && !assessment.over),
         avoid,
         ...(context ? { smart: context } : {})
       })
-      if (!target || (!target.usage.known && strikesOf(this.state.health[target.key], now) > 0)) return null
+      if (!target || (!target.usage.known && strikesOf(health[target.key], now) > 0)) return null
       if (!out && !enoughGap(selected, target, config, true)) return null
       return {
         target,
@@ -2012,7 +2056,7 @@ export class Rotator {
     const view = await this.accountsFor(this.server)
     const now = this.deps.now()
     const due = PROVIDERS.filter((p) => {
-      if (!config.services[p] || this.probation(p, now)) return false
+      if (!config.services[p] || this.probation(p, now, this.server)) return false
       const chain = buildChain(view.seats, p, config)
       if (chain.length < 2) return false
       const avoid = this.avoided(p, view, this.server, config, now)
@@ -2020,7 +2064,7 @@ export class Rotator {
       return chain.some(
         (s) =>
           this.leaving(s, this.server, config, now).leave ||
-          preferredOver(chain, s.key, this.state.health, config, now, 'pane', avoid) ||
+          preferredOver(chain, s.key, this.healthOn(this.server), config, now, 'pane', avoid) ||
           (config.mode === 'smart' && expiring(s, samples[s.key], now))
       )
     })
@@ -2055,7 +2099,7 @@ export class Rotator {
         if (!seat) continue
         const chain = buildChain(wsView.seats, agent, config)
         const over = this.leaving(seat, wsServer, config, now).leave
-        const back = !over && !!preferredOver(chain, seat.key, this.state.health, config, now, 'pane', this.avoided(agent, wsView, wsServer, config, now))
+        const back = !over && !!preferredOver(chain, seat.key, this.healthOn(wsServer), config, now, 'pane', this.avoided(agent, wsView, wsServer, config, now))
         // Smart, "use it or lose it": another account's weekly quota would expire unused.
         const loseKey = `${wsServer ?? 'local'}|${seat.key}`
         if (!over && !back && !expiringFor.has(loseKey)) expiringFor.set(loseKey, await this.expiringTarget(seat, agent, wsView, wsServer, config, now))
@@ -2128,7 +2172,7 @@ export class Rotator {
       const now = this.deps.now()
       const chain = buildChain(view.seats, w.agent, config)
       const source = view.seats.find((s) => s.key === w.fromSeat)
-      if (w.hold === 'short' && source && isEligible(source, this.state.health[source.key], config, now) && agents.some((a: any) => a.terminalId === w.terminalId)) {
+      if (w.hold === 'short' && source && isEligible(source, this.healthOf(source.key, server), config, now) && agents.some((a: any) => a.terminalId === w.terminalId)) {
         // The short wait is over and the account is back: the session continues where it is.
         this.state.waiting = this.state.waiting.filter((x) => x.terminalId !== w.terminalId)
         const label = displayLabels(view.seats, w.agent).get(source.key) ?? source.label
@@ -2155,14 +2199,14 @@ export class Rotator {
       // room for that model, then one not known to be full in it.
       const capped = w.reason === 'model_cap' && this.looksAhead(config)
       const room = (unknownToo: boolean) =>
-        pickNext(chain, w.fromSeat, this.state.health, config, now, { only: this.modelRoom(chain, w.model, now, unknownToo), ...context })
+        pickNext(chain, w.fromSeat, this.healthOn(server), config, now, { only: this.modelRoom(chain, w.model, now, unknownToo), ...context })
       const target = capped
         ? (room(false) ?? room(true))
-        : pickNext(chain, w.model && w.wakeAt > now ? w.fromSeat : undefined, this.state.health, config, now, { ...early, ...context })
+        : pickNext(chain, w.model && w.wakeAt > now ? w.fromSeat : undefined, this.healthOn(server), config, now, { ...early, ...context })
       if (!target) {
         // Nowhere to go any more: from here on it is an ordinary wait for a reset.
         delete w.reason
-        w.wakeAt = earliestReset(chain, this.state.health, now) ?? now + config.defaultCooldownMinutes * 60_000
+        w.wakeAt = earliestReset(chain, this.healthOn(server), now) ?? now + config.defaultCooldownMinutes * 60_000
         await this.save()
         return
       }
@@ -2225,7 +2269,7 @@ export class Rotator {
     const view = await this.accounts(true)
     const chain = buildChain(view.seats, provider, config)
     const strategy = config.strategy === 'manual' ? 'drain' : config.strategy
-    const next = pickNext(chain, view.active[provider], this.state.health, { ...config, strategy }, this.deps.now(), { mode: 'manual' })
+    const next = pickNext(chain, view.active[provider], this.healthOn(this.server), { ...config, strategy }, this.deps.now(), { mode: 'manual' })
     if (!next) return `${PROVIDER_NAME[provider]}: no other healthy account`
     return this.selectSeat(next.key)
   }
@@ -2243,7 +2287,7 @@ export class Rotator {
     if (!seat) throw Object.assign(new Error(`Unknown account ${seatKey}`), { code: 'invalid_params' })
     const provider = seat.provider
     const now = this.deps.now()
-    const health = this.state.health[seat.key]
+    const health = this.healthOf(seat.key, this.server)
     if (health?.cooldownUntil && health.cooldownUntil > now) {
       return { message: `${PROVIDER_NAME[provider]}: ${seat.label} is limited until ${new Date(health.cooldownUntil).toLocaleTimeString()}; clear the cooldown first`, switched: false, provider }
     }
@@ -2259,7 +2303,7 @@ export class Rotator {
       const target = fresh.seats.find((s) => s.key === seat.key)
       if (!target || target.provider !== provider || at.seat?.key === target.key) return null
       // Limited since the choice was made (another pane showed a banner while this waited).
-      const cooling = this.state.health[target.key]?.cooldownUntil
+      const cooling = this.healthOf(target.key, pane.server)?.cooldownUntil
       if (cooling && cooling > this.deps.now()) return null
       const screen = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
       // Unreadable: nothing shows that closing it is safe.
@@ -2349,8 +2393,9 @@ export class Rotator {
     this.publishNow()
   }
 
+  /** The panel's *Clear*: `seatKey` is an account of the project in focus (the panel lists those). */
   async clearCooldown(seatKey: string): Promise<void> {
-    delete this.state.health[seatKey]
+    delete this.state.health[scopedKey(this.server, seatKey)]
     await this.save()
     this.publishNow()
   }
@@ -2365,7 +2410,7 @@ export class Rotator {
       paused: this.state.paused,
       updatedAt,
       seats: view.seats.map((s) => {
-        const h = this.state.health[s.key]
+        const h = this.healthOf(s.key, this.server)
         const { liveKeys: _liveKeys, ...seat } = s
         // The history covers this computer's accounts only.
         const runway = this.server ? null : runwayMs(this.samples.seats[s.key]?.recent ?? [], now)

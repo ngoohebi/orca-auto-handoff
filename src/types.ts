@@ -270,6 +270,8 @@ export type LeftLow = { at: number; until: number; used?: number }
 /** Everything the worker persists, under one storage key. */
 export type RotatorState = {
   paused: boolean
+  /** By seat key for this computer's accounts, and by `<server>|<seat key>` for a paired server's
+   *  (engine.ts `scopedKey`); `leftLow` likewise, `lastAutoSwitchAt` and `probation` by provider. */
   health: Record<string, SeatHealth>
   /** Which seat each agent terminal runs on, as far as the plugin knows. */
   paneSeat: Record<string, string>
@@ -280,8 +282,8 @@ export type RotatorState = {
   waiting: WaitingEntry[]
   history: HistoryEntry[]
   /** Last automatic selection change per provider (for the switch cooldown). */
-  lastAutoSwitchAt?: Partial<Record<Provider, number>>
-  probation?: Partial<Record<Provider, Probation>>
+  lastAutoSwitchAt?: Record<string, number>
+  probation?: Record<string, Probation>
   /** Seats left as Low (smart.ts anti-flap), by seat key. */
   leftLow?: Record<string, LeftLow>
   /** The one-time note about `custom` mode has been dismissed. */

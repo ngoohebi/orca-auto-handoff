@@ -29,7 +29,9 @@ reads tokens or keychains.
 project on a paired server (Orca host `runtime:<server>`) has its own accounts and its own active
 selection. The plugin follows the project: the panel lists that server's accounts and names the
 server, and a pane there is switched, closed and resumed with that server's accounts. Each server's
-accounts are cached separately. Since the `orca account` commands refuse `--environment`, the
+accounts are cached separately, and so is what the plugin remembers about them: cooldowns, strikes,
+probation, accounts left as Low and the 5-minute selection cooldown are kept per server, so a limit
+or a switch on a paired server never holds back the accounts of this computer. Since the `orca account` commands refuse `--environment`, the
 worker reaches a paired server through Orca's own runtime client (see *Permissions*). A project on
 a direct SSH target (host `ssh:<target>`) is different: its agents run with that machine's own
 login and Orca manages no accounts for it, so the plugin leaves those panes alone, notes a limit
@@ -93,8 +95,8 @@ turn this prompt off, and it also appears when the plugin changes the selection.
 on, and the plugin moves each one by itself at a safe moment. Pressing Restart would stop busy
 sessions in the middle of their work. The plugin's own notification says why it changed the
 account, and it changes the selection alone (without moving a session) at most once every
-5 minutes, and only when a session is in the middle of a turn on an account that is running out,
-or when another account has quota about to expire.
+5 minutes, and only when a session is in the middle of a turn (working, or waiting for you to
+answer a permission question) on an account that is running out, or when another account has quota about to expire.
 
 **Coming from an earlier version?** With *Auto-switch* on `auto`, your earlier settings decide:
 

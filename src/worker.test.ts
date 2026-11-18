@@ -1,7 +1,7 @@
 // End-to-end through the real worker: Orca events in, host calls and CLI calls out.
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
-import type { Cli, Rotator } from './engine'
+import { Rotator, type Cli } from './engine'
 import * as fx from './fixtures'
 import { activateWith, readConfig, resolveMode, statusText } from './worker'
 import { DEFAULT_CONFIG, SMART_CONFIG, type Config, type RotatorState } from './types'
@@ -2980,9 +2980,12 @@ test('a parked session that is in the middle of a turn again (asking for permiss
   await w.rotator.tick()
   assert.equal(w.host.callsOf('terminal.close').length, 0)
   assert.equal(w.host.callsOf('agent.resume').length, 0)
-  assert.deepEqual(selects(w), [])
   assert.deepEqual(w.typed, [])
   assert.equal(stored(w).waiting.length, 0)
+  // The session itself is left alone. It is in the middle of a turn on an account Orca still
+  // reports as used up, so (as for a working session) only the account for new launches changes.
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(stored(w).history.filter((h) => h.result !== 'waiting').map((h) => h.result), ['selected'])
   await worker.deactivate()
 })
 
@@ -3296,5 +3299,345 @@ test('new launches: a tick already under way when a move changes the selection d
   w.advance(5 * MIN + 1000)
   await w.rotator.tick()
   assert.deepEqual(selects(w), ['select claude c2', 'select claude c3'])
+  await worker.deactivate()
+})
+
+// ---- Review round 9: permission prompts are mid-turn; state per server; the launch hook's save --
+
+test('smart: a session asking for permission (blocked) is in the middle of a turn, so the account for new launches changes', async () => {
+  const w = calm({ session: 97, weekly: 40 }, { panes: [{ terminalId: 't1', agent: 'claude', state: 'blocked', sessionId: 's1' }] })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  // The session cannot move while it waits for the answer: only the selection changes.
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(w.typed, [])
+  assert.equal(stored(w).history.at(-1)?.result, 'selected')
+  await worker.deactivate()
+
+  // Blocked or working, a session is never moved by the idle sweep or by its own status event.
+  for (const state of ['blocked', 'working'] as const) {
+    const busy = calm({ session: 100, weekly: 40 }, { panes: [{ terminalId: 't1', agent: 'claude', state, sessionId: 's1' }] })
+    const bw = await busy.mount()
+    await bw.emit('agent.status.changed', { ...statusEvent('t1'), state, mainAgent: { state, stateStartedAt: 1 } } as never)
+    busy.advance(20 * MIN)
+    await busy.rotator.tick()
+    assert.equal(busy.host.callsOf('terminal.close').length, 0, state)
+    assert.equal(busy.host.callsOf('agent.resume').length, 0, state)
+    assert.deepEqual(busy.typed, [], state)
+    await bw.deactivate()
+  }
+})
+
+type PlacedPane = Pane & { ws: 'w-local' | 'w-remote' }
+
+/** This computer and a paired server (`remote-box`) whose Claude accounts have the same ids
+ *  (c1, c2): the same seat keys, but other accounts. */
+function twoServers(options: {
+  panes: PlacedPane[]
+  tails: Record<string, string[]>
+  localUsage?: { session: number; weekly: number }
+  state?: Partial<RotatorState>
+  settings?: Record<string, string | number | boolean>
+}) {
+  let clock = 1_000_000
+  let focused: 'w-local' | 'w-remote' = 'w-local'
+  let localActive = 'c1'
+  let remoteActive = 'c1'
+  let next = 2
+  const panes = [...options.panes]
+  const cliCalls: string[] = []
+  const cli: Cli = {
+    async listAccounts(server) {
+      cliCalls.push(server ? `list@${server}` : 'list')
+      if (server !== 'remote-box') {
+        return fx.accountList({
+          claudeActive: localActive,
+          updatedAt: clock,
+          inactiveClaude: { [localActive === 'c1' ? 'c2' : 'c1']: { session: 5, weekly: 5 } },
+          claudeUsage: localActive === 'c1' ? options.localUsage ?? { session: 15, weekly: 20 } : { session: 5, weekly: 5 }
+        })
+      }
+      return {
+        claude: {
+          accounts: [
+            { id: 'c1', email: 'remote1@example.test' },
+            { id: 'c2', email: 'remote2@example.test' }
+          ],
+          activeAccountId: remoteActive,
+          systemDefaultHome: null
+        },
+        codex: { accounts: [], activeAccountId: null, systemDefault: { hasAuth: false } },
+        rateLimits: {
+          claude: {
+            status: 'ok',
+            session: { usedPercent: remoteActive === 'c1' ? 100 : 12, resetsAt: 1_000_000 + 3_600_000 },
+            weekly: { usedPercent: 20, resetsAt: 1_000_000 + 30 * 86_400_000 }
+          }
+        }
+      }
+    },
+    async select(provider, accountId, server) {
+      cliCalls.push(server ? `select@${server} ${provider} ${accountId}` : `select ${provider} ${accountId}`)
+      if (provider !== 'claude') return
+      if (server === 'remote-box') remoteActive = accountId
+      else localActive = accountId
+    },
+    async closeTerminal(id, server) {
+      cliCalls.push(server ? `close@${server} ${id}` : `close ${id}`)
+    },
+    async sendText(id, _text, server) {
+      cliCalls.push(server ? `send@${server} ${id}` : `send ${id}`)
+    },
+    async git() {
+      return ''
+    }
+  }
+  const host = mockHost({
+    settings: options.settings ?? {},
+    storage: options.state ? { state: { paused: false, health: {}, paneSeat: {}, seen: {}, apiRetries: {}, modelStep: {}, waiting: [], history: [], ...options.state } as never } : {},
+    results: {
+      'agents.list': (params?: { workspaceId?: string }) => ({
+        agents: panes
+          .filter((p) => p.ws === (params?.workspaceId ?? focused))
+          .map(({ ws: _ws, ...p }) => ({ title: null, task: null, stateStartedAt: 1, sessionId: null, ...p }))
+      }),
+      'terminal.read': ({ terminalId }: { terminalId: string }) => ({ lines: options.tails[terminalId] ?? [], truncated: false }),
+      'terminal.close': ({ terminalId }: { terminalId: string }) => {
+        const i = panes.findIndex((p) => p.terminalId === terminalId)
+        if (i >= 0) panes.splice(i, 1)
+        return { closed: true }
+      },
+      'agent.resume': ({ workspaceId, agent, sessionId }: { workspaceId: 'w-local' | 'w-remote'; agent: string; sessionId: string }) => {
+        const terminalId = `n${next++}`
+        panes.push({ terminalId, agent, state: 'waiting', sessionId, ws: workspaceId })
+        return { terminalId, started: true }
+      },
+      'terminal.sendText': { accepted: true },
+      'workspace.list': {
+        workspaces: [
+          { id: 'w-local', kind: 'worktree', name: 'local-app', projectId: 'p-local', path: '/local/repo', branch: 'main', hostId: 'local' },
+          { id: 'w-remote', kind: 'worktree', name: 'remote-app', projectId: 'p-remote', path: '/srv/repo', branch: 'main', hostId: null }
+        ],
+        truncated: false
+      },
+      'project.list': {
+        projects: [
+          { id: 'p-local', name: 'local-app', kind: 'git', hostId: 'local', path: '/local/repo' },
+          { id: 'p-remote', name: 'remote-app', kind: 'git', hostId: 'runtime:remote-box', path: '/srv/repo' }
+        ],
+        truncated: false
+      },
+      'workspace.readContext': () => ({ workspaceId: focused, branch: 'main', displayName: focused, terminals: [] }),
+      'notifications.show': { delivered: true },
+      'statusBar.update': { ok: true }
+    }
+  })
+  let rotator!: Rotator
+  const mod = {
+    default: async (orca: OrcaWorkerApi) => {
+      rotator = await activateWith(orca, { cli, now: () => clock, sleep: async () => undefined }, { tick: false })
+    }
+  }
+  return {
+    host,
+    cliCalls,
+    panes,
+    get rotator() {
+      return rotator
+    },
+    advance(ms: number) {
+      clock += ms
+    },
+    focus(ws: 'w-local' | 'w-remote') {
+      focused = ws
+    },
+    event(terminalId: string, ws: 'w-local' | 'w-remote') {
+      return { workspaceId: ws, paneKey: `pane-${terminalId}`, terminalId, state: 'done' as const, receivedAt: 1, mainAgent: { state: 'done' as const, stateStartedAt: 1 } }
+    },
+    async mount() {
+      const worker = await mountWorker(mod, { host })
+      await rotator.accounts(true)
+      return worker
+    }
+  }
+}
+
+test('per server: a limit and a switch on a paired server leave this computer’s account, cooldown and switch cooldown alone', async () => {
+  const w = twoServers({
+    panes: [
+      { terminalId: 'tr1', agent: 'claude', state: 'done', sessionId: 'sr1', ws: 'w-remote' },
+      { terminalId: 'tl1', agent: 'claude', state: 'working', sessionId: 'sl1', ws: 'w-local' }
+    ],
+    tails: { tr1: [...fx.CLAUDE_SESSION_LIMIT], tl1: ['⏺ Working on it…'] },
+    // This computer's c1 is running Low while a session is in the middle of a turn on it.
+    localUsage: { session: 97, weekly: 20 },
+    state: { paneSeat: { tr1: 'claude:c1', tl1: 'claude:c1' } }
+  })
+  const worker = await w.mount()
+  // The paired server's c1 hits its limit: its session moves to that server's c2.
+  await worker.emit('agent.status.changed', w.event('tr1', 'w-remote'))
+  assert.deepEqual(selects(w), ['select@remote-box claude c2'])
+  let state = stored(w)
+  assert.ok(state.health['remote-box|claude:c1']?.cooldownUntil! > 1_000_000)
+  assert.equal(state.health['claude:c1'], undefined)
+  assert.equal(state.lastAutoSwitchAt?.['remote-box|claude'], 1_000_000)
+  assert.equal(state.lastAutoSwitchAt?.claude, undefined)
+  // Orca has no numbers for that server's c2: the probation that follows is that server's too.
+  assert.equal(state.probation?.['remote-box|claude']?.key, 'claude:c2')
+  assert.equal(state.probation?.claude, undefined)
+  // This computer's c1 shows no cooldown in the panel…
+  const local = await worker.request('rotator.snapshot', {})
+  assert.equal(local.server, undefined)
+  assert.equal(local.seats.find((s) => s.key === 'claude:c1')?.cooldownUntil, undefined)
+  // …and its selection may change in the same minute: the paired server's switch is not its own.
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select@remote-box claude c2', 'select claude c2'])
+  state = stored(w)
+  assert.equal(state.lastAutoSwitchAt?.claude, 1_000_000)
+  assert.ok(state.leftLow?.['claude:c1'])
+  assert.equal(state.leftLow?.['remote-box|claude:c1'], undefined)
+  // Within its own cooldown neither server's selection changes again by advice.
+  await w.rotator.tick()
+  assert.equal(selects(w).length, 2)
+  // The paired server's panel shows its own cooldown, and *Clear* clears that one only.
+  w.focus('w-remote')
+  const remote = await worker.request('rotator.snapshot', { refresh: true })
+  assert.equal(remote.server, 'remote-box')
+  assert.ok(remote.seats.find((s) => s.key === 'claude:c1')?.cooldownUntil)
+  await worker.request('rotator.clearCooldown', { seatKey: 'claude:c1' })
+  state = stored(w)
+  assert.equal(state.health['remote-box|claude:c1'], undefined)
+  assert.ok(state.leftLow?.['claude:c1'])
+  await worker.deactivate()
+})
+
+test('per server: state stored before the keys carried a server loads as this computer’s, and never applies to a paired server', async () => {
+  const w = twoServers({
+    panes: [
+      { terminalId: 'tr1', agent: 'claude', state: 'done', sessionId: 'sr1', ws: 'w-remote' },
+      { terminalId: 'tl1', agent: 'claude', state: 'done', sessionId: 'sl1', ws: 'w-local' }
+    ],
+    tails: { tr1: [...fx.CLAUDE_SESSION_LIMIT], tl1: [...fx.CLAUDE_SESSION_LIMIT] },
+    state: {
+      paneSeat: { tr1: 'claude:c1', tl1: 'claude:c1' },
+      // As an older version stored them: bare seat keys, a bare provider.
+      health: { 'claude:c2': { cooldownUntil: 1_000_000 + 30 * MIN, reason: 'rate_limit: 5-hour limit reached' } },
+      lastAutoSwitchAt: { claude: 1_000_000 },
+      probation: { claude: { key: 'claude:c3', until: 1_000_000 + 10 * MIN } },
+      leftLow: { 'claude:c3': { at: 1_000_000, until: 1_000_000 + 3_600_000 } }
+    }
+  })
+  const worker = await w.mount()
+  // On this computer everything is as before: c2 is cooling down, so the limit on c1 goes past it.
+  const before = await worker.request('rotator.snapshot', {})
+  assert.equal(before.seats.find((s) => s.key === 'claude:c2')?.cooldownUntil, 1_000_000 + 30 * MIN)
+  await worker.emit('agent.status.changed', w.event('tl1', 'w-local'))
+  assert.deepEqual(selects(w), ['select claude c3'])
+  let state = stored(w)
+  assert.equal(state.health['claude:c2']?.cooldownUntil, 1_000_000 + 30 * MIN)
+  assert.ok(state.health['claude:c1']?.cooldownUntil)
+  assert.deepEqual(state.probation?.claude, { key: 'claude:c3', until: 1_000_000 + 10 * MIN })
+  assert.ok(state.leftLow?.['claude:c3'])
+  // The paired server's c2 is another account: this computer's cooldown does not keep its
+  // session from moving there.
+  await worker.emit('agent.status.changed', w.event('tr1', 'w-remote'))
+  assert.deepEqual(selects(w), ['select claude c3', 'select@remote-box claude c2'])
+  state = stored(w)
+  assert.ok(state.health['remote-box|claude:c1']?.cooldownUntil)
+  assert.equal(state.waiting.length, 0)
+  await worker.deactivate()
+})
+
+test('per server: a paired server’s "left as Low" mark survives a read of this computer’s accounts, and ends with its window', async () => {
+  const w = twoServers({
+    panes: [],
+    tails: {},
+    state: {
+      leftLow: {
+        'remote-box|claude:c2': { at: 1_000_000, until: 1_000_000 + 60 * MIN, used: 97 },
+        // This computer has no such account any more: its mark goes, as before.
+        'claude:gone': { at: 1_000_000, until: 1_000_000 + 60 * MIN }
+      }
+    }
+  })
+  const worker = await w.mount()
+  await w.rotator.accounts(true)
+  await w.rotator.tick()
+  assert.deepEqual(Object.keys(stored(w).leftLow ?? {}), ['remote-box|claude:c2'])
+  // A read of the paired server's own accounts keeps it too while its window lasts…
+  w.focus('w-remote')
+  w.advance(2 * MIN)
+  await w.rotator.tick()
+  assert.equal(w.rotator.snapshot().server, 'remote-box')
+  assert.deepEqual(Object.keys(stored(w).leftLow ?? {}), ['remote-box|claude:c2'])
+  // …and once the window is over, any read drops it.
+  w.focus('w-local')
+  w.advance(60 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(Object.keys(stored(w).leftLow ?? {}), [])
+  await worker.deactivate()
+})
+
+test('launch hook: a storage failure while noting the new pane’s account is logged, never an unhandled rejection', async () => {
+  const logs: string[] = []
+  let fail = false
+  const rotator = new Rotator({
+    host: { call: async (method: string) => (method === 'workspace.readContext' ? { workspaceId: 'w1' } : method === 'workspace.list' ? { workspaces: [{ id: 'w1', hostId: 'local' }] } : {}) },
+    cli: {
+      listAccounts: async () => fx.accountList(),
+      select: async () => undefined,
+      closeTerminal: async () => undefined,
+      sendText: async () => undefined,
+      git: async () => ''
+    },
+    now: () => 1_000_000,
+    sleep: async () => undefined,
+    loadState: async () => null,
+    saveState: async () => {
+      if (fail) throw new Error('storage is full')
+    },
+    config: async () => DEFAULT_CONFIG,
+    log: (message) => logs.push(message),
+    notify: async () => undefined,
+    publish: () => undefined,
+    loadUsage: async () => null,
+    saveUsage: async () => undefined,
+    readLive: async () => null,
+    loadSamples: async () => null,
+    saveSamples: async () => undefined
+  })
+  await rotator.init()
+  await rotator.accounts(true)
+  fail = true
+  rotator.noteLaunch('claude', 't9', 'w1')
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  // The account is still remembered for this run; only the write failed.
+  assert.equal(rotator.state.paneSeat.t9, 'claude:c1')
+  assert.deepEqual(logs.filter((l) => /could not save/.test(l)), ['could not save the account of t9: storage is full'])
+  rotator.dispose()
+})
+
+test('per server: a session in the middle of a turn on a paired server does not count as one on this computer’s account', async () => {
+  const w = twoServers({
+    panes: [
+      { terminalId: 'tr1', agent: 'claude', state: 'working', sessionId: 'sr1', ws: 'w-remote' },
+      // This computer's only session is between turns (and not idle for long): it moves itself at
+      // its next turn end, so the selection is left alone until then.
+      { terminalId: 'tl1', agent: 'claude', state: 'done', sessionId: 'sl1', ws: 'w-local', stateStartedAt: 1_000_000 }
+    ],
+    tails: { tr1: ['⏺ Working on it…'], tl1: [...fx.CLAUDE_TALKING_ABOUT_LIMITS] },
+    localUsage: { session: 97, weekly: 20 },
+    state: { paneSeat: { tr1: 'claude:c1', tl1: 'claude:c1' } }
+  })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  // No change of selection, so Orca shows no restart prompt for a session that is elsewhere.
+  assert.deepEqual(selects(w), [])
+  // With a session of this computer's own in the middle of a turn there, it does change.
+  w.panes.find((p) => p.terminalId === 'tl1')!.state = 'blocked'
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
   await worker.deactivate()
 })
