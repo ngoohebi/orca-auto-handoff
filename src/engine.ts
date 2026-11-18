@@ -975,7 +975,7 @@ export class Rotator {
         if (this.looksAhead(config) && (await this.modelRoomElsewhere(pane, signal, config))) {
           return this.limitHit(pane, signal, config, lines, 'model_cap')
         }
-        if (await this.fallbackModel(pane, config, signal)) return
+        if (await this.fallbackModel(pane, config, signal, lines)) return
         return this.limitHit(pane, signal, config, lines, 'model_cap')
       case 'auth':
         return this.limitHit(pane, signal, config, lines, 'auth')
@@ -998,9 +998,33 @@ export class Rotator {
     await this.save()
     await this.deps.sleep(backoffMs(attempt))
     if (!(await this.allowed(pane.agent))) return
+    // The backoff can be minutes: only type when the pane is still between turns and its input
+    // box is empty. Typing would send the user's unsent text, or land in a turn they started.
+    const { agents } = await this.deps.host.call('agents.list', { workspaceId: pane.workspaceId }).catch(() => ({ agents: [] as any[] }))
+    const row = agents.find((a: any) => a.terminalId === pane.terminalId)
+    if (!row || (row.state !== 'waiting' && row.state !== 'done')) {
+      this.deps.log(`${pane.agent} ${pane.terminalId}: no longer between turns, not retrying`)
+      return
+    }
+    const screen = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
+    if (!screen) {
+      this.deps.log(`${pane.agent} ${pane.terminalId}: unreadable, not retrying`)
+      return
+    }
+    if (hasDraft(screen.lines)) return this.leftForDraft(pane, 'api_error', 'the API error was not retried')
     await this.type(pane.terminalId, config.autoMessage || 'continue', pane.server)
     this.record({ provider: pane.agent, terminalId: pane.terminalId, reason: 'api_error', result: 'retried', detail: `attempt ${attempt + 1}` })
     await this.save()
+    this.publishNow()
+  }
+
+  /** Typing into a pane sends whatever is in its input box: with unsent text there, nothing is
+   *  typed. Noted in the history and said once, so the user knows why the pane stays as it is. */
+  private async leftForDraft(pane: PaneInfo, reason: 'api_error' | 'model_cap', what: string): Promise<void> {
+    this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not typing into it`)
+    this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', detail: 'unsent text in the input box' })
+    await this.save()
+    await this.deps.notify('Auto Hand-off', `${PROVIDER_NAME[pane.agent]}: the session has unsent text in its input box, so ${what}. It is left for you to continue.`)
     this.publishNow()
   }
 
@@ -1014,7 +1038,7 @@ export class Rotator {
     return !!pickNext(chain, from?.key, this.state.health, config, now, { only })
   }
 
-  private async fallbackModel(pane: PaneInfo, config: Config, signal: Signal): Promise<boolean> {
+  private async fallbackModel(pane: PaneInfo, config: Config, signal: Signal, lines: readonly string[]): Promise<boolean> {
     const adapter = ADAPTERS[pane.agent]
     const models = (parseModelFallback(config.modelFallback)[pane.agent] ?? []).filter(
       (m) => !signal.model || !m.toLowerCase().includes(signal.model)
@@ -1022,6 +1046,11 @@ export class Rotator {
     const step = this.state.modelStep[pane.terminalId] ?? 0
     if (!adapter.modelSwitch || step >= models.length) return false
     const model = models[step]!
+    if (hasDraft(lines)) {
+      // `/model …` and the first message would both send the user's unsent text.
+      await this.leftForDraft(pane, 'model_cap', `the model was not switched to ${model}`)
+      return true
+    }
     this.state.modelStep[pane.terminalId] = step + 1
     await this.type(pane.terminalId, adapter.modelSwitch(model), pane.server)
     await this.deps.sleep(1500)
@@ -1129,6 +1158,12 @@ export class Rotator {
       // A manual move works under the manual strategy too.
       const config: Config = reason === 'manual' && base.strategy === 'manual' ? { ...base, strategy: 'drain' } : base
       const advisory = reason === 'threshold' || reason === 'idle'
+      // The user may have gone on in the pane while this waited behind another move: a turn that
+      // runs is never closed. Its end is a new event. (Advice checks this in `advisoryOk`.)
+      if (reason !== 'manual' && !advisory && (await this.midTurn(pane))) {
+        this.deps.log(`${pane.agent} ${pane.terminalId}: in the middle of a turn again, not moving it`)
+        return
+      }
       // Right after a move onto a seat without numbers, advice waits; only a real limit moves on.
       if (advisory && this.probation(pane.agent, this.deps.now())) return
       const view = await this.accountsFor(pane.server, true)
@@ -1303,7 +1338,14 @@ export class Rotator {
      *  (smart.ts); headroom is not the point of that move. */
     rule: 'gap' | 'low' | 'switch-back' | 'expiring' = 'gap'
   ): Promise<boolean> {
-    if (hasDraft(lines)) {
+    // `lines` were read before this move waited for its turn (the lock, a fresh account read):
+    // look at the pane as it is now.
+    if (await this.midTurn(pane)) {
+      this.deps.log(`${pane.agent} ${pane.terminalId}: in the middle of a turn again, not moving it`)
+      return false
+    }
+    const screen = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
+    if (hasDraft(screen?.lines ?? lines)) {
       this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not moving it`)
       return false
     }
@@ -1313,6 +1355,13 @@ export class Rotator {
     // change is what must not flap.
     if (view.active[target.provider] !== target.key && !this.canChangeSelection(target.provider, config, now)) return false
     return true
+  }
+
+  /** Is the pane in the middle of a turn right now? False when Orca cannot say. */
+  private async midTurn(pane: PaneInfo): Promise<boolean> {
+    const { agents } = await this.deps.host.call('agents.list', { workspaceId: pane.workspaceId }).catch(() => ({ agents: [] as any[] }))
+    const row = agents.find((a: any) => a.terminalId === pane.terminalId)
+    return !!row && row.state !== 'waiting' && row.state !== 'done'
   }
 
   private canChangeSelection(provider: Provider, config: Config, now: number): boolean {

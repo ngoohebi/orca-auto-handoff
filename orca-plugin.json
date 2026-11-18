@@ -205,7 +205,7 @@
         "title": "Model fallback",
         "type": "string",
         "default": "",
-        "description": "Models to try in place before switching account when a model-specific cap is hit, e.g. claude=sonnet,haiku; codex=gpt-5-mini"
+        "description": "Models to try on the same account when one model's limit is hit, e.g. claude=sonnet,haiku; codex=gpt-5-mini"
       },
       {
         "key": "default_cooldown_minutes",

@@ -233,7 +233,7 @@ footer a{color:var(--fg-2)}
         <span class="badge">v<b>0.2.0</b></span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
         <span class="badge"><b>MIT</b> license</span>
-        <span class="badge"><b>60</b> tests, real captured banners</span>
+        <span class="badge"><b>188</b> tests, real captured banners</span>
         <span class="badge">Never switches <b>across services</b></span>
       </div>
       <div class="cta">
@@ -331,10 +331,10 @@ footer a{color:var(--fg-2)}
       <thead><tr><th>Trigger</th><th>Action</th></tr></thead>
       <tbody>
         <tr><td>Rate-limit banner in the pane's latest output</td><td>Cool the account down until the parsed reset time, switch, resume.</td></tr>
-        <tr><td>Model-specific cap (for example a Claude Fable weekly cap)</td><td>Type <code>/model &lt;next&gt;</code> from <em>Model fallback</em> in place. Switch accounts only when the list runs out.</td></tr>
-        <tr><td>API error (529, overloaded, stream disconnected)</td><td>Type the first message again after a Fibonacci backoff from 5 s to 120 s, up to the retry limit.</td></tr>
+        <tr><td>Model-specific cap (for example a Claude Fable weekly cap)</td><td>Smart and Follow my order: move to an account known to have room for that model, then type <code>/model &lt;next&gt;</code> from <em>Model fallback</em> in place, then try an account not known to be full for that model, then wait. Custom: <code>/model &lt;next&gt;</code> first, and switch accounts only when the list runs out. <code>/model</code> is never typed into a pane whose input box holds unsent text.</td></tr>
+        <tr><td>API error (529, overloaded, stream disconnected)</td><td>Type the first message again after a Fibonacci backoff from 5 s to 120 s, up to the retry limit. Only while the pane is still between turns, and never into an input box that holds unsent text.</td></tr>
         <tr><td>Auth failure</td><td>12-hour cooldown on that account, then switch.</td></tr>
-        <tr><td>A turn ends while the account is over a threshold</td><td>Switch. The account left behind stays out of rotation until its window resets. Thresholds default to 100 %, so this is reactive only.</td></tr>
+        <tr><td>A turn ends while the account is over a threshold</td><td>Switch. The account left behind stays out of rotation until its window resets. Smart, the default, also leaves an account shortly before it runs out (about 10 minutes ahead at the current pace), between turns or when the session is idle. In custom mode thresholds default to 100 %, so this is reactive only.</td></tr>
         <tr><td>Every account of the service limited</td><td>Park the session and wake it when the earliest account frees up. Carry on in the parked pane yourself and the wait ends.</td></tr>
         <tr><td>A higher-priority account is healthy again</td><td><b>Switch back.</b> New launches use it, and sessions on lower accounts move back when they finish a turn or sit idle.</td></tr>
         <tr><td>A session idles on an over-threshold account</td><td>Move it after <em>Move idle sessions after</em> seconds, 900 by default.</td></tr>
@@ -356,16 +356,16 @@ footer a{color:var(--fg-2)}
     <div class="sec-head">
       <div class="eyebrow">Strategies</div>
       <h2>Choose how the pool is spent</h2>
-      <p class="lede">The <code>chain</code> setting orders accounts within each service, by email or seat key. Example: <code>me@example.com, claude:*</code>. Empty means Orca's order.</p>
+      <p class="lede">Out of the box the plugin runs in <b style="color:var(--fg)">Smart</b> mode (<em>Auto-switch</em>): it looks ahead, leaves an account shortly before it runs out, and picks the next one by how long it will last. <em>Follow my order</em> follows your account order instead. The strategies below are the <em>Advanced</em> settings, used when <em>Auto-switch</em> is <code>custom</code> (kept automatically for settings changed in an earlier version). The <code>chain</code> setting orders accounts within each service, by email or seat key. Example: <code>me@example.com, claude:*</code>. Empty means Orca's order.</p>
     </div>
     <div class="grid g5">
-      <div class="tile default"><h3>drain <span class="tag">default</span></h3><p>Stay on an account until it is limited, then take the next in chain order.</p></div>
+      <div class="tile"><h3>drain</h3><p>Stay on an account until it is limited, then take the next in chain order.</p></div>
       <div class="tile"><h3>balanced</h3><p>Always the account with the most room.</p></div>
       <div class="tile"><h3>priority</h3><p>Always the first healthy account in the chain.</p></div>
       <div class="tile"><h3>soonest-reset</h3><p>The account whose weekly window resets first, so expiring usage is spent before it is lost.</p></div>
       <div class="tile"><h3>manual</h3><p>Never switch automatically. The panel and commands still work.</p></div>
     </div>
-    <p class="lede" style="margin-top:24px"><b style="color:var(--fg)">Switch back</b> is on by default for drain and priority, where the chain is a priority order. Once an earlier account is out of cooldown and under its thresholds, new launches use it again and lingering sessions migrate back after their next turn, or after sitting idle.</p>
+    <p class="lede" style="margin-top:24px"><b style="color:var(--fg)">Switch back</b> applies in <em>Follow my order</em>, and in custom mode (on by default) for drain and priority, where the chain is a priority order. Once an earlier account is out of cooldown and under its thresholds, new launches use it again and lingering sessions migrate back after their next turn, or after sitting idle.</p>
   </div>
 </section>
 
@@ -425,13 +425,17 @@ footer a{color:var(--fg-2)}
     <div class="sec-head">
       <div class="eyebrow">Settings</div>
       <h2>Every knob, straight from the manifest</h2>
-      <p class="lede">Settings → Plugins → Auto Hand-off. Every cux key is here, plus the chain, exclusions, switch-back guards and the console status line format.</p>
+      <p class="lede">Settings → Plugins → Auto Hand-off. The first four rows are all most people need. Every cux key is here too, plus the chain, exclusions, switch-back guards and the console status line format; the strategy, switch-back, threshold, gap, idle, resume and wait rows are <em>Advanced</em> and only used when <em>Auto-switch</em> is <code>custom</code>.</p>
     </div>
     <div class="tscroll">
     <table class="tbl">
       <thead><tr><th>Key</th><th>Default</th><th>What it does</th></tr></thead>
       <tbody>
-<tr><td><code>strategy</code><div class="st">Strategy</div></td><td>drain</td><td>drain, balanced, priority, soonest-reset or manual. See <a href="#strategies">Strategies</a>.</td></tr>
+<tr><td><code>mode</code><div class="st">Auto-switch</div></td><td>auto</td><td>smart: looks ahead (see <a href="#strategies">Strategies</a>). my-order: follows your account order and goes back to an earlier account when it is free again. manual: never switches by itself. custom: uses the Advanced settings exactly as set. auto: smart, unless you had changed the Advanced settings in an earlier version; those are then kept.</td></tr>
+<tr><td><code>switch_early</code><div class="st">Switch early</div></td><td>just-before</td><td>just-before: about 10 minutes before the limit at the current pace. earlier: about 25 minutes before. at-limit: only when the limit is reached. Not used in custom mode.</td></tr>
+<tr><td><code>running_sessions</code><div class="st">Running sessions</div></td><td>move</td><td>move: a session moves between turns or when idle, never in the middle of a turn and never with unsent text in its input box. limit: only when it hits a limit. launches: running sessions are never moved. Not used in custom mode.</td></tr>
+<tr><td><code>when_all_used</code><div class="st">When everything is used up</div></td><td>wait</td><td>wait: the session waits for the first account to reset and resumes by itself. stop: it stops and you are told. Not used in custom mode.</td></tr>
+<tr><td><code>strategy</code><div class="st">Advanced: Strategy</div></td><td>drain</td><td>Only used when Auto-switch is custom. drain, balanced, priority, soonest-reset or manual. See <a href="#strategies">Strategies</a>.</td></tr>
 <tr><td><code>chain</code><div class="st">Account chain</div></td><td><em>empty</em></td><td>Comma-separated order of accounts within each service: emails, seat keys (claude:&lt;id&gt;, codex:system) or provider:*. Example: me@example.com, claude:*. Empty = Orca's order. Switching never leaves the agent's own service.</td></tr>
 <tr><td><code>exclude</code><div class="st">Never switch to</div></td><td><em>empty</em></td><td>Comma-separated accounts that automatic hand-off never picks (emails, seat keys, or provider:*). Picking them from the panel still works.</td></tr>
 <tr><td><code>service_claude</code><div class="st">Auto hand-off Claude accounts</div></td><td>on</td><td>Off: Claude panes are never switched or resumed automatically (manual switching still works). The same switch exists for <code>service_codex</code>, <code>service_antigravity</code>, <code>service_opencode</code> and <code>service_devin</code>.</td></tr>
@@ -448,7 +452,7 @@ footer a{color:var(--fg-2)}
 <tr><td><code>wait_for_reset</code><div class="st">Wait for reset when every account is exhausted</div></td><td>on</td><td></td></tr>
 <tr><td><code>retry_on_api_error</code><div class="st">Retry on API errors</div></td><td>on</td><td>Types the first message again after a Fibonacci backoff (5 s … 120 s).</td></tr>
 <tr><td><code>max_api_retries</code><div class="st">Maximum API error retries</div></td><td>6</td><td></td></tr>
-<tr><td><code>model_fallback</code><div class="st">Model fallback</div></td><td><em>empty</em></td><td>Models to try in place before switching account when a model-specific cap is hit, e.g. claude=sonnet,haiku; codex=gpt-5-mini</td></tr>
+<tr><td><code>model_fallback</code><div class="st">Model fallback</div></td><td><em>empty</em></td><td>Models to try on the same account when one model's limit is hit, e.g. claude=sonnet,haiku; codex=gpt-5-mini</td></tr>
 <tr><td><code>default_cooldown_minutes</code><div class="st">Default cooldown (minutes)</div></td><td>60</td><td>Used when neither the message nor Orca says when a limit resets.</td></tr>
 <tr><td><code>poll_interval_seconds</code><div class="st">Usage refresh interval (seconds)</div></td><td>60</td><td></td></tr>
 <tr><td><code>handoff_max_chars</code><div class="st">Handoff prompt size limit</div></td><td>6000</td><td></td></tr>
@@ -519,7 +523,7 @@ footer a{color:var(--fg-2)}
     <div class="note"><b>Coming from cux?</b> Run <code>cux uninstall-hooks</code> first so the two don't both rotate. Every cux setting key has the same name here. Per-directory project bindings and <code>cux attach</code> are not migrated yet.</div>
     <details>
       <summary>Working on the plugin itself</summary>
-      <pre style="margin-top:12px"><code>orca plugin test . --json        # 60 tests: adapters, selector, worker end to end, panel
+      <pre style="margin-top:12px"><code>orca plugin test . --json        # 188 tests: adapters, selector, usage, status line, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker
 npx -p typescript tsc -p .       # type-check
 orca plugin validate . --json

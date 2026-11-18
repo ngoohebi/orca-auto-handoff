@@ -31,6 +31,8 @@ function world(options: {
   failSelect?: string[]
   /** Terminals in the active tab of each workspace (`orca terminal list --include-visual-layouts`). */
   activeTerminals?: string[]
+  /** Called when the plugin waits (a backoff, a settle delay), with the wait in ms. */
+  onSleep?: (ms: number) => void
 }) {
   let clock = 1_000_000
   let claudeActive: string | null = 'c1'
@@ -129,7 +131,7 @@ function world(options: {
     default: async (orca: OrcaWorkerApi) => {
       rotator = await activateWith(
         orca,
-        { cli, now: () => clock, sleep: async () => undefined },
+        { cli, now: () => clock, sleep: async (ms: number) => options.onSleep?.(ms) },
         { tick: false }
       )
     }
@@ -274,6 +276,79 @@ test('API error: retry in place with backoff, no account change', async () => {
   assert.equal(w.cliCalls.filter((c) => c.startsWith('select')).length, 0)
   assert.equal((w.host.data().storage.state as RotatorState).apiRetries.t1, 2)
   await worker.deactivate()
+})
+
+const DRAFT_BOX = ['╭──────────────╮', '│ > also update the docs', '╰──────────────╯']
+
+test('API error: the retry never types into a pane that holds unsent text, or that works again', async () => {
+  // Unsent text already in the input box when the error shows.
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_API_ERROR, ...DRAFT_BOX] }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(w.typed, [])
+  assert.equal(w.cliCalls.filter((c) => c.startsWith('send')).length, 0)
+  const last = (w.host.data().storage.state as RotatorState).history.at(-1)
+  assert.equal(last?.reason, 'api_error')
+  assert.equal(last?.result, 'failed')
+  assert.match(last?.detail ?? '', /unsent text/)
+  assert.match((w.host.callsOf('notifications.show') as { body?: string }[]).at(-1)?.body ?? '', /unsent text/)
+  await worker.deactivate()
+
+  // The user starts typing during the backoff.
+  const tails: Record<string, string[]> = { t1: [...fx.CLAUDE_API_ERROR] }
+  const during = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails,
+    onSleep: () => {
+      tails.t1 = [...fx.CLAUDE_API_ERROR, ...DRAFT_BOX]
+    }
+  })
+  const dw = await during.mount()
+  await dw.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(during.typed, [])
+  assert.match((during.host.data().storage.state as RotatorState).history.at(-1)?.detail ?? '', /unsent text/)
+  await dw.deactivate()
+
+  // The user sent a message during the backoff: the agent is in the middle of a turn.
+  const busy = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_API_ERROR] },
+    onSleep: () => {
+      busy.panes[0]!.state = 'working'
+    }
+  })
+  const bw = await busy.mount()
+  await bw.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(busy.typed, [])
+  await bw.deactivate()
+})
+
+test('model cap: the fallback model is never typed into a pane that holds unsent text', async () => {
+  for (const mode of ['smart', 'custom']) {
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: [...fx.CLAUDE_MODEL_CAP, ...DRAFT_BOX] },
+      settings: { mode, model_fallback: 'claude=fable,sonnet' }
+    })
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    // Neither `/model sonnet` nor the first message: both would send the user's text.
+    assert.deepEqual(w.typed, [], mode)
+    assert.equal(w.cliCalls.filter((c) => c.startsWith('send')).length, 0)
+    assert.equal(w.host.callsOf('terminal.close').length, 0)
+    const state = w.host.data().storage.state as RotatorState
+    const last = state.history.at(-1)
+    assert.equal(last?.reason, 'model_cap')
+    assert.equal(last?.result, 'failed')
+    assert.match(last?.detail ?? '', /unsent text/)
+    // The fallback model is still there for the next time.
+    assert.equal(state.modelStep.t1 ?? 0, 0)
+    assert.match((w.host.callsOf('notifications.show') as { body?: string }[]).at(-1)?.body ?? '', /unsent text/)
+    await worker.deactivate()
+  }
 })
 
 test('model cap: switch model in place before rotating accounts', async () => {
@@ -1922,6 +1997,57 @@ test('smart: unsent text in the input box blocks the move', async () => {
   w.tails.t1 = ['❯ also update the docs', '⏺ Updated README.md.', '╭──────────────╮', '│ >', '╰──────────────╯']
   await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
   assert.deepEqual(selects(w), ['select claude c2'])
+  await worker.deactivate()
+})
+
+test('a session that went on while its move waited behind another one is left alone', async () => {
+  // Two sessions end a turn on a Low account at once. While the first is being moved (close,
+  // resume, wait until ready), the user goes on in the second.
+  for (const went of ['typing', 'working'] as const) {
+    const w = calm(
+      { session: 97, weekly: 40 },
+      {
+        panes: [
+          { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
+          { terminalId: 'tB', agent: 'claude', state: 'done', sessionId: 'sB' }
+        ],
+        tails: { t1: [...fx.CLAUDE_TALKING_ABOUT_LIMITS], tB: [...fx.CLAUDE_TALKING_ABOUT_LIMITS] },
+        state: { paneSeat: { t1: 'claude:c1', tB: 'claude:c1' } },
+        onSleep: () => {
+          if (went === 'typing') w.tails.tB = [...fx.CLAUDE_TALKING_ABOUT_LIMITS, ...DRAFT_BOX]
+          else w.panes.find((p) => p.terminalId === 'tB')!.state = 'working'
+        }
+      }
+    )
+    const worker = await w.mount()
+    await Promise.all([worker.emit('agent.status.changed', statusEvent('t1')), worker.emit('agent.status.changed', statusEvent('tB'))])
+    assert.deepEqual((w.host.callsOf('agent.resume') as { sessionId: string }[]).map((c) => c.sessionId), ['s1'], went)
+    assert.ok(w.panes.some((p) => p.terminalId === 'tB'), went)
+    await worker.deactivate()
+  }
+})
+
+test('a limited session the user restarted while its move waited behind another one is not closed mid-turn', async () => {
+  const w = world({
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
+      { terminalId: 'tB', agent: 'claude', state: 'done', sessionId: 'sB' }
+    ],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT, tB: fx.CLAUDE_SESSION_LIMIT },
+    state: { paneSeat: { t1: 'claude:c1', tB: 'claude:c1' } },
+    onSleep: () => {
+      w.panes.find((p) => p.terminalId === 'tB')!.state = 'working'
+    }
+  })
+  const worker = await w.mount()
+  await Promise.all([worker.emit('agent.status.changed', statusEvent('t1')), worker.emit('agent.status.changed', statusEvent('tB'))])
+  assert.deepEqual((w.host.callsOf('agent.resume') as { sessionId: string }[]).map((c) => c.sessionId), ['s1'])
+  assert.ok(w.panes.some((p) => p.terminalId === 'tB'))
+  // When that turn ends on the same limit (a new copy of the banner), it is handled then.
+  w.panes.find((p) => p.terminalId === 'tB')!.state = 'done'
+  w.tails.tB = [...fx.CLAUDE_SESSION_LIMIT, '❯ continue', ...fx.CLAUDE_SESSION_LIMIT]
+  await worker.emit('agent.status.changed', statusEvent('tB', 'done', 2))
+  assert.equal(w.host.callsOf('agent.resume').length, 2)
   await worker.deactivate()
 })
 

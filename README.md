@@ -124,8 +124,8 @@ The table below lists every trigger. Rows that mention thresholds, strategies or
 |---|---|
 | Rate-limit banner in the pane's latest output | Cooldown that seat until the parsed reset time (else Orca's `resetsAt`, else *Default cooldown*), switch, resume. The next account is one with known room if there is one, else one presumed reset, else one without numbers |
 | Banner with no reset time on an account without usage numbers | A *strike*: the cooldown is *Default cooldown* × 2 per strike (60, 120, 240 min …), at most 5 h. Strikes count for 24 h |
-| Model-specific cap (e.g. Claude Fable weekly) | Smart and Follow my order: an account known to have room for that model, then `/model <next>` from *Model fallback* in place, then an account not known to be full for that model, then wait. Custom: `/model <next>` first; switch accounts only when the list runs out |
-| API error (529, overloaded, stream disconnected) | Type the first message again after a Fibonacci backoff (5 s … 120 s), up to *Maximum API error retries* |
+| Model-specific cap (e.g. Claude Fable weekly) | Smart and Follow my order: an account known to have room for that model, then `/model <next>` from *Model fallback* in place, then an account not known to be full for that model, then wait. Custom: `/model <next>` first; switch accounts only when the list runs out. `/model` is never typed into a pane whose input box holds unsent text; you are told instead |
+| API error (529, overloaded, stream disconnected) | Type the first message again after a Fibonacci backoff (5 s … 120 s), up to *Maximum API error retries*. Only while the pane is still between turns, and never into an input box that holds unsent text; you are told instead |
 | Auth failure | 12 h cooldown on that seat, switch |
 | A turn ends while the seat is over a threshold | Switch to an account with known room (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets. An account without numbers is taken only when the current one is known to be at 100 % and no known account is left |
 | Every seat limited | Park; wake when the earliest seat frees up (*Wait for reset*). Carry on in the parked pane yourself and the wait ends |
@@ -508,7 +508,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 146 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 188 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json
