@@ -37,6 +37,9 @@ import { minLeft, percentLeft, PROVIDER_NAME, runwayWords, seatOrder } from './l
 import type { ConsoleLineState, Snapshot } from './protocol'
 import { PROVIDERS, type Provider } from './types'
 
+/** The Auto-switch mode as the panel names it. */
+const MODE_NAME = { smart: 'Smart', 'my-order': 'My order', manual: 'Manual', custom: 'Custom' } as const
+
 const snapshot = atom<Snapshot | null>(null)
 const busy = atom<string | null>(null)
 const message = atom<string | null>(null)
@@ -549,6 +552,7 @@ export default function Panel() {
         <Row gap="sm" align="center">
           <Heading>Auto Hand-off</Heading>
           {snap.paused ? <Badge tone="warning">paused</Badge> : null}
+          {snap.mode ? <Badge tone="neutral">{MODE_NAME[snap.mode]}</Badge> : null}
         </Row>
         <IconButton
           icon="refresh"
@@ -592,6 +596,22 @@ export default function Panel() {
       {snap.error ? (
         <Callout tone="danger" title="Cannot read accounts">
           {snap.error}
+        </Callout>
+      ) : null}
+      {snap.notice ? (
+        <Callout tone="neutral" title="Your settings were kept">
+          <Text size="xs">{snap.notice}</Text>
+          <Button
+            size="sm"
+            variant="outline"
+            onPress={() =>
+              act('notice', async () => {
+                await plugin.request('rotator.dismissNotice', {})
+              })
+            }
+          >
+            Got it
+          </Button>
         </Callout>
       ) : null}
       <Waiting snap={snap} />

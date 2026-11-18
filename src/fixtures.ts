@@ -62,7 +62,7 @@ export function accountList(options: {
   codexUsage?: { session: number; weekly: number }
   inactiveCodex?: Record<string, number>
   /** Claude accounts not in use that Orca has numbers for; the others report nothing. */
-  inactiveClaude?: Record<string, { session: number; weekly: number }>
+  inactiveClaude?: Record<string, { session: number; weekly: number; fable?: number }>
   /** When Orca took the active readings (its `updatedAt`). */
   updatedAt?: number
 } = {}): Record<string, any> {
@@ -118,6 +118,7 @@ export function accountList(options: {
             status: 'ok',
             session: { usedPercent: used.session, windowMinutes: 300, resetsAt: 1_000_000 + 3_600_000 },
             weekly: { usedPercent: used.weekly, windowMinutes: 10080, resetsAt: 1_000_000 + 86_400_000 },
+            ...(used.fable === undefined ? {} : { fableWeekly: { usedPercent: used.fable, windowMinutes: 10080, resetsAt: 1_000_000 + 86_400_000 } }),
             updatedAt
           }
         }))

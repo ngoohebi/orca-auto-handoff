@@ -108,7 +108,7 @@ export const BLIND_COOLDOWN_CAP_MINUTES = 300
  *  switch-back for that provider, and a limit banner on `key` counts as a strike. */
 export type Probation = { key: string; until: number }
 
-export type SwapReason = 'rate_limit' | 'threshold' | 'auth' | 'manual' | 'reset' | 'model_cap' | 'switch_back' | 'idle'
+export type SwapReason = 'rate_limit' | 'threshold' | 'auth' | 'manual' | 'reset' | 'model_cap' | 'switch_back' | 'idle' | 'expiring'
 export type SwapResult =
   | 'resumed'
   | 'handoff'
@@ -144,12 +144,37 @@ export type WaitingEntry = {
   wakeAt: number
   /** Remote Orca server (`environmentId` from `runtime:<environmentId>`) when the workspace is not on `local`. */
   server?: string
+  /** `short`: the session waits for its own account to reset (a few minutes) and is only woken
+   *  at `wakeAt`, not as soon as another account has room. */
+  hold?: 'short'
+  /** Waiting for this model's bucket: woken at `wakeAt`, or once an account is known to have room
+   *  in that bucket. */
+  model?: string
 }
 
+/** How the plugin decides (the `mode` setting, with `auto` resolved; see `resolveSettings`). */
+export type Mode = 'smart' | 'my-order' | 'manual' | 'custom'
+
 export type Config = {
+  /** `smart`: forecast and rank (smart.ts). `my-order`: the account order, with the same early
+   *  leave. `manual`: never automatically. `custom`: the legacy settings exactly as stored. */
+  mode: Mode
+  /** A seat counts as Low when it would run out within this many minutes at its current pace.
+   *  0 = no forecast. */
+  horizonMinutes: number
+  /** Without a pace, a seat is Low from this much use of its 5-hour window (100 = never)… */
+  lowFiveHour: number
+  /** …or of its weekly window. */
+  lowSevenDay: number
+  /** `move`: sessions move when idle or between turns. `limit`: only at a limit. `launches`:
+   *  running sessions are never moved; only new launches change account. */
+  runningSessions: 'move' | 'limit' | 'launches'
+  /** Set when `auto` kept the earlier settings as `custom`: the panel says so once. */
+  notice?: string
   thresholdFiveHour: number
   thresholdSevenDay: number
-  strategy: 'drain' | 'balanced' | 'priority' | 'soonest-reset' | 'manual'
+  /** `smart` is never stored: it is what `mode: smart` resolves to. */
+  strategy: 'drain' | 'balanced' | 'priority' | 'soonest-reset' | 'manual' | 'smart'
   autoSwitchOnThreshold: boolean
   /** Go back to an earlier seat in the chain once it is healthy again (drain, priority). */
   switchBack: boolean
@@ -187,7 +212,14 @@ export function allServices(on: boolean): Record<Provider, boolean> {
   return { claude: on, codex: on, antigravity: on, opencode: on, devin: on }
 }
 
+/** The legacy settings at their defaults, as `custom` mode reads them. What a fresh install runs
+ *  is `SMART_CONFIG`. */
 export const DEFAULT_CONFIG: Config = {
+  mode: 'custom',
+  horizonMinutes: 0,
+  lowFiveHour: 100,
+  lowSevenDay: 100,
+  runningSessions: 'move',
   thresholdFiveHour: 100,
   thresholdSevenDay: 100,
   strategy: 'drain',
@@ -213,6 +245,21 @@ export const DEFAULT_CONFIG: Config = {
   services: allServices(true)
 }
 
+/** What a fresh install runs: Smart, "just before the limit". */
+export const SMART_CONFIG: Config = {
+  ...DEFAULT_CONFIG,
+  mode: 'smart',
+  strategy: 'smart',
+  switchBack: false,
+  horizonMinutes: 10,
+  lowFiveHour: 97,
+  lowSevenDay: 99
+}
+
+/** A seat left because it was running Low: not a target again until `until` (the end of its
+ *  5-hour window), unless a reading newer than `at` shows the window has started over. */
+export type LeftLow = { at: number; until: number; used?: number }
+
 /** Everything the worker persists, under one storage key. */
 export type RotatorState = {
   paused: boolean
@@ -228,6 +275,10 @@ export type RotatorState = {
   /** Last automatic selection change per provider (for the switch cooldown). */
   lastAutoSwitchAt?: Partial<Record<Provider, number>>
   probation?: Partial<Record<Provider, Probation>>
+  /** Seats left as Low (smart.ts anti-flap), by seat key. */
+  leftLow?: Record<string, LeftLow>
+  /** The one-time note about `custom` mode has been dismissed. */
+  customNoticeSeen?: boolean
 }
 
 export const HISTORY_CAP = 1000
@@ -245,7 +296,8 @@ export function emptyState(): RotatorState {
     waiting: [],
     history: [],
     lastAutoSwitchAt: {},
-    probation: {}
+    probation: {},
+    leftLow: {}
   }
 }
 
@@ -264,6 +316,10 @@ export type Snapshot = {
   history: HistoryEntry[]
   /** Which services switch automatically. */
   services: Record<Provider, boolean>
+  /** How the plugin decides right now (`auto` resolved). */
+  mode?: Mode
+  /** A one-time note for the panel (settings carried over as `custom`), until dismissed. */
+  notice?: string
   /** The service of the agent the user is working with: the most recently active agent in the
    *  focused workspace. The panel lists that service first. */
   focused?: Provider

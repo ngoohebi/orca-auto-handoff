@@ -192,23 +192,41 @@ export function rateOf(samples: readonly Sample[], win: WindowName, now: number)
 }
 
 /**
- * How long until the first window is used up at the current pace, from `now`. A window that
- * resets before it would run out does not count. `null` when no window has a pace, or the last
- * reading is more than 10 minutes old.
+ * How long until the first window is used up, from `now`, and which window that is. `scale`
+ * multiplies the pace (more sessions on the account). A window that resets before it would run
+ * out does not count. `null` when no window has a pace, or the last reading is more than 10
+ * minutes old.
  */
-export function runwayMs(samples: readonly Sample[], now: number): number | null {
+export function runwayOf(samples: readonly Sample[], now: number, scale = 1): { ms: number; win: WindowName } | null {
   const latest = samples[samples.length - 1]
   if (!latest || now - latest.t > RUNWAY_MAX_AGE_MS) return null
-  let best: number | null = null
+  let best: { ms: number; win: WindowName } | null = null
   for (const win of WINDOWS) {
     const used = valueOf(latest, win)
     const rate = rateOf(samples, win, now)
     if (used === null || rate === null) continue
-    const emptyAt = latest.t + (Math.max(0, 100 - used) / rate) * MIN
+    const emptyAt = latest.t + (Math.max(0, 100 - used) / (rate * Math.max(1, scale))) * MIN
     const reset = resetOf(latest, win)
     if (reset !== null && reset <= emptyAt) continue
     const left = Math.max(0, emptyAt - now)
-    if (best === null || left < best) best = left
+    if (best === null || left < best.ms) best = { ms: left, win }
   }
   return best
+}
+
+/** How long until the first window is used up at the current pace (see `runwayOf`). */
+export function runwayMs(samples: readonly Sample[], now: number): number | null {
+  return runwayOf(samples, now)?.ms ?? null
+}
+
+/**
+ * How fast the weekly window fills over days, in points per millisecond: the slope of the daily
+ * levels of the current week. `null` without two of them at least 12 hours apart.
+ */
+export function weeklyPace(daily: readonly DailySample[], weeklyReset: number | null): number | null {
+  const week = daily.filter((d) => sameReset(d.wReset, weeklyReset))
+  const first = week[0]
+  const last = week[week.length - 1]
+  if (!first || !last || last.t - first.t < 12 * 60 * MIN) return null
+  return Math.max(0, last.w - first.w) / (last.t - first.t)
 }

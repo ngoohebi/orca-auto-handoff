@@ -1,5 +1,8 @@
 // Which seat comes next: the chain, eligibility, strategies, switch-back, earliest reset.
+import { NO_CONTEXT, candidateOf, rank, type SmartContext, type Tier } from './smart'
 import { BLIND_COOLDOWN_CAP_MINUTES, STRIKE_TTL_MS, type Config, type Provider, type Seat, type SeatHealth } from './types'
+
+export type { Tier }
 
 function tokens(list: string): string[] {
   return list
@@ -76,7 +79,6 @@ export function blindCooldownMs(config: Config, strikes: number): number {
  * - `B`: no numbers at all;
  * - null: cooling down or over a threshold, so not a target.
  */
-export type Tier = 'A' | 'B+' | 'B'
 const RANK: Record<Tier, number> = { A: 0, 'B+': 1, B: 2 }
 
 export function tier(seat: Seat, health: SeatHealth | undefined, config: Config, now: number): Tier | null {
@@ -131,6 +133,13 @@ export type PickOptions = {
   mode?: 'hard' | 'advisory' | 'manual'
   /** For `advisory`: the seat being left is known to be at 100 %. */
   sourceExhausted?: boolean
+  /** For the `smart` strategy: usage history, pane counts and the accounts set aside. Without
+   *  it Smart ranks on the accounts' numbers alone. */
+  smart?: SmartContext
+  /** Accounts an `advisory` move never goes to: left as Low a moment ago, or Low now. */
+  avoid?: ReadonlySet<string>
+  /** Only these accounts may be picked (a model cap: the ones with room in that model's bucket). */
+  only?: ReadonlySet<string>
 }
 
 export function pickNext(
@@ -144,10 +153,27 @@ export function pickNext(
   if (config.strategy === 'manual') return null
   const mode = options.mode ?? 'hard'
   const tiers = new Map<Seat, Tier>()
+  const smart = config.strategy === 'smart' ? (options.smart ?? NO_CONTEXT) : null
+  const candidates = new Map<Seat, ReturnType<typeof candidateOf>>()
   for (const s of chain) {
     if (s.key === currentKey || isExcluded(s, config)) continue
+    if (options.only && !options.only.has(s.key)) continue
+    if (mode === 'advisory' && options.avoid?.has(s.key)) continue
     const t = tier(s, health[s.key], config, now)
-    if (t) tiers.set(s, t)
+    if (!t) continue
+    if (smart) {
+      const at = chain.findIndex((x) => x.key === currentKey)
+      const index = chain.indexOf(s)
+      const c = candidateOf(s, t, strikesOf(health[s.key], now), health[s.key], smart, config, now, {
+        chainIndex: config.chain.trim() ? index : 0,
+        turn: (index - at - 1 + 2 * chain.length) % chain.length
+      })
+      // A move that is only advice never goes to an account that is itself about to run out, or
+      // that was left for that reason a moment ago.
+      if (mode === 'advisory' && (c.avoided || c.assessment.state === 'low')) continue
+      candidates.set(s, c)
+    }
+    tiers.set(s, t)
   }
   if (tiers.size === 0) return null
   let pool = [...tiers.keys()]
@@ -162,6 +188,8 @@ export function pickNext(
     }
   }
   switch (config.strategy) {
+    case 'smart':
+      return rank(pool.map((s) => candidates.get(s)!), config)[0]!.seat
     case 'balanced':
       return [...pool].sort((a, b) => load(a) - load(b))[0]!
     case 'soonest-reset':
@@ -198,14 +226,16 @@ export function preferredOver(
   health: Record<string, SeatHealth>,
   config: Config,
   now: number,
-  scope: 'pane' | 'launch' = 'launch'
+  scope: 'pane' | 'launch' = 'launch',
+  /** Accounts not to go back to yet: left as Low, or Low now (never set in `custom` mode). */
+  avoid?: ReadonlySet<string>
 ): Seat | null {
   if (!config.switchBack) return null
   if (config.strategy !== 'drain' && config.strategy !== 'priority') return null
   const at = chain.findIndex((s) => s.key === currentKey)
   if (at <= 0) return null
   for (const s of chain.slice(0, at)) {
-    if (isExcluded(s, config)) continue
+    if (isExcluded(s, config) || avoid?.has(s.key)) continue
     const t = tier(s, health[s.key], config, now)
     if (t === 'A' || t === 'B+') return s
     if (t === 'B' && scope === 'launch' && strikesOf(health[s.key], now) === 0) return s

@@ -109,6 +109,8 @@ export function whyMove(
       return `${to.label} is available again${level(to)}; ${options.selectionOnly ? 'new launches use it' : `moved back from ${source}`}`
     case 'reset':
       return `a limit has reset; ${options.selectionOnly ? `new launches use ${to.label}` : `resumed on ${to.label}`}${level(to)}`
+    case 'expiring':
+      return `${to.label} has weekly quota that would expire unused${level(to)}; ${options.selectionOnly ? 'new launches use it' : `moved there from ${source}`}`
     case 'manual':
       return `chosen by hand; ${arrived}`
   }

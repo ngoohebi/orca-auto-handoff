@@ -3,8 +3,8 @@ import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
 import type { Cli, Rotator } from './engine'
 import * as fx from './fixtures'
-import { activateWith, statusText } from './worker'
-import type { RotatorState } from './types'
+import { activateWith, readConfig, resolveMode, statusText } from './worker'
+import { DEFAULT_CONFIG, SMART_CONFIG, type Config, type RotatorState } from './types'
 
 type Pane = { terminalId: string; agent: string; state: 'working' | 'waiting' | 'done' | 'blocked'; sessionId?: string; title?: string; stateStartedAt?: number }
 
@@ -13,13 +13,13 @@ function world(options: {
   tails: Record<string, string[]>
   /** Orca's numbers for the active accounts; by default they are exhausted, as they are when a
    *  pane on them hits a limit. */
-  claudeUsage?: { session: number; weekly: number }
+  claudeUsage?: { session: number; weekly: number; sessionReset?: number; weeklyReset?: number }
   codexUsage?: { session: number; weekly: number }
   /** Orca's numbers for a Claude account switched to later (default: plenty of room). */
   laterClaudeUsage?: { session: number; weekly: number }
   /** Claude accounts not in use that Orca has numbers for (read on every list, so a test can
    *  change it); by default Orca reports nothing for them. */
-  inactiveClaude?: Record<string, { session: number; weekly: number }>
+  inactiveClaude?: Record<string, { session: number; weekly: number; fable?: number }>
   settings?: Record<string, string | number | boolean>
   state?: Partial<RotatorState>
   /** Resumed sessions redraw their transcript, as live Claude does; `late` = only after the
@@ -636,7 +636,9 @@ test('switch back: once the first account resets, new launches use it and a pane
 test('switch back: an idle pane on the backup account moves without waiting for a turn', async () => {
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
-    tails: { t1: fx.CLAUDE_SESSION_LIMIT }
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    // Switch-back belongs to the legacy strategies; the default mode (Smart) has no preferred account.
+    settings: { mode: 'custom' }
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
@@ -664,7 +666,8 @@ test('switch back is off for balanced, and never closes a pane with unsent text'
 
   const draft = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
-    tails: { t1: fx.CLAUDE_SESSION_LIMIT }
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { mode: 'custom' }
   })
   worker = await draft.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
@@ -1486,5 +1489,248 @@ test('history: switching back for new launches says which account is available a
   const state = w.host.data().storage.state as RotatorState
   assert.equal(state.history.at(-1)?.reason, 'switch_back')
   assert.match(state.history.at(-1)?.why ?? '', /^one is available again.*; new launches use it$/)
+  await worker.deactivate()
+})
+
+// ---- modes: Smart, Follow my order, Manual, custom ----------------------------------------------
+
+const configFor = (settings: Record<string, string | number | boolean>): Promise<Config> =>
+  readConfig({ settings: { get: async () => settings } } as unknown as Pick<OrcaWorkerApi, 'settings'>)
+
+/** Every legacy decision setting spelled out at its default, as a host that fills in manifest
+ *  defaults would report them. */
+const LEGACY_AT_DEFAULTS = {
+  strategy: 'drain',
+  switch_back: true,
+  switch_cooldown_minutes: 5,
+  min_headroom_gap: 10,
+  auto_swap_idle_after_seconds: 900,
+  auto_switch_on_rate_limit: true,
+  auto_switch_on_threshold: true,
+  thresholds_five_hour: 100,
+  thresholds_seven_day: 100,
+  auto_resume: true,
+  wait_for_reset: true,
+  chain: ''
+}
+
+test('modes: `auto` resolves from the earlier settings (the migration table)', async () => {
+  // Nothing changed: Smart, whether the host reports no settings or every default.
+  assert.deepEqual(await configFor({}), SMART_CONFIG)
+  assert.deepEqual(await configFor({ mode: 'auto', ...LEGACY_AT_DEFAULTS }), SMART_CONFIG)
+  assert.deepEqual(resolveMode({}), { mode: 'smart', auto: true, switchEarly: 'just-before', keepThresholds: false })
+
+  // An account order with drain or priority: Follow my order, with switch-back.
+  const ordered = await configFor({ chain: 'claude:c2, claude:c1' })
+  assert.deepEqual([ordered.mode, ordered.strategy, ordered.switchBack, ordered.chain], ['my-order', 'drain', true, 'claude:c2, claude:c1'])
+  const priority = await configFor({ chain: 'claude:c2', strategy: 'priority' })
+  assert.deepEqual([priority.mode, priority.strategy, priority.switchBack], ['my-order', 'priority', true])
+  // It looks ahead like Smart does.
+  assert.deepEqual([ordered.horizonMinutes, ordered.lowFiveHour, ordered.lowSevenDay], [10, 97, 99])
+
+  // strategy manual: Manual, whatever else is set.
+  const manual = await configFor({ strategy: 'manual', switch_back: false, chain: 'claude:c2' })
+  assert.deepEqual([manual.mode, manual.strategy], ['manual', 'manual'])
+
+  // Anything else: custom, the stored settings exactly, and a note for the panel.
+  const changed: [Record<string, string | number | boolean>, Partial<Config>][] = [
+    [{ strategy: 'balanced' }, { strategy: 'balanced' }],
+    [{ strategy: 'soonest-reset' }, { strategy: 'soonest-reset' }],
+    [{ strategy: 'priority' }, { strategy: 'priority' }],
+    [{ switch_back: false }, { switchBack: false }],
+    [{ switch_cooldown_minutes: 0 }, { switchCooldownMinutes: 0 }],
+    [{ min_headroom_gap: 25 }, { minHeadroomGap: 25 }],
+    [{ auto_swap_idle_after_seconds: 0 }, { autoSwapIdleAfterSeconds: 0 }],
+    [{ auto_switch_on_rate_limit: false }, { autoSwitchOnRateLimit: false }],
+    [{ auto_switch_on_threshold: false }, { autoSwitchOnThreshold: false }],
+    [{ auto_resume: false }, { autoResume: false }],
+    [{ wait_for_reset: false }, { waitForReset: false }],
+    [{ chain: 'claude:c2', strategy: 'balanced', thresholds_five_hour: 80 }, { chain: 'claude:c2', strategy: 'balanced', thresholdFiveHour: 80 }]
+  ]
+  for (const [settings, expected] of changed) {
+    const { notice, ...config } = await configFor(settings)
+    assert.deepEqual(config, { ...DEFAULT_CONFIG, ...expected }, JSON.stringify(settings))
+    assert.match(notice ?? '', /kept exactly as they were/, JSON.stringify(settings))
+  }
+
+  // Thresholds below 100 are no reason for custom: "Earlier", with the threshold kept as a hard cap.
+  const capped = await configFor({ thresholds_five_hour: 80 })
+  assert.deepEqual(capped, { ...SMART_CONFIG, thresholdFiveHour: 80, horizonMinutes: 25, lowFiveHour: 90, lowSevenDay: 97 })
+  const cappedOrder = await configFor({ thresholds_seven_day: 90, chain: 'claude:c2' })
+  assert.deepEqual([cappedOrder.mode, cappedOrder.thresholdSevenDay, cappedOrder.thresholdFiveHour, cappedOrder.horizonMinutes], ['my-order', 90, 100, 25])
+  // A Switch early chosen by hand stands; the cap stays.
+  const cappedAtLimit = await configFor({ thresholds_five_hour: 80, switch_early: 'at-limit' })
+  assert.deepEqual([cappedAtLimit.thresholdFiveHour, cappedAtLimit.horizonMinutes, cappedAtLimit.lowFiveHour], [80, 0, 100])
+})
+
+test('modes: a mode chosen by hand; legacy settings apply in custom only', async () => {
+  const legacy = { strategy: 'balanced', switch_back: false, thresholds_five_hour: 60, min_headroom_gap: 30, switch_cooldown_minutes: 1, auto_resume: false, wait_for_reset: false }
+  // Smart ignores them all.
+  assert.deepEqual(await configFor({ mode: 'smart', ...legacy }), SMART_CONFIG)
+  // Custom reads them exactly, without the note (it was chosen, not carried over).
+  assert.deepEqual(await configFor({ mode: 'custom', ...legacy }), {
+    ...DEFAULT_CONFIG,
+    strategy: 'balanced',
+    switchBack: false,
+    thresholdFiveHour: 60,
+    minHeadroomGap: 30,
+    switchCooldownMinutes: 1,
+    autoResume: false,
+    waitForReset: false
+  })
+  assert.deepEqual(await configFor({ mode: 'custom' }), DEFAULT_CONFIG)
+  // Follow my order and Manual by hand.
+  const order = await configFor({ mode: 'my-order', ...legacy })
+  assert.deepEqual([order.strategy, order.switchBack, order.thresholdFiveHour, order.autoResume, order.waitForReset], ['drain', true, 100, true, true])
+  assert.equal((await configFor({ mode: 'manual' })).strategy, 'manual')
+  // An unknown value is `auto`.
+  assert.equal((await configFor({ mode: 'whatever' })).mode, 'smart')
+  // Settings that are not decisions apply in every mode.
+  const kept = await configFor({ mode: 'smart', exclude: 'claude:c3', chain: 'claude:c2', model_fallback: 'claude=sonnet', auto_message: 'go on', poll_interval_seconds: 30, service_codex: false })
+  assert.deepEqual(
+    [kept.exclude, kept.chain, kept.modelFallback, kept.autoMessage, kept.pollIntervalSeconds, kept.services.codex],
+    ['claude:c3', 'claude:c2', 'claude=sonnet', 'go on', 30, false]
+  )
+})
+
+test('modes: the three knobs beside Auto-switch', async () => {
+  const early = async (switch_early: string) => {
+    const c = await configFor({ switch_early })
+    return [c.horizonMinutes, c.lowFiveHour, c.lowSevenDay]
+  }
+  assert.deepEqual(await early('just-before'), [10, 97, 99])
+  assert.deepEqual(await early('earlier'), [25, 90, 97])
+  assert.deepEqual(await early('at-limit'), [0, 100, 100])
+  const running = async (running_sessions: string) => {
+    const c = await configFor({ running_sessions })
+    return [c.runningSessions, c.autoSwitchOnThreshold, c.autoSwapIdleAfterSeconds, c.autoResume, c.autoSwitchOnRateLimit]
+  }
+  assert.deepEqual(await running('move'), ['move', true, 900, true, true])
+  assert.deepEqual(await running('limit'), ['limit', false, 0, true, true])
+  assert.deepEqual(await running('launches'), ['launches', false, 0, false, true])
+  assert.equal((await configFor({ when_all_used: 'wait' })).waitForReset, true)
+  assert.equal((await configFor({ when_all_used: 'stop' })).waitForReset, false)
+  // In custom the knobs are not read.
+  assert.deepEqual(await configFor({ mode: 'custom', switch_early: 'earlier', running_sessions: 'launches', when_all_used: 'stop' }), DEFAULT_CONFIG)
+})
+
+test('modes: the panel is told the mode, and once that earlier settings were kept as custom', async () => {
+  const smart = world({ panes: [], tails: {} })
+  let worker = await smart.mount()
+  await smart.rotator.tick()
+  assert.equal(smart.rotator.snapshot().mode, 'smart')
+  assert.equal(smart.rotator.snapshot().notice, undefined)
+  await worker.deactivate()
+
+  const custom = world({ panes: [], tails: {}, settings: { strategy: 'balanced' } })
+  worker = await custom.mount()
+  await custom.rotator.tick()
+  assert.equal(custom.rotator.snapshot().mode, 'custom')
+  assert.match(custom.rotator.snapshot().notice ?? '', /kept exactly as they were/)
+  await worker.request('rotator.dismissNotice', {})
+  assert.equal(custom.rotator.snapshot().notice, undefined)
+  assert.equal(stored(custom).customNoticeSeen, true)
+  await worker.deactivate()
+})
+
+test('model cap, Smart: an account known to have room for that model comes before the fallback model', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_MODEL_CAP },
+    // c2 has room in its Fable bucket; c3 is known but its bucket is not.
+    inactiveClaude: { c2: { session: 5, weekly: 5, fable: 20 }, c3: { session: 1, weekly: 1 } },
+    settings: { model_fallback: 'claude=fable,sonnet' }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(w.typed.map((t) => t.text), ['Go continue.'])
+  assert.equal(stored(w).history.at(-1)?.reason, 'model_cap')
+  assert.equal(stored(w).history.at(-1)?.result, 'resumed')
+  await worker.deactivate()
+
+  // A bucket that is nearly full is not room: the fallback model on the same account is next.
+  const full = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_MODEL_CAP },
+    inactiveClaude: { c2: { session: 5, weekly: 5, fable: 95 } },
+    settings: { model_fallback: 'claude=fable,sonnet' }
+  })
+  const fw = await full.mount()
+  await fw.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(full), [])
+  assert.deepEqual(full.typed.map((t) => t.text), ['/model sonnet', 'Go continue.'])
+  await fw.deactivate()
+})
+
+test('model cap, Smart: with no known room and no fallback model the session waits for that bucket', async () => {
+  const inactiveClaude: Record<string, { session: number; weekly: number; fable?: number }> = { c2: { session: 5, weekly: 5 } }
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_MODEL_CAP },
+    inactiveClaude
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  // c2 is known and has room in general, but nothing says its Fable bucket has: no move.
+  assert.deepEqual(selects(w), [])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  let state = stored(w)
+  assert.equal(state.waiting.length, 1)
+  assert.equal(state.waiting[0]?.model, 'fable')
+  assert.equal(state.history.at(-1)?.result, 'waiting')
+  assert.equal(state.history.at(-1)?.why, 'no other Claude account is known to have room for fable; waiting for its limit to reset')
+  // Other accounts having room in general does not end the wait.
+  w.advance(2 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), [])
+  assert.equal(stored(w).waiting.length, 1)
+  // Orca now reports c2's Fable bucket with room: the session resumes there.
+  inactiveClaude.c2 = { session: 5, weekly: 5, fable: 30 }
+  w.advance(2 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  state = stored(w)
+  assert.equal(state.waiting.length, 0)
+  assert.equal(state.history.at(-1)?.reason, 'reset')
+  assert.equal(state.history.at(-1)?.result, 'resumed')
+  await worker.deactivate()
+
+  // "When everything is used up: Stop" also stops this wait.
+  const stop = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_MODEL_CAP },
+    settings: { when_all_used: 'stop' }
+  })
+  const sw = await stop.mount()
+  await sw.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(stop).waiting.length, 0)
+  assert.equal(stored(stop).history.at(-1)?.result, 'failed')
+  await sw.deactivate()
+})
+
+test('model cap, custom: the legacy order is unchanged (fallback model first, then any next account)', async () => {
+  const withFallback = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_MODEL_CAP },
+    inactiveClaude: { c2: { session: 5, weekly: 5, fable: 20 } },
+    settings: { mode: 'custom', model_fallback: 'claude=fable,sonnet' }
+  })
+  let worker = await withFallback.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(withFallback), [])
+  assert.deepEqual(withFallback.typed.map((t) => t.text), ['/model sonnet', 'Go continue.'])
+  await worker.deactivate()
+
+  const without = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_MODEL_CAP },
+    settings: { mode: 'custom' }
+  })
+  worker = await without.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  // No numbers for c2 at all: the legacy order still moves there.
+  assert.deepEqual(selects(without), ['select claude c2'])
+  assert.equal(stored(without).waiting.length, 0)
   await worker.deactivate()
 })

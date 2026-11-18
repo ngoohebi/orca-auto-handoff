@@ -3,7 +3,7 @@ import { parseAccounts } from './accounts'
 import { activeTerminalsIn } from './cli'
 import { accountList } from './fixtures'
 import { blindCooldownMs, buildChain, earliestReset, enoughGap, pickNext, preferredOver, strikesOf, tier } from './selector'
-import { DEFAULT_CONFIG, type Config, type Seat, type SeatHealth } from './types'
+import { DEFAULT_CONFIG, SMART_CONFIG, type Config, type Seat, type SeatHealth } from './types'
 
 const NOW = 1_000_000
 const cfg = (over: Partial<Config> = {}): Config => ({ ...DEFAULT_CONFIG, ...over })
@@ -327,4 +327,39 @@ test('guessed cooldown for a seat without numbers doubles per strike, capped at 
   assert.deepEqual([1, 2, 3, 6].map((n) => minutes(n, 20)), [20, 40, 80, 300])
   // A default longer than the cap is kept as it is, never shortened or escalated.
   assert.deepEqual([1, 2].map((n) => minutes(n, 480)), [480, 480])
+})
+
+test('legacy strategies are unchanged by Smart: its context and its settings mean nothing to them', () => {
+  const seat = (id: string, session: number | null, weekly = 10, weeklyReset = NOW + 86_400_000): Seat => ({
+    key: `claude:${id}`,
+    provider: 'claude',
+    accountId: id,
+    label: `${id}@example.test`,
+    active: false,
+    usage: session === null ? { known: false } : { known: true, source: 'live', session: { usedPercent: session, resetsAt: NOW + 3_600_000 }, weekly: { usedPercent: weekly, resetsAt: weeklyReset } }
+  })
+  // b is nearly full (Low for Smart), c has the most room, d resets soonest, e is unknown.
+  const chain = [seat('a', 100), seat('b', 98, 20), seat('c', 5, 5), seat('d', 50, 60, NOW + 3_600_000), seat('e', null)]
+  const health: Record<string, SeatHealth> = {}
+  const expected = { drain: 'b', priority: 'b', balanced: 'c', 'soonest-reset': 'd' } as const
+  // What Smart would be told: b was left as Low, c is crowded.
+  const smart = { samples: {}, panes: { 'claude:c': 9 }, avoid: new Set(['claude:b']) }
+  for (const [strategy, id] of Object.entries(expected) as [Config['strategy'], string][]) {
+    const config = cfg({ strategy })
+    for (const mode of ['hard', 'advisory', 'manual'] as const) {
+      assert.equal(pickNext(chain, 'claude:a', health, config, NOW, { mode })?.accountId, id, `${strategy} ${mode}`)
+      assert.equal(pickNext(chain, 'claude:a', health, config, NOW, { mode, smart })?.accountId, id, `${strategy} ${mode} with context`)
+      // The Smart-only settings are not read by a legacy strategy either.
+      const looking = { ...config, horizonMinutes: 25, lowFiveHour: 90, lowSevenDay: 97 }
+      assert.equal(pickNext(chain, 'claude:a', health, looking, NOW, { mode, smart })?.accountId, id, `${strategy} ${mode} with Smart settings`)
+    }
+  }
+  assert.equal(pickNext(chain, 'claude:a', health, cfg({ strategy: 'manual' }), NOW, { smart }), null)
+  // Smart itself reads all of it: d, whose weekly quota is about to expire, and never the nearly full b.
+  assert.equal(pickNext(chain, 'claude:a', health, SMART_CONFIG, NOW, { smart })?.accountId, 'd')
+  // Switch-back: unchanged without an `avoid` set, which only Smart and my-order ever pass.
+  const back = [seat('p', 20), seat('q', 30)]
+  assert.equal(preferredOver(back, 'claude:q', {}, cfg(), NOW, 'pane')?.accountId, 'p')
+  assert.equal(preferredOver(back, 'claude:q', {}, cfg(), NOW, 'pane', new Set())?.accountId, 'p')
+  assert.equal(preferredOver(back, 'claude:q', {}, cfg(), NOW, 'pane', new Set(['claude:p'])), null)
 })

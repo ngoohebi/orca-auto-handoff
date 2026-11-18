@@ -7,7 +7,7 @@ import { PROVIDER_NAME } from './labels'
 import { LIVE_KEY, liveFileName } from './live-usage'
 import { DATA_DIR, LIVE_DIR } from './statusline'
 import { ConsoleStatusLine, nodeFiles, memoryFiles, type Files } from './statusline-files'
-import { DEFAULT_CONFIG, PROVIDERS, type Config, type Provider, type RotatorState, type Snapshot } from './types'
+import { DEFAULT_CONFIG, PROVIDERS, type Config, type Mode, type Provider, type RotatorState, type Snapshot } from './types'
 import './protocol'
 
 const STATE_KEY = 'state'
@@ -22,6 +22,60 @@ export function tickMs(pollIntervalSeconds: number): number {
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
+/** The legacy decision settings and their defaults. Outside `custom` mode they are not read:
+ *  the four knobs decide. */
+const LEGACY_DEFAULTS: Record<string, string | number | boolean> = {
+  switch_back: DEFAULT_CONFIG.switchBack,
+  switch_cooldown_minutes: DEFAULT_CONFIG.switchCooldownMinutes,
+  min_headroom_gap: DEFAULT_CONFIG.minHeadroomGap,
+  auto_swap_idle_after_seconds: DEFAULT_CONFIG.autoSwapIdleAfterSeconds,
+  auto_switch_on_rate_limit: DEFAULT_CONFIG.autoSwitchOnRateLimit,
+  auto_switch_on_threshold: DEFAULT_CONFIG.autoSwitchOnThreshold,
+  auto_resume: DEFAULT_CONFIG.autoResume,
+  wait_for_reset: DEFAULT_CONFIG.waitForReset
+}
+
+const MODES = ['smart', 'my-order', 'manual', 'custom'] as const
+const EARLY = ['just-before', 'earlier', 'at-limit'] as const
+const RUNNING = ['move', 'limit', 'launches'] as const
+
+export type ResolvedMode = {
+  mode: Mode
+  /** `auto` chose the mode from the earlier settings. */
+  auto: boolean
+  switchEarly: (typeof EARLY)[number]
+  /** The stored thresholds (below 100) stay as a hard cap. */
+  keepThresholds: boolean
+}
+
+/**
+ * Resolves the `mode` setting. `auto` (the default) reads the earlier settings each time, since a
+ * plugin cannot tell a stored value from a default:
+ * - `strategy` manual → manual;
+ * - every legacy setting at its default → smart, or my-order when an account order (`chain`) is set;
+ * - `strategy` priority with an account order, the rest at their defaults → my-order;
+ * - anything else → custom: the earlier settings, read exactly as before.
+ * Thresholds below 100 are no reason for `custom`: they select "Earlier" and stay as a hard cap.
+ */
+export function resolveMode(s: Record<string, unknown>): ResolvedMode {
+  const pick = <T extends string>(key: string, allowed: readonly T[], fallback: T): T =>
+    typeof s[key] === 'string' && (allowed as readonly string[]).includes(s[key] as string) ? (s[key] as T) : fallback
+  const early = pick('switch_early', EARLY, 'just-before')
+  const stored = typeof s.mode === 'string' ? s.mode : 'auto'
+  if ((MODES as readonly string[]).includes(stored)) return { mode: stored as Mode, auto: false, switchEarly: early, keepThresholds: false }
+  const strategy = typeof s.strategy === 'string' ? s.strategy : DEFAULT_CONFIG.strategy
+  if (strategy === 'manual') return { mode: 'manual', auto: true, switchEarly: early, keepThresholds: false }
+  const untouched = Object.entries(LEGACY_DEFAULTS).every(([key, value]) => s[key] === undefined || s[key] === value)
+  const ordered = typeof s.chain === 'string' && s.chain.trim() !== ''
+  const mode: Mode = !untouched ? 'custom' : strategy === 'drain' ? (ordered ? 'my-order' : 'smart') : strategy === 'priority' && ordered ? 'my-order' : 'custom'
+  if (mode === 'custom') return { mode, auto: true, switchEarly: early, keepThresholds: false }
+  const capped = [s.thresholds_five_hour, s.thresholds_seven_day].some((n) => typeof n === 'number' && n < 100)
+  return { mode, auto: true, switchEarly: capped && early === 'just-before' ? 'earlier' : early, keepThresholds: capped }
+}
+
+const CUSTOM_NOTICE =
+  'Your earlier switching settings are kept exactly as they were (Auto-switch: custom). To try the new automatic mode, set Auto-switch to smart in Settings.'
+
 export async function readConfig(orca: Pick<OrcaWorkerApi, 'settings'>): Promise<Config> {
   const s = (await orca.settings.get().catch(() => ({}))) as Record<string, unknown>
   const num = (k: string, d: number) => (typeof s[k] === 'number' ? (s[k] as number) : d)
@@ -29,7 +83,9 @@ export async function readConfig(orca: Pick<OrcaWorkerApi, 'settings'>): Promise
   const str = (k: string, d: string) => (typeof s[k] === 'string' ? (s[k] as string) : d)
   const strategy = str('strategy', DEFAULT_CONFIG.strategy)
   const d = DEFAULT_CONFIG
-  return {
+  // The settings as stored: what `custom` mode runs, exactly as before the modes existed.
+  const stored: Config = {
+    ...d,
     thresholdFiveHour: num('thresholds_five_hour', d.thresholdFiveHour),
     thresholdSevenDay: num('thresholds_seven_day', d.thresholdSevenDay),
     strategy: (['drain', 'balanced', 'priority', 'soonest-reset', 'manual'].includes(strategy) ? strategy : d.strategy) as Config['strategy'],
@@ -55,6 +111,41 @@ export async function readConfig(orca: Pick<OrcaWorkerApi, 'settings'>): Promise
     services: Object.fromEntries(
       PROVIDERS.map((p) => [p, bool(`service_${p}`, d.services[p])])
     ) as Config['services']
+  }
+  return applyMode(stored, resolveMode(s), s)
+}
+
+/**
+ * The settings the engine runs. In `custom` they are the stored ones. In every other mode the
+ * legacy decision settings are replaced by what the four knobs say:
+ * - Switch early: just before the limit (10 min ahead; 5h 97 %, week 99 %), earlier (25 min;
+ *   5h 90 %, week 97 %), or only at the limit;
+ * - Running sessions: move when idle or between turns, only at a limit, or new launches only;
+ * - When everything is used up: wait and resume, or stop.
+ */
+export function applyMode(stored: Config, resolved: ResolvedMode, s: Record<string, unknown>): Config {
+  if (resolved.mode === 'custom') return resolved.auto ? { ...stored, mode: 'custom', notice: CUSTOM_NOTICE } : { ...stored, mode: 'custom' }
+  const d = DEFAULT_CONFIG
+  const running = typeof s.running_sessions === 'string' && (RUNNING as readonly string[]).includes(s.running_sessions) ? (s.running_sessions as Config['runningSessions']) : 'move'
+  const early = { 'just-before': [10, 97, 99], earlier: [25, 90, 97], 'at-limit': [0, 100, 100] }[resolved.switchEarly] as [number, number, number]
+  return {
+    ...stored,
+    mode: resolved.mode,
+    strategy: resolved.mode === 'smart' ? 'smart' : resolved.mode === 'manual' ? 'manual' : stored.strategy === 'priority' ? 'priority' : 'drain',
+    switchBack: resolved.mode === 'my-order',
+    switchCooldownMinutes: d.switchCooldownMinutes,
+    minHeadroomGap: d.minHeadroomGap,
+    autoSwitchOnRateLimit: true,
+    autoSwitchOnThreshold: running === 'move',
+    autoSwapIdleAfterSeconds: running === 'move' ? d.autoSwapIdleAfterSeconds : 0,
+    autoResume: running !== 'launches',
+    runningSessions: running,
+    waitForReset: s.when_all_used !== 'stop',
+    thresholdFiveHour: resolved.keepThresholds ? stored.thresholdFiveHour : 100,
+    thresholdSevenDay: resolved.keepThresholds ? stored.thresholdSevenDay : 100,
+    horizonMinutes: early[0],
+    lowFiveHour: early[1],
+    lowSevenDay: early[2]
   }
 }
 
@@ -223,6 +314,10 @@ export async function activateWith(
   orca.panels.handle('rotator.focus', async () => {
     if (await rotator.refreshFocus()) rotator.publishNow()
     return rotator.focused ? { focused: rotator.focused } : {}
+  })
+  orca.panels.handle('rotator.dismissNotice', async () => {
+    await rotator.dismissNotice()
+    return { ok: true as const }
   })
   orca.panels.handle('rotator.cancelWaiting', async ({ terminalId }) => {
     await rotator.cancelWaiting(terminalId)

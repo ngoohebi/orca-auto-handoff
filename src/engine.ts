@@ -5,7 +5,8 @@ import { parseAccounts, type AccountView } from './accounts'
 import { PROVIDER_NAME, displayLabels, whyMove } from './labels'
 import { parseLive } from './live-usage'
 import { emptyUsageCache, loadedUsageCache, observe, observeLive, resolve, type UsageCache } from './usage-cache'
-import { addSample, emptyUsageSamples, loadedUsageSamples, pruneSamples, runwayMs, type UsageSamples } from './usage-history'
+import { addSample, emptyUsageSamples, loadedUsageSamples, pruneSamples, runwayMs, type SeatSamples, type UsageSamples } from './usage-history'
+import type { SmartContext } from './smart'
 import {
   blindCooldownMs,
   buildChain,
@@ -28,6 +29,7 @@ import {
   isProvider,
   type Config,
   type HistoryEntry,
+  type Mode,
   type Provider,
   type RotatorState,
   type Seat,
@@ -119,6 +121,8 @@ const FAILED_SWITCH_SKIP_MS = 10 * 60_000
 const MIN_PROBATION_MS = 10 * 60_000
 /** A turn that ends this soon after a strike was probably answered before the limit hit. */
 const STRIKE_SETTLE_MS = 60_000
+/** A model's bucket counts as having room with at least this many points left. */
+const MODEL_ROOM_LEFT = 10
 
 /** A new cooldown for a seat: strikes that still count are kept, everything else starts over. */
 function cooled(prev: SeatHealth | undefined, now: number, until: number, reason: string): SeatHealth {
@@ -194,6 +198,9 @@ export class Rotator {
   private inflight = new Set<string>()
   /** Services with automatic hand-off on (from settings). */
   services: Record<Provider, boolean> = allServices(true)
+  /** How the plugin decides (from settings, `auto` resolved), and the one-time note about it. */
+  mode: Mode | undefined
+  private modeNotice: string | undefined
   /** The last few status events, for `rotator.debug`. */
   recentEvents: StatusEvent[] = []
   /** See `Snapshot.focused`. */
@@ -262,8 +269,22 @@ export class Rotator {
   }
 
   async refreshServices(publish = true): Promise<void> {
-    this.services = { ...(await this.deps.config()).services }
+    this.noteConfig(await this.deps.config())
     if (publish) this.publishNow()
+  }
+
+  /** Keeps what the panel shows of the settings: the services, the mode and its note. */
+  private noteConfig(config: Config): void {
+    this.services = { ...config.services }
+    this.mode = config.mode
+    this.modeNotice = config.notice
+  }
+
+  /** The panel's note about `custom` mode was read. */
+  async dismissNotice(): Promise<void> {
+    this.state.customNoticeSeen = true
+    await this.save()
+    this.publishNow()
   }
 
   /** Keeps the last 7 days of history (and at most HISTORY_CAP entries). True when it dropped any. */
@@ -292,6 +313,62 @@ export class Rotator {
     const labels = displayLabels(view.seats, to.provider)
     const named = (seat: Seat) => ({ label: labels.get(seat.key) ?? seat.label, usage: seat.usage })
     return whyMove(reason, from ? named(from) : undefined, named(to), options).slice(0, 240)
+  }
+
+  // ---- smart: what the engine knows beyond the accounts -----------------------------------
+
+  /** Smart or Follow my order: the modes that look ahead. `custom` and `manual` never do. */
+  private looksAhead(config: Config): boolean {
+    return config.mode === 'smart' || config.mode === 'my-order'
+  }
+
+  /** Usage history covers this computer's accounts only. */
+  private samplesOn(server: string | undefined): Readonly<Record<string, SeatSamples>> {
+    return server ? {} : this.samples.seats
+  }
+
+  /** How many sessions run on each account of this service now (`agents.list` per workspace,
+   *  placed by `paneSeat`). Empty when Orca cannot say. `busyOnly` counts only sessions in the
+   *  middle of a turn. */
+  private async paneCounts(provider: Provider, view: AccountView, busyOnly = false): Promise<Record<string, number>> {
+    const counts: Record<string, number> = {}
+    try {
+      const { workspaces } = await this.deps.host.call('workspace.list')
+      const seen = new Set<string>()
+      for (const ws of workspaces as { id: string }[]) {
+        const { agents } = await this.deps.host.call('agents.list', { workspaceId: ws.id }).catch(() => ({ agents: [] as any[] }))
+        for (const row of agents) {
+          if (!row.terminalId || seen.has(row.terminalId) || providerOf(row.agent) !== provider) continue
+          seen.add(row.terminalId)
+          if (busyOnly && row.state !== 'working') continue
+          const seat = this.seatOf(row.terminalId, provider, view)
+          if (seat) counts[seat.key] = (counts[seat.key] ?? 0) + 1
+        }
+      }
+    } catch {
+      return {}
+    }
+    return counts
+  }
+
+  /** What Smart ranks with: the history, the pane counts and the accounts left as Low. */
+  private async smartContext(provider: Provider, view: AccountView, server: string | undefined, now: number): Promise<SmartContext> {
+    const avoid = new Set<string>()
+    for (const [key, left] of Object.entries(this.state.leftLow ?? {})) if (left.until > now) avoid.add(key)
+    return { samples: this.samplesOn(server), panes: await this.paneCounts(provider, view), avoid }
+  }
+
+  /** The accounts known to have room in a model's own bucket (a model cap moves only there). */
+  private modelRoom(chain: readonly Seat[], model: string | undefined, now: number): Set<string> {
+    const keys = new Set<string>()
+    for (const seat of chain) {
+      const bucket = seat.usage.known ? seat.usage.model : undefined
+      if (!bucket) continue
+      if (model && !bucket.name.toLowerCase().includes(model.toLowerCase())) continue
+      const over = !bucket.reset && !(bucket.resetsAt !== null && bucket.resetsAt <= now) && bucket.usedPercent > 100 - MODEL_ROOM_LEFT
+      if (!over) keys.add(seat.key)
+    }
+    return keys
   }
 
   // ---- server & accounts ------------------------------------------------------------------
@@ -586,7 +663,7 @@ export class Rotator {
   /** Automatic action allowed for this provider right now (re-read after every wait). */
   private async allowed(provider: Provider): Promise<boolean> {
     const config = await this.deps.config()
-    this.services = { ...config.services }
+    this.noteConfig(config)
     return !this.state.paused && config.services[provider] !== false
   }
 
@@ -718,7 +795,7 @@ export class Rotator {
 
   async inspect(pane: PaneInfo, observeOnly = false, turnEnded = false): Promise<void> {
     const config = await this.deps.config()
-    this.services = { ...config.services }
+    this.noteConfig(config)
     const { lines, truncated } = await this.deps.host.call('terminal.read', {
       terminalId: pane.terminalId,
       maxLines: 80
@@ -791,6 +868,11 @@ export class Rotator {
       case 'api_error':
         return this.retryApiError(pane, config)
       case 'model_cap':
+        // Smart order: an account known to have room in that model's bucket, then the fallback
+        // model on this account, then wait (`swap` parks when no account has known room).
+        if (this.looksAhead(config) && (await this.modelRoomElsewhere(pane, signal, config))) {
+          return this.limitHit(pane, signal, config, lines, 'model_cap')
+        }
         if (await this.fallbackModel(pane, config, signal)) return
         return this.limitHit(pane, signal, config, lines, 'model_cap')
       case 'auth':
@@ -818,6 +900,16 @@ export class Rotator {
     this.record({ provider: pane.agent, terminalId: pane.terminalId, reason: 'api_error', result: 'retried', detail: `attempt ${attempt + 1}` })
     await this.save()
     this.publishNow()
+  }
+
+  /** Is another account of this service known to have room in the capped model's bucket? */
+  private async modelRoomElsewhere(pane: PaneInfo, signal: Signal, config: Config): Promise<boolean> {
+    const view = await this.accountsFor(pane.server)
+    const now = this.deps.now()
+    const from = this.seatOf(pane.terminalId, pane.agent, view)
+    const chain = buildChain(view.seats, pane.agent, config)
+    const only = this.modelRoom(chain, signal.model, now)
+    return !!pickNext(chain, from?.key, this.state.health, config, now, { only })
   }
 
   private async fallbackModel(pane: PaneInfo, config: Config, signal: Signal): Promise<boolean> {
@@ -958,17 +1050,34 @@ export class Rotator {
       const chain = buildChain(view.seats, pane.agent, config)
       const healthyActive =
         preferActive && active && isEligible(active, this.state.health[active.key], config, now) ? active : null
+      const ahead = reason !== 'manual' && this.looksAhead(config)
+      const context = ahead && config.strategy === 'smart' ? await this.smartContext(pane.agent, view, pane.server, now) : undefined
+      // A model cap (Smart): only an account known to have room in that model's bucket.
+      const only = ahead && reason === 'model_cap' ? this.modelRoom(chain, signal?.model, now) : undefined
       const picked =
         healthyActive ??
         pickNext(chain, from?.key, this.state.health, config, now, {
           mode: reason === 'manual' ? 'manual' : advisory ? 'advisory' : 'hard',
-          sourceExhausted: !!from && exhausted(from, now)
+          sourceExhausted: !!from && exhausted(from, now),
+          ...(context ? { smart: context } : {}),
+          ...(only ? { only } : {})
         })
       // Only ever another account of the same service.
       const target = picked && picked.provider === pane.agent ? picked : null
       if (!target) {
         // A threshold is advice: with nowhere to go, the session keeps working where it is.
-        if (!advisory) await this.park(pane, from, chain, config, reason)
+        if (advisory) return
+        if (only) {
+          const model = signal?.model ?? 'model'
+          await this.park(pane, from, chain, config, reason, {
+            model,
+            ...(signal?.resetsAt ? { wakeAt: signal.resetsAt } : {}),
+            why: `no other ${PROVIDER_NAME[pane.agent]} account is known to have room for ${model}; waiting for its limit to reset`,
+            notify: `${PROVIDER_NAME[pane.agent]}: the ${model} limit was hit and no other account is known to have room for it.`
+          })
+          return
+        }
+        await this.park(pane, from, chain, config, reason)
         return
       }
       if (advisory && !(await this.advisoryOk(pane, from, target, lines, view, config, now))) return
@@ -1031,7 +1140,16 @@ export class Rotator {
     })
   }
 
-  private async park(pane: PaneInfo, from: Seat | undefined, chain: Seat[], config: Config, reason: SwapReason) {
+  private async park(
+    pane: PaneInfo,
+    from: Seat | undefined,
+    chain: Seat[],
+    config: Config,
+    reason: SwapReason,
+    /** A wait that is not "every account is used up": for the source to reset (`hold`), or for a
+     *  model's bucket (`model`). */
+    special: { wakeAt?: number; hold?: 'short'; model?: string; why: string; notify: string } | undefined = undefined
+  ) {
     const now = this.deps.now()
     if (config.strategy === 'manual' || !config.waitForReset) {
       this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', ...(from ? { from: from.key } : {}), detail: config.strategy === 'manual' ? 'manual strategy' : 'no healthy seat', why: `no other ${PROVIDER_NAME[pane.agent]} account has room, and ${config.strategy === 'manual' ? 'the strategy is manual' : 'waiting for a reset is off'}` })
@@ -1040,16 +1158,18 @@ export class Rotator {
       this.publishNow()
       return
     }
-    const wakeAt = earliestReset(chain, this.state.health, now) ?? now + config.defaultCooldownMinutes * 60_000
+    const wakeAt = special?.wakeAt ?? earliestReset(chain, this.state.health, now) ?? now + config.defaultCooldownMinutes * 60_000
     const entry: WaitingEntry = { terminalId: pane.terminalId, workspaceId: pane.workspaceId, agent: pane.agent, wakeAt }
+    if (special?.hold) entry.hold = special.hold
+    if (special?.model) entry.model = special.model
     if (pane.sessionId) entry.sessionId = pane.sessionId
     if (pane.agentId) entry.agentId = pane.agentId
     if (from) entry.fromSeat = from.key
     if (pane.server) entry.server = pane.server
     this.state.waiting = [...this.state.waiting.filter((w) => w.terminalId !== pane.terminalId), entry]
-    this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'waiting', ...(from ? { from: from.key } : {}), detail: `until ${new Date(wakeAt).toISOString()}`, why: `every ${PROVIDER_NAME[pane.agent]} account is used up or cooling down; waiting for the earliest reset` })
+    this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'waiting', ...(from ? { from: from.key } : {}), detail: `until ${new Date(wakeAt).toISOString()}`, why: special?.why ?? `every ${PROVIDER_NAME[pane.agent]} account is used up or cooling down; waiting for the earliest reset` })
     await this.save()
-    await this.deps.notify('Auto Hand-off', `Every ${pane.agent} account is exhausted; resuming at ${new Date(wakeAt).toLocaleString()}.`)
+    await this.deps.notify('Auto Hand-off', special ? `${special.notify} Resuming at ${new Date(wakeAt).toLocaleString()}.` : `Every ${pane.agent} account is exhausted; resuming at ${new Date(wakeAt).toLocaleString()}.`)
     this.publishNow()
   }
 
@@ -1256,7 +1376,7 @@ export class Rotator {
   /** Runs every 30 s: refresh usage, wake parked sessions, expire cooldowns. */
   async tick(): Promise<void> {
     const config = await this.deps.config()
-    this.services = { ...config.services }
+    this.noteConfig(config)
     const view = await this.accounts()
     const now = this.deps.now()
     let changed = this.pruneHistory()
@@ -1295,7 +1415,14 @@ export class Rotator {
         const wServer = w.server ?? (await this.serverOfWorkspace(w.workspaceId))
         const wView = wServer === this.server ? view : await this.accountsFor(wServer)
         const chain = buildChain(wView.seats, w.agent, config)
-        const ready = w.wakeAt <= now || pickNext(chain, undefined, this.state.health, config, now)
+        // A wait with its own end (`hold`) ends at its time only; a wait for a model's bucket also
+        // ends once an account is known to have room in that bucket.
+        const sooner = w.hold
+          ? null
+          : w.model
+            ? pickNext(chain, w.fromSeat, this.state.health, config, now, { only: this.modelRoom(chain, w.model, now) })
+            : pickNext(chain, undefined, this.state.health, config, now)
+        const ready = w.wakeAt <= now || sooner
         if (ready) await this.wake(w)
       }
       await this.reselectPreferred(config)
@@ -1438,7 +1565,10 @@ export class Rotator {
       const view = await this.accountsFor(server, true)
       const now = this.deps.now()
       const chain = buildChain(view.seats, w.agent, config)
-      const target = pickNext(chain, undefined, this.state.health, config, now)
+      // Before its time, a wait for a model's bucket ends only on an account with room in it.
+      const early = w.model && w.wakeAt > now ? { only: this.modelRoom(chain, w.model, now) } : {}
+      const context = this.looksAhead(config) && config.strategy === 'smart' ? { smart: await this.smartContext(w.agent, view, server, now) } : {}
+      const target = pickNext(chain, w.model && w.wakeAt > now ? w.fromSeat : undefined, this.state.health, config, now, { ...early, ...context })
       if (!target) {
         w.wakeAt = earliestReset(chain, this.state.health, now) ?? now + config.defaultCooldownMinutes * 60_000
         await this.save()
@@ -1619,6 +1749,8 @@ export class Rotator {
       history: this.state.history.filter((h) => h.at >= now - HISTORY_MAX_AGE_MS).slice(-100),
       services: { ...this.services }
     }
+    if (this.mode) snap.mode = this.mode
+    if (this.modeNotice && !this.state.customNoticeSeen) snap.notice = this.modeNotice
     if (this.focused) snap.focused = this.focused
     if (this.server) snap.server = this.server
     if (this.sshHost) snap.sshHost = this.sshHost

@@ -31,6 +31,8 @@ declare module 'orca' {
      *  automatic hand-off off so the choice is never undone; the panel offers the toggle. */
     'rotator.switchTo': { input: { seatKey: string }; output: { message: string } }
     'rotator.cancelWaiting': { input: { terminalId: string }; output: { ok: true } }
+    /** The one-time note about `custom` mode was read. */
+    'rotator.dismissNotice': { input: Record<string, never>; output: { ok: true } }
   }
   interface PluginPanelEvents {
     /** Posted to every open panel when anything the panel shows changes. */
