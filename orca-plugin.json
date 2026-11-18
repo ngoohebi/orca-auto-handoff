@@ -1,0 +1,252 @@
+{
+  "manifestVersion": 2,
+  "id": "account-rotator",
+  "name": "Account Rotator",
+  "version": "0.1.0",
+  "description": "Pools Orca's managed agent accounts (Claude, Codex, Antigravity, OpenCode, Devin): on a rate limit or usage threshold it switches to the next healthy account and resumes the session, like cux.",
+  "engines": {
+    "orca": ">=1.4.259"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "seats",
+        "title": "Account Rotator",
+        "icon": "gauge",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "commands": [
+      {
+        "id": "rotator.next",
+        "title": "Account Rotator: Switch Claude to the next account"
+      },
+      {
+        "id": "rotator.nextCodex",
+        "title": "Account Rotator: Switch Codex to the next account"
+      },
+      {
+        "id": "rotator.swapThisPane",
+        "title": "Account Rotator: Move this workspace's agent to another account"
+      },
+      {
+        "id": "rotator.togglePause",
+        "title": "Account Rotator: Pause or resume automatic switching"
+      },
+      {
+        "id": "rotator.refresh",
+        "title": "Account Rotator: Refresh usage"
+      }
+    ],
+    "events": [
+      {
+        "on": "agent.status.changed"
+      }
+    ],
+    "hooks": [
+      {
+        "event": "agent.launch.before",
+        "onError": "pass"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "seat",
+        "text": "Account Rotator",
+        "icon": "gauge",
+        "tooltip": "Account Rotator",
+        "command": "rotator.next"
+      }
+    ],
+    "settings": [
+      {
+        "key": "service_claude",
+        "title": "Auto-switch Claude accounts",
+        "type": "boolean",
+        "default": true,
+        "description": "Off: Claude panes are never switched or resumed automatically (manual switching still works)."
+      },
+      {
+        "key": "service_codex",
+        "title": "Auto-switch Codex accounts",
+        "type": "boolean",
+        "default": true,
+        "description": "Off: Codex panes are never switched or resumed automatically (manual switching still works)."
+      },
+      {
+        "key": "service_antigravity",
+        "title": "Auto-switch Antigravity accounts",
+        "type": "boolean",
+        "default": true,
+        "description": "Off: Antigravity panes are never switched or resumed automatically (manual switching still works)."
+      },
+      {
+        "key": "service_opencode",
+        "title": "Auto-switch OpenCode accounts",
+        "type": "boolean",
+        "default": true,
+        "description": "Off: OpenCode panes are never switched or resumed automatically (manual switching still works)."
+      },
+      {
+        "key": "service_devin",
+        "title": "Auto-switch Devin accounts",
+        "type": "boolean",
+        "default": true,
+        "description": "Off: Devin panes are never switched or resumed automatically (manual switching still works)."
+      },
+      {
+        "key": "strategy",
+        "title": "Strategy",
+        "type": "string",
+        "default": "drain",
+        "enum": [
+          "drain",
+          "balanced",
+          "priority",
+          "manual"
+        ],
+        "description": "drain: stay on an account until it is limited, then take the next in chain order. balanced: the account with the most room. priority: always the first healthy account in the chain. manual: never switch automatically."
+      },
+      {
+        "key": "auto_switch_on_rate_limit",
+        "title": "Switch on rate limit",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "auto_switch_on_threshold",
+        "title": "Switch at usage threshold",
+        "type": "boolean",
+        "default": true,
+        "description": "Checked when an agent finishes a turn."
+      },
+      {
+        "key": "thresholds_five_hour",
+        "title": "5-hour threshold (%)",
+        "type": "integer",
+        "default": 100,
+        "minimum": 1,
+        "maximum": 100,
+        "description": "100 = only when exhausted."
+      },
+      {
+        "key": "thresholds_seven_day",
+        "title": "Weekly threshold (%)",
+        "type": "integer",
+        "default": 100,
+        "minimum": 1,
+        "maximum": 100
+      },
+      {
+        "key": "auto_resume",
+        "title": "Resume the session after a switch",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "auto_message",
+        "title": "First message after a switch",
+        "type": "string",
+        "default": "Go continue.",
+        "description": "Empty = resume silently."
+      },
+      {
+        "key": "wait_for_reset",
+        "title": "Wait for reset when every account is exhausted",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "retry_on_api_error",
+        "title": "Retry on API errors",
+        "type": "boolean",
+        "default": true,
+        "description": "Types the first message again after a Fibonacci backoff (5 s … 120 s)."
+      },
+      {
+        "key": "max_api_retries",
+        "title": "Maximum API error retries",
+        "type": "integer",
+        "default": 6,
+        "minimum": 0,
+        "maximum": 50
+      },
+      {
+        "key": "chain",
+        "title": "Account chain",
+        "type": "string",
+        "default": "",
+        "description": "Comma-separated order of accounts within each service: emails, seat keys (claude:<id>, codex:system) or provider:*. Example: me@example.com, claude:*. Empty = Orca's order. Switching never leaves the agent's own service."
+      },
+      {
+        "key": "model_fallback",
+        "title": "Model fallback",
+        "type": "string",
+        "default": "",
+        "description": "Models to try in place before switching account when a model-specific cap is hit, e.g. claude=sonnet,haiku; codex=gpt-5-mini"
+      },
+      {
+        "key": "default_cooldown_minutes",
+        "title": "Default cooldown (minutes)",
+        "type": "integer",
+        "default": 60,
+        "minimum": 1,
+        "maximum": 10080,
+        "description": "Used when neither the message nor Orca says when a limit resets."
+      },
+      {
+        "key": "poll_interval_seconds",
+        "title": "Usage refresh interval (seconds)",
+        "type": "integer",
+        "default": 60,
+        "minimum": 15,
+        "maximum": 3600
+      },
+      {
+        "key": "handoff_max_chars",
+        "title": "Handoff prompt size limit",
+        "type": "integer",
+        "default": 6000,
+        "minimum": 500,
+        "maximum": 50000
+      },
+      {
+        "key": "orca_cli_path",
+        "title": "Orca CLI path",
+        "type": "string",
+        "default": "",
+        "description": "Empty = detect (ORCA_CLI_COMMAND, the app bundle, then orca)."
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "agent:read"
+    },
+    {
+      "kind": "agent:launch"
+    },
+    {
+      "kind": "terminal:read"
+    },
+    {
+      "kind": "terminal:send"
+    },
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "notifications:show"
+    },
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    }
+  ]
+}
