@@ -1154,6 +1154,13 @@ export class Rotator {
       await this.leftForDraft(pane, 'model_cap', `the model was not switched to ${model}`)
       return true
     }
+    // Looking for unsent text asks Orca (live: a CLI process), and Smart read the accounts before
+    // that: a turn the user started meanwhile is not typed into. Its end is a new event, and the
+    // fallback model is still there for it.
+    if (await this.midTurn(pane)) {
+      this.deps.log(`${pane.agent} ${pane.terminalId}: in the middle of a turn again, not switching the model`)
+      return true
+    }
     this.state.modelStep[pane.terminalId] = step + 1
     await this.type(pane.terminalId, adapter.modelSwitch(model), pane.server)
     await this.deps.sleep(1500)
@@ -1496,8 +1503,11 @@ export class Rotator {
     return now - last >= config.switchCooldownMinutes * 60_000
   }
 
-  private noteSelectionChange(provider: Provider, reason: SwapReason, now: number, server: string | undefined): void {
-    if (reason === 'manual') return
+  /** Every change of the selection starts the switch cooldown: the plugin's own, and one the user
+   *  made by moving a session with the command. Advice (switch-back, a Low account, expiring
+   *  quota) that changed it again half a minute later would be a flap, with Orca's restart
+   *  prompt shown twice. */
+  private noteSelectionChange(provider: Provider, now: number, server: string | undefined): void {
     this.state.lastAutoSwitchAt = { ...(this.state.lastAutoSwitchAt ?? {}), [scopedKey(server, provider)]: now }
   }
 
@@ -1601,7 +1611,7 @@ export class Rotator {
         await this.selectOn(target.provider, target.accountId, pane.server)
         view.active[target.provider] = target.key
         for (const s of view.seats) if (s.provider === target.provider) s.active = s.key === target.key
-        this.noteSelectionChange(target.provider, reason, this.deps.now(), pane.server)
+        this.noteSelectionChange(target.provider, this.deps.now(), pane.server)
         reselected = true
       }
       if (!config.autoResume) {
@@ -1667,7 +1677,7 @@ export class Rotator {
       await this.save()
       this.publishNow()
       // Why the first message was not typed into the resumed pane, if it was not.
-      let left: 'busy' | 'draft' | null = null
+      let left: 'busy' | 'draft' | 'untyped' | null = null
       if (canResume) {
         await this.waitReady(newTerminal, pane.workspaceId)
         await this.seedSeen(newTerminal, pane.agent, pane.sessionId)
@@ -1677,14 +1687,29 @@ export class Rotator {
           const resumed: PaneInfo = { ...pane, terminalId: newTerminal }
           left = (await this.midTurn(resumed)) ? 'busy' : (await this.draftIn(resumed, [])) ? 'draft' : null
           if (left) this.deps.log(`${pane.agent} ${newTerminal}: ${left === 'busy' ? 'in the middle of a turn' : 'unsent text in the input box'}, not typing the first message`)
-          else await this.type(newTerminal, config.autoMessage, pane.server)
+          else {
+            // The session is resumed on the new account whether or not the message gets through:
+            // a send that fails must not turn the move into a failed one (below), which would set
+            // the account the session now runs on aside.
+            try {
+              await this.type(newTerminal, config.autoMessage, pane.server)
+            } catch (error) {
+              left = 'untyped'
+              this.deps.log(`${pane.agent} ${newTerminal}: could not type the first message: ${String((error as Error)?.message ?? error)}`)
+            }
+          }
         }
       }
       // In Smart the notification gives the reason in words, and says that Orca's own restart
       // prompt (shown whenever the selected account changes) needs no action.
       const plain = reason !== 'manual' && this.looksAhead(config)
       const body = plain ? `${PROVIDER_NAME[pane.agent]}: ${whyLine}.` : `${pane.agent}: ${from?.label ?? 'account'} → ${target.label} (${reason}).`
-      const untyped = left === 'draft' ? ' The session has unsent text in its input box, so it is left for you to continue.' : ''
+      const untyped =
+        left === 'draft'
+          ? ' The session has unsent text in its input box, so it is left for you to continue.'
+          : left === 'untyped'
+            ? ' The first message could not be typed, so the session is left for you to continue.'
+            : ''
       await this.deps.notify('Auto Hand-off', `${body}${untyped}${plain && reselected ? ` ${restartNote(config)}` : ''}`)
     } catch (error) {
       const message = String((error as Error)?.message ?? error)
@@ -2023,7 +2048,7 @@ export class Rotator {
         }
         fresh.active[provider] = preferred.key
         for (const s of fresh.seats) if (s.provider === provider) s.active = s.key === preferred.key
-        this.noteSelectionChange(provider, plan.reason, this.deps.now(), server)
+        this.noteSelectionChange(provider, this.deps.now(), server)
         this.startProbation(preferred, config, this.deps.now(), server)
         if (plan.leftLow) this.markLeftLow(plan.leftLow, this.deps.now(), server)
         this.record({ provider, reason: plan.reason, result: 'selected', ...(from ? { from } : {}), to: preferred.key, why: plan.why })
@@ -2215,6 +2240,14 @@ export class Rotator {
           this.publishNow()
           return
         }
+        // The accounts were read afresh since the look at the pane above (live: seconds): a turn
+        // the user started meanwhile is not typed into. They went on there, so the wait is over.
+        if (await this.midTurn({ terminalId: w.terminalId, workspaceId: w.workspaceId, agent: w.agent })) {
+          this.deps.log(`${w.agent} ${w.terminalId}: in the middle of a turn again, not typing into it`)
+          await this.save()
+          this.publishNow()
+          return
+        }
         this.record({ provider: w.agent, terminalId: w.terminalId, reason: 'reset', result: 'retried', from: source.key, to: source.key, why: `${label} has reset; the session continues there` })
         await this.save()
         if (config.autoMessage) await this.type(w.terminalId, config.autoMessage, server)
@@ -2277,8 +2310,20 @@ export class Rotator {
   // ---- commands ---------------------------------------------------------------------------
 
   async selectSeat(seatKey: string, chosen?: (provider: Provider) => Promise<void>): Promise<string> {
-    const view = await this.accounts(true)
-    const server = this.server
+    return this.selectSeatOn(await this.focusedServer(), seatKey, chosen)
+  }
+
+  /** The server of the project in focus now, noted as the one the panel shows. A choice made by
+   *  hand settles it once, before the accounts are read (live: seconds): the focus can move to a
+   *  project on another server meanwhile, whose accounts are other accounts under the same keys. */
+  private async focusedServer(): Promise<string | undefined> {
+    const server = await this.currentServer()
+    this.server = server
+    return server
+  }
+
+  private async selectSeatOn(server: string | undefined, seatKey: string, chosen?: (provider: Provider) => Promise<void>): Promise<string> {
+    const view = await this.accountsFor(server, true)
     const seat = view.seats.find((s) => s.key === seatKey)
     if (!seat) throw Object.assign(new Error(`Unknown account ${seatKey}`), { code: 'invalid_params' })
     return this.withLock(seat.provider, async () => {
@@ -2303,12 +2348,13 @@ export class Rotator {
 
   async selectNext(provider: Provider): Promise<string> {
     const config = await this.deps.config()
-    const view = await this.accounts(true)
+    const server = await this.focusedServer()
+    const view = await this.accountsFor(server, true)
     const chain = buildChain(view.seats, provider, config)
     const strategy = config.strategy === 'manual' ? 'drain' : config.strategy
-    const next = pickNext(chain, view.active[provider], this.healthOn(this.server), { ...config, strategy }, this.deps.now(), { mode: 'manual' })
+    const next = pickNext(chain, view.active[provider], this.healthOn(server), { ...config, strategy }, this.deps.now(), { mode: 'manual' })
     if (!next) return `${PROVIDER_NAME[provider]}: no other healthy account`
-    return this.selectSeat(next.key)
+    return this.selectSeatOn(server, next.key)
   }
 
   /** The panel's *Manual switch*: select the chosen account of its service for new launches and
@@ -2319,19 +2365,22 @@ export class Rotator {
    *  as the account is selected, before any other move of that service can run. */
   async forceTo(seatKey: string, chosen?: (provider: Provider) => Promise<void>): Promise<{ message: string; switched: boolean; provider: Provider }> {
     const config = await this.deps.config()
-    const view = await this.accounts(true)
+    const server = await this.focusedServer()
+    const view = await this.accountsFor(server, true)
     const seat = view.seats.find((s) => s.key === seatKey)
     if (!seat) throw Object.assign(new Error(`Unknown account ${seatKey}`), { code: 'invalid_params' })
     const provider = seat.provider
     const now = this.deps.now()
-    const health = this.healthOf(seat.key, this.server)
+    const health = this.healthOf(seat.key, server)
     if (health?.cooldownUntil && health.cooldownUntil > now) {
       return { message: `${PROVIDER_NAME[provider]}: ${seat.label} is limited until ${new Date(health.cooldownUntil).toLocaleTimeString()}; clear the cooldown first`, switched: false, provider }
     }
     if (view.active[provider] === seat.key) return { message: `${PROVIDER_NAME[provider]}: new launches already use ${seat.label}`, switched: false, provider }
-    const selected = await this.selectSeat(seat.key, chosen)
+    const selected = await this.selectSeatOn(server, seat.key, chosen)
     const pane = await this.currentPane(provider)
-    if (!pane) return { message: selected, switched: true, provider }
+    // The focus moved to a project on another server meanwhile: the pane in front now runs on
+    // other accounts, and is not the one the choice was made for.
+    if (!pane || pane.server !== server) return { message: selected, switched: true, provider }
     if (pane.sshHost) return { message: `${selected}; this pane runs on SSH target ${pane.sshHost} with that machine's own login and is left alone`, switched: true, provider }
     if (pane.state !== 'waiting' && pane.state !== 'done') return { message: `${selected}; this pane keeps its account while it works`, switched: true, provider }
     const moved = await this.withLock(provider, async () => {

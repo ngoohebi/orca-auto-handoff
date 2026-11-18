@@ -282,7 +282,7 @@ export type RotatorState = {
   waiting: WaitingEntry[]
   history: HistoryEntry[]
   /** Last selection change per provider (for the switch cooldown): the plugin's own, or one the
-   *  user made with the next-account command or the panel's switch. */
+   *  user made with the next-account command, the move command or the panel's switch. */
   lastAutoSwitchAt?: Record<string, number>
   probation?: Record<string, Probation>
   /** Seats left as Low (smart.ts anti-flap), by seat key. */

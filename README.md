@@ -31,7 +31,9 @@ selection. The plugin follows the project: the panel lists that server's account
 server, and a pane there is switched, closed and resumed with that server's accounts. Each server's
 accounts are cached separately, and so is what the plugin remembers about them: cooldowns, strikes,
 probation, accounts left as Low and the 5-minute selection cooldown are kept per server, so a limit
-or a switch on a paired server never holds back the accounts of this computer. Since the `orca account` commands refuse `--environment`, the
+or a switch on a paired server never holds back the accounts of this computer. A choice you make
+by hand (the panel's switch, the next-account command) applies to the server of the project in
+focus when you made it, also when you move on to another project while it is carried out. Since the `orca account` commands refuse `--environment`, the
 worker reaches a paired server through Orca's own runtime client (see *Permissions*). A project on
 a direct SSH target (host `ssh:<target>`) is different: its agents run with that machine's own
 login and Orca manages no accounts for it, so the plugin leaves those panes alone, notes a limit
@@ -60,7 +62,10 @@ Out of the box, Auto Hand-off runs in **Smart** mode. You do not have to set any
   and that week ends within two days, idle sessions and new sessions go there first, because
   unused quota is lost at the reset.
 - **It does not bounce back and forth.** An account it left because it was running low is not
-  used again until that account's 5-hour window has reset.
+  gone back to by an early or idle move, nor selected again for new sessions, until that
+  account's 5-hour window has reset (or a fresh reading shows it has started again). Only a
+  session stopped by a real limit may still be moved there, when no other account with known
+  room would last.
 - **It waits when waiting is cheaper.** A session that is moved has to re-read its whole
   conversation on the new account. If the account it is on resets within 5 minutes, the session
   simply waits and carries on there.
@@ -127,7 +132,7 @@ The table below lists every trigger. Rows that mention thresholds, strategies or
 |---|---|
 | Rate-limit banner in the pane's latest output | Cooldown that seat until the parsed reset time (else Orca's `resetsAt`, else *Default cooldown*), switch, resume. The next account is one with known room if there is one, else one presumed reset, else one without numbers |
 | Banner with no reset time on an account without usage numbers | A *strike*: the cooldown is *Default cooldown* × 2 per strike (60, 120, 240 min …), at most 5 h. Strikes count for 24 h |
-| Model-specific cap (e.g. Claude Fable weekly) | Smart and Follow my order: an account known to have room for that model, then `/model <next>` from *Model fallback* in place, then an account not known to be full for that model, then wait. Custom: `/model <next>` first; switch accounts only when the list runs out. `/model` is never typed into a pane whose input box holds unsent text; you are told instead |
+| Model-specific cap (e.g. Claude Fable weekly) | Smart and Follow my order: an account known to have room for that model, then `/model <next>` from *Model fallback* in place, then an account not known to be full for that model, then wait. Custom: `/model <next>` first; switch accounts only when the list runs out. `/model` is never typed into a pane whose input box holds unsent text (you are told instead), nor into a turn you started meanwhile (its end is handled as a new event) |
 | API error (529, overloaded, stream disconnected) | Type the first message again after a Fibonacci backoff (5 s … 120 s), up to *Maximum API error retries*. Only while the pane is still between turns and the error is still its latest output (if you went on meanwhile, what the pane shows now is handled instead), and never into an input box that holds unsent text; you are told instead |
 | Auth failure | 12 h cooldown on that seat, switch |
 | A turn ends while the seat is over a threshold | Switch to an account with known room (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets. An account without numbers is taken only when the current one is known to be at 100 % and no known account is left |
@@ -197,7 +202,10 @@ other move they also never close a pane that is in the middle of a turn. The plu
 (`orca terminal read --json`, field `draft`) and also looks at the input line on screen; if Orca
 cannot be asked, the screen alone decides. The same holds for the first message after a move: if
 you are already typing in the resumed pane, or have sent something there, it is not typed, and
-the notification says the session is left for you to continue.
+the notification says the session is left for you to continue. A first message that cannot be
+typed at all (the new pane is gone, or the CLI fails) is said the same way; the move itself
+stands, and the account moved to is not set aside. A session that waited for its own account to
+reset (the short wait) is likewise not typed into when you started a turn there meanwhile.
 
 **Guards on advisory moves** (threshold, idle, switch-back; hard limits ignore these two, and so
 does a move you ask for yourself from the panel or the command):
@@ -565,7 +573,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 243 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 248 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json
