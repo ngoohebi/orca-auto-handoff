@@ -190,7 +190,7 @@ without numbers, as long as it has no strikes.
 included: a pane whose input box holds unsent text is never closed. An advisory move is dropped
 and considered again at the next turn end or idle check; a limit move stays pending until the
 text is sent or cleared (see the table above). The *Move this workspace's agent to another
-account* command and the panel's *Hand off* leave such a pane alone as well, and say so; like every
+account* command and the panel's *Switch to this account* leave such a pane alone as well, and say so; like every
 other move they also never close a pane that is in the middle of a turn. The plugin asks Orca for that text
 (`orca terminal read --json`, field `draft`) and also looks at the input line on screen; if Orca
 cannot be asked, the screen alone decides.
@@ -269,7 +269,7 @@ and these are ignored.
     ready, amber low, red limited or drained, grey idle), its 5-hour, weekly and model windows as
     "% left" plus the reset time on the same bar Orca's account switcher draws (green, yellow
     from 80 % used, red from 90 %), and *Clear* on a cooldown;
-  - on each standby account, *Hand off*, which asks first: new sessions of that
+  - on each standby account, *Switch to this account*, which asks first: new sessions of that
     service start on it, and the session in the current tab moves there too when it is between
     turns and its input box holds no unsent text, whatever the headroom of the account you chose.
     A pane that is working, or that holds unsent text, keeps its account, and the panel says

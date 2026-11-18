@@ -183,7 +183,7 @@ test('a service with a single account shows no auto hand-off toggle', async () =
   assert.ok(view.find({ text: 'plus@example.test' }))
 })
 
-test('a standby offers Hand off, asks first, and the block then says automatic hand-off is off', async () => {
+test('a standby offers "Switch to this account", asks first in plain words, and the block then says automatic hand-off is off', async () => {
   const calls: string[] = []
   let auto = true
   const seats: Snapshot['seats'] = [
@@ -203,20 +203,20 @@ test('a standby offers Hand off, asks first, and the block then says automatic h
   })
   const view = await mount(panel, { host })
   // Only the standby can be chosen; the account in use has no such button.
-  assert.equal(view.findAll({ text: 'Hand off' }).length, 1)
-  assert.ok(!view.find({ text: /Hand off Claude to spare@example.test/ }))
+  assert.equal(view.findAll({ text: 'Switch to this account' }).length, 1)
+  assert.ok(!view.find({ text: /Use spare@example.test for Claude/ }))
   assert.ok(!view.find({ text: /Automatic hand-off for Claude is off/ }))
-  await view.press({ text: 'Hand off' })
-  assert.ok(view.find({ text: 'Hand off Claude to spare@example.test?' }))
+  await view.press({ text: 'Switch to this account' })
+  assert.ok(view.find({ text: 'Use spare@example.test for Claude?' }))
   assert.ok(view.find({ text: 'New Claude sessions will start on this account.' }))
   assert.ok(view.find({ text: 'The session in this tab moves too if it is idle; a busy one stays where it is.' }))
   assert.ok(view.find({ text: "Auto hand-off for Claude turns off, so it won't switch back on its own." }))
   // Cancel backs out without switching.
   await view.press({ text: 'Cancel' })
-  assert.ok(!view.find({ text: /Hand off Claude to spare@example.test/ }))
+  assert.ok(!view.find({ text: /Use spare@example.test for Claude/ }))
   assert.deepEqual(calls, [])
-  await view.press({ text: 'Hand off' })
-  await view.press({ text: 'Hand off' })
+  await view.press({ text: 'Switch to this account' })
+  await view.press({ text: 'Yes, switch' })
   assert.deepEqual(calls, ['switch claude:b'])
   assert.ok(view.find({ text: /new launches use/ }))
   assert.ok(view.find({ text: /Automatic hand-off for Claude is off/ }))

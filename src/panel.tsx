@@ -46,7 +46,7 @@ const message = atom<string | null>(null)
 const tab = atom('tab', 'accounts', { persist: 'plugin' })
 /** The Claude console status line in the focused workspace; null until read. */
 const consoleLine = atom<ConsoleLineState | null>(null)
-/** The standby account whose *Hand off* is waiting for confirmation. */
+/** The standby account whose *Switch to this account* is waiting for confirmation. */
 const confirming = atom<string | null>(null)
 
 /** The console line state; one retry, since the first request after a reload can race the
@@ -299,7 +299,7 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
           <Box paddingY="xs">
             {read(confirming) === seat.key ? (
               <Box border="accent" radius="md" padding="sm" gap="sm">
-                <Text size="sm" weight="medium">{`Hand off ${name} to ${seat.label}?`}</Text>
+                <Text size="sm" weight="medium">{`Use ${seat.label} for ${name}?`}</Text>
                 <Text size="xs" muted>
                   New {name} sessions will start on this account.
                 </Text>
@@ -326,7 +326,7 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
                       })
                     }}
                   >
-                    Hand off
+                    Yes, switch
                   </Button>
                 </Row>
               </Box>
@@ -336,10 +336,11 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
                   size="sm"
                   variant="outline"
                   icon="next"
+                  tooltip={`Use this account for ${name} now, instead of waiting for auto hand-off`}
                   disabled={read(busy) !== null}
                   onPress={() => set(confirming, seat.key)}
                 >
-                  Hand off
+                  Switch to this account
                 </Button>
               </Row>
             )}
