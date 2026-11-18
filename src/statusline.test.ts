@@ -407,6 +407,39 @@ test('wrapper script: a model name that holds a header placeholder is printed as
   }
 })
 
+test('wrapper script: a payload value that is not a plain number is shown as unknown and never evaluated by the shell', async () => {
+  const fx = fakeHome()
+  try {
+    const { existsSync, readdirSync } = await fs()
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    writeFileSync(join(fx.home, '.orca/account-rotator/status.tsv'), renderStatusFile(snapshot(Date.now()), '{ctx}|{5h}|{7d}|{reset}', Date.now()))
+    const env = { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin' }
+    const marker = join(fx.home, 'ran')
+    // Shell arithmetic expands an array subscript, so a "number" like this would run its command.
+    const evil = `x[$(touch ${marker})]`
+    const odd: unknown[] = [evil, { a: 1 }, '2026-11-19T10:00:00Z', 'lots', -3, true]
+    for (const value of odd) {
+      const payload = JSON.stringify({
+        model: { display_name: 'Opus 4.1' },
+        context_window: { used_percentage: value },
+        rate_limits: { five_hour: { used_percentage: value, resets_at: value }, seven_day: { used_percentage: value, resets_at: value } }
+      })
+      const run = await sh(script, payload, env)
+      const what = JSON.stringify(value)
+      assert.equal(run.code, 0, what)
+      assert.equal(run.stderr, '', what)
+      assert.equal(existsSync(marker), false, `${what} ran a command`)
+      const lines = plain(run.stdout).split('\n')
+      // Unknown, not "100 % left": the header has no numbers and this pane's row keeps the file's.
+      assert.equal(lines[0], '-|-|-|now', what)
+      assert.ok(lines.includes(`▶ ${pad('system (third)', 14)}  5h ········  n/a  7d ········  n/a  model ········  n/a`), `${what}: ${lines.join(' / ')}`)
+      assert.deepEqual(readdirSync(join(fx.home, '.orca/account-rotator')).includes('live'), false, `${what}: no live file`)
+    }
+  } finally {
+    fx.cleanup()
+  }
+})
+
 test('wrapper script: a live dir that cannot be written still prints the line and feeds Orca\'s hook', async () => {
   const fx = fakeHome()
   try {

@@ -194,7 +194,7 @@ export function rateOf(samples: readonly Sample[], win: WindowName, now: number)
 /**
  * How long until the first window is used up, from `now`, and which window that is. `scale`
  * multiplies the pace (more sessions on the account). A window that resets before it would run
- * out does not count. `null` when no window has a pace, or the last reading is more than 10
+ * out, or has reset since the last reading, does not count. `null` when no window has a pace, or the last reading is more than 10
  * minutes old.
  */
 export function runwayOf(samples: readonly Sample[], now: number, scale = 1): { ms: number; win: WindowName } | null {
@@ -207,7 +207,8 @@ export function runwayOf(samples: readonly Sample[], now: number, scale = 1): { 
     if (used === null || rate === null) continue
     const emptyAt = latest.t + (Math.max(0, 100 - used) / (rate * Math.max(1, scale))) * MIN
     const reset = resetOf(latest, win)
-    if (reset !== null && reset <= emptyAt) continue
+    // A reset that has passed since the reading started a new window: the old pace is not its pace.
+    if (reset !== null && (reset <= emptyAt || reset <= now)) continue
     const left = Math.max(0, emptyAt - now)
     if (best === null || left < best.ms) best = { ms: left, win }
   }

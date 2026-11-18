@@ -181,6 +181,13 @@ else
     fi
   fi
 fi
+# Only plain numbers go on. These values are used in shell arithmetic below, and arithmetic would
+# run a command hidden in any other text (an array subscript is expanded): the rest is unknown.
+case "$ctx" in ''|.*|*[!0-9.]*|*.*.*) ctx=- ;; esac
+case "$five" in ''|.*|*[!0-9.]*|*.*.*) five=- ;; esac
+case "$seven" in ''|.*|*[!0-9.]*|*.*.*) seven=- ;; esac
+case "$reset" in ''|.*|*[!0-9.]*|*.*.*) reset=- ;; esac
+case "$wreset" in ''|.*|*[!0-9.]*|*.*.*) wreset=- ;; esac
 
 now=$(date +%s 2>/dev/null || printf '%s' 0)
 

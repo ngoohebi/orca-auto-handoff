@@ -314,8 +314,8 @@ Orca points Claude Code's `statusLine` at its own hook, which feeds Orca's statu
 nothing, so a Claude pane in Orca shows no status line. *Auto Hand-off: Install the console
 status line in this workspace* writes a wrapper into the focused workspace's
 `.claude/settings.local.json` (project settings win over the user settings Orca manages). Only for
-a workspace on this computer: one on an SSH target or a paired Orca server is left alone, and the
-command and the panel switch say so. The wrapper still forwards every payload to Orca's hook, then prints one row per account of the pane's
+a workspace on this computer: one on an SSH target or a paired Orca server is left alone: the
+command says so, and the panel switch is unavailable there. The wrapper still forwards every payload to Orca's hook, then prints one row per account of the pane's
 own service (a Claude pane lists the Claude accounts, never Codex):
 
 ```
@@ -466,7 +466,8 @@ storage key `usage-samples`. When a window's reset time changes, that window's s
 
 From it the plugin works out a **rate** per window (the rise over the last 30 minutes; it needs two
 samples at least 3 minutes apart and a rise of a point) and a **runway**: how long until the first
-window is used up at that rate. A window that resets before it would run out does not count, and a
+window is used up at that rate. A window that resets before it would run out, or that has reset since the last reading, does not
+count, and a
 reading more than 10 minutes old gives no runway. The panel shows it as "About N min left at this
 pace". Smart and Follow my order act on it: see [Smart](#smart-the-default).
 
@@ -549,7 +550,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 220 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 231 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

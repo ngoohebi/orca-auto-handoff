@@ -211,6 +211,20 @@ test('runway: a window that resets before it runs out does not count; no pace or
   assert.equal(runwayMs(old, T0 + 20 * MIN + 1), null)
 })
 
+test('runway: a window whose reset time has passed since the last reading does not count', () => {
+  // 95 % and a point a minute: used up at minute 10, two minutes before the window resets.
+  const samples = fed([[0, { s: 90, sReset: T0 + 12 * MIN }], [5, { s: 95, sReset: T0 + 12 * MIN }]])
+  near(runwayMs(samples, T0 + 8 * MIN), 2 * MIN, 1)
+  near(runwayMs(samples, T0 + 11 * MIN), 0, 1)
+  // Once the reset has passed the window is a new one: the old pace says nothing about it, and
+  // the account is not "out of room" for the minutes until its next reading.
+  assert.equal(runwayMs(samples, T0 + 12 * MIN), null)
+  assert.equal(runwayMs(samples, T0 + 14 * MIN), null)
+  // The other window still counts.
+  const both = fed([[0, { s: 90, w: 50, sReset: T0 + 12 * MIN }], [5, { s: 95, w: 51, sReset: T0 + 12 * MIN }]])
+  near(runwayMs(both, T0 + 14 * MIN), (49 / 0.2 - 9) * MIN, 1)
+})
+
 test('wording: the runway, an account\'s level, and the reason for a move', () => {
   assert.equal(runwayWords(8.4 * MIN), 'about 8 min left at this pace')
   assert.equal(runwayWords(90 * MIN), 'about 90 min left at this pace')
