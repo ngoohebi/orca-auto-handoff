@@ -851,7 +851,31 @@ export class Rotator {
    *  focused workspace's active terminal tab (from the CLI's layout listing); failing that, the
    *  agent whose state changed last, since the host API names the focused workspace but not the
    *  focused pane. Returns whether the focused server or agent moved. */
-  async refreshFocus(): Promise<boolean> {
+  refreshFocus(): Promise<boolean> {
+    // One read at a time. Each costs a CLI process, and the panel's poll, the tick and Orca's
+    // events all ask: reads that overlapped piled up, and one that finished late could put back
+    // an older answer. Whoever asks during a read shares one further read made after it, so the
+    // answer is never older than the question.
+    if (!this.focusRead) {
+      const read: Promise<boolean> = this.readFocus().finally(() => {
+        if (this.focusRead === read) this.focusRead = undefined
+      })
+      this.focusRead = read
+      return read
+    }
+    this.focusNext ??= this.focusRead
+      .then(() => undefined, () => undefined)
+      .then(() => {
+        this.focusNext = undefined
+        return this.refreshFocus()
+      })
+    return this.focusNext
+  }
+
+  private focusRead: Promise<boolean> | undefined
+  private focusNext: Promise<boolean> | undefined
+
+  private async readFocus(): Promise<boolean> {
     const nextServer = await this.currentServer()
     const serverMoved = nextServer !== this.server
     if (serverMoved) {
@@ -1562,6 +1586,13 @@ export class Rotator {
     const closesUnasked = reason === 'rate_limit' || reason === 'auth' || reason === 'model_cap' || reason === 'reset'
     if (config.autoResume && closesUnasked && (await this.draftIn(pane, lines))) {
       await this.holdForDraft(pane, from, target, reason, signal?.model, view)
+      return
+    }
+    // Choosing the target read the accounts through the CLI (seconds, live): a turn the user
+    // started meanwhile is never closed. Its end is a new event; a parked session is looked at
+    // again at the next tick.
+    if (config.autoResume && closesUnasked && (await this.midTurn(pane))) {
+      this.deps.log(`${pane.agent} ${pane.terminalId}: in the middle of a turn again, not moving it`)
       return
     }
     this.moving.add(pane.terminalId)
@@ -2359,7 +2390,11 @@ export class Rotator {
   async swapFocused(): Promise<string> {
     const { agents } = await this.deps.host.call('agents.list')
     const context = await this.deps.host.call('workspace.readContext')
+    // The agent in the terminal tab in front is the one meant; without a layout listing (or with
+    // no agent in that tab), the first agent between turns, as before.
+    const active = await this.activeTerminalsOn(await this.currentServer())
     const row =
+      agents.find((a: any) => providerOf(a.agent) && a.terminalId && active.includes(a.terminalId)) ??
       agents.find((a: any) => providerOf(a.agent) && (a.state === 'waiting' || a.state === 'done')) ??
       agents.find((a: any) => providerOf(a.agent))
     if (!row || !context?.workspaceId) return 'No agent in the focused workspace'

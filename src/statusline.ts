@@ -305,6 +305,11 @@ if [ -r "$status" ]; then
       *) continue ;;
     esac
     [ "$provider" = claude ] || continue
+    # As for the payload: only plain numbers reach the arithmetic below.
+    case "$s" in ''|.*|*[!0-9.]*|*.*.*) s=- ;; esac
+    case "$w" in ''|.*|*[!0-9.]*|*.*.*) w=- ;; esac
+    case "$m" in ''|.*|*[!0-9.]*|*.*.*) m=- ;; esac
+    case "$cool" in ''|.*|*[!0-9.]*|*.*.*) cool=- ;; esac
     s=$(left_of "$s"); w=$(left_of "$w"); m=$(left_of "$m")
     # Claude trims leading spaces off each row, so the first column is never blank: ▶ is the
     # account this pane runs on, a dim dot any other.

@@ -265,8 +265,9 @@ and these are ignored.
 - **Panel** (gauge icon, right sidebar), laid out after Orca's own style guide (quiet and
   monochrome, colour only for state):
   - one section per service, in Orca's order except that the service of the agent in the current
-    terminal tab comes first, marked *this terminal* (the panel re-checks every few seconds while
-    open, since switching tabs raises no event); each sits on a band
+    terminal tab comes first, marked *this terminal* (switching tabs raises no event, so while it
+    is open the panel asks again 3 seconds after each answer, and less often, up to every 15
+    seconds, while the tab stays the same; one check runs at a time); each sits on a band
     washed in the tone nearest its brand with a brand-coloured rule under its name, a status
     light, "n of m ready" and, when it has more than one account, that service's auto hand-off
     toggle; the Claude section also has a
@@ -304,7 +305,8 @@ and these are ignored.
     Each move, wait and selection change says why in one line, for example "work is over its
     usage threshold (used 97 % of 5h, 40 % of the week); moved to personal (used 12 % of 5h)".
 - **Commands:** switch Claude or Codex to the next account, move this workspace's agent to
-  another account, pause or resume, refresh usage, install or remove the console status line.
+  another account, pause or resume, refresh usage, install or remove the console status line. With several agents in the
+  workspace, the move command takes the one in the terminal tab in front.
 - **Console status line** (Claude panes): see below.
 - **Settings** (Settings → Plugins → Auto Hand-off): every cux key (`thresholds`, `strategy`,
   `auto_resume`, `auto_message`, `wait_for_reset`, `retry_on_api_error`, `model_fallback`, …) plus
@@ -532,16 +534,21 @@ keychains and never triggers Orca's internal fetches.
 ## Permissions
 
 Orca asks you to approve the plugin's access. Beyond the host API, the worker runs the `orca` CLI
-(`account select`, `account list`, `terminal close`, `terminal send`, `terminal read`) and `git status` and
+(`account select`, `account list`, `terminal close`, `terminal send`, `terminal read`, `terminal list`) and `git status` and
 `git diff --stat`. It always uses an argument list, never a shell. The CLI is used because the host
-API cannot select accounts, refuses to close or type into panes outside the focused workspace, and
+API cannot select accounts, refuses to close or type into panes outside the focused workspace,
 does not say whether a pane's input box holds unsent text (`terminal read` does; only its `draft`
-field is used).
+field is used), and does not say which terminal tab is in front (`terminal list
+--include-visual-layouts` does; read-only, for the panel's *this terminal* mark and for the pane
+*Switch to this account* moves).
 
 For a project on a paired Orca server the worker loads Orca's own runtime client from the app
 bundle (`app.asar.unpacked/out/cli/runtime/client.js`) and calls that server's `accounts.*` RPCs
 (`accounts.list`, `accounts.selectClaude`, …) over the pairing saved on this computer, because the
-CLI's account commands only answer for this computer. Those modules are Orca internals, not a
+CLI's account commands only answer for this computer. When the host API does not say which Orca a
+workspace runs on, the same client is asked, read-only, for this computer's catalog of paired
+projects and hosts (`mobileRelay.projectSections`, `mobileRelay.hosts.list`,
+`mobileRelay.hosts.worktrees`, `ui.get`). Those modules are Orca internals, not a
 published API: an Orca update can break the server path, in which case the panel shows the error
 and this computer's accounts keep working.
 
@@ -558,7 +565,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 237 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 243 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

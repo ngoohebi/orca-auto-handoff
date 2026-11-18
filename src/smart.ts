@@ -6,7 +6,7 @@
 // - `rank`: the order in which accounts are worth moving to.
 // - `shouldLeave`: is a session's account one to move away from at the next safe moment?
 // - `explain`: the reason for a move, for the history and the notification.
-import { rateOf, runwayOf, weeklyPace, type Sample, type SeatSamples, type WindowName } from './usage-history'
+import { RUNWAY_MAX_AGE_MS, rateOf, runwayOf, weeklyPace, type Sample, type SeatSamples, type WindowName } from './usage-history'
 import type { Config, Seat, SeatHealth, UsageWindow } from './types'
 
 const MIN = 60_000
@@ -100,11 +100,14 @@ export function assess(
   if (cooling || over) return { ...base, state: 'out', over }
   const horizon = horizonMs(config)
   if (horizon > 0 && runway && runway.ms < horizon) return { ...base, state: 'low', over, low: { window: runway.win, by: 'pace' } }
-  // No pace for a window: its level alone decides.
-  if (rate.s === null && session && config.lowFiveHour < 100 && session.usedPercent >= config.lowFiveHour) {
+  // No pace for a window: its level alone decides. So it does when the readings are too old to
+  // forecast with (no runway from them), whatever pace the last half hour still shows.
+  const latest = samples[samples.length - 1]
+  const stale = !latest || now - latest.t > RUNWAY_MAX_AGE_MS
+  if ((rate.s === null || stale) && session && config.lowFiveHour < 100 && session.usedPercent >= config.lowFiveHour) {
     return { ...base, state: 'low', over, low: { window: 's', by: 'level' } }
   }
-  if (rate.w === null && weekly && config.lowSevenDay < 100 && weekly.usedPercent >= config.lowSevenDay) {
+  if ((rate.w === null || stale) && weekly && config.lowSevenDay < 100 && weekly.usedPercent >= config.lowSevenDay) {
     return { ...base, state: 'low', over, low: { window: 'w', by: 'level' } }
   }
   return { ...base, state: 'ok', over }

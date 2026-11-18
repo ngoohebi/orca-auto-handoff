@@ -240,14 +240,17 @@ export async function activateWith(
   // Load accounts now so the launch hook (2 s budget, no CLI) can record seats from the start.
   void rotator.accounts().then(() => rotator.publishNow())
 
+  // An open panel's Status line switch follows the focused workspace and the install and remove commands.
+  const tellConsoleLine = () =>
+    consoleLine
+      .status()
+      .then((state) => orca.panels.post('rotator.consoleLine', state))
+      .catch(() => undefined)
   orca.events.on('agent.status.changed', (payload) => rotator.onAgentStatus(payload as StatusEvent))
   // The panel lists the service of the agent in the focused workspace first.
   orca.events.on('workspace.changed', async () => {
     // The panel's Status line switch is per workspace: tell it the state of the one in focus now.
-    await consoleLine
-      .status()
-      .then((state) => orca.panels.post('rotator.consoleLine', state))
-      .catch(() => undefined)
+    await tellConsoleLine()
     if (await rotator.refreshFocus()) rotator.publishNow()
   })
 
@@ -270,8 +273,16 @@ export async function activateWith(
     rotator.publishNow()
     return 'Usage read from Orca. Accounts not in use update when Orca fetches them (its usage view, or right after a switch).'
   })
-  orca.commands.register('rotator.installStatusLine', () => consoleLine.install())
-  orca.commands.register('rotator.uninstallStatusLine', () => consoleLine.uninstall())
+  orca.commands.register('rotator.installStatusLine', async () => {
+    const said = await consoleLine.install()
+    await tellConsoleLine()
+    return said
+  })
+  orca.commands.register('rotator.uninstallStatusLine', async () => {
+    const said = await consoleLine.uninstall()
+    await tellConsoleLine()
+    return said
+  })
 
   orca.panels.handle('rotator.snapshot', async ({ refresh }) => {
     await Promise.all([rotator.accounts(!!refresh), rotator.refreshFocus()])

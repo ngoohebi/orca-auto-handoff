@@ -233,7 +233,7 @@ footer a{color:var(--fg-2)}
         <span class="badge">v<b>0.2.0</b></span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
         <span class="badge"><b>MIT</b> license</span>
-        <span class="badge"><b>231</b> tests, real captured banners</span>
+        <span class="badge"><b>243</b> tests, real captured banners</span>
         <span class="badge">Never switches <b>across services</b></span>
       </div>
       <div class="cta">
@@ -486,8 +486,8 @@ footer a{color:var(--fg-2)}
       <div class="tile">
         <h3>Outside the host API</h3>
         <ul class="check">
-          <li>Runs the <b>orca CLI</b>: <code>account select</code>, <code>account list</code>, <code>terminal close</code>, <code>terminal send</code>, <code>terminal read</code> (only to ask whether a pane holds unsent text). Always an argument list, never a shell.</li>
-          <li>For a project on a paired Orca server: loads Orca's own runtime client from the app bundle to list and select that server's accounts. These are Orca internals, not a published API</li>
+          <li>Runs the <b>orca CLI</b>: <code>account select</code>, <code>account list</code>, <code>terminal close</code>, <code>terminal send</code>, <code>terminal read</code> (only to ask whether a pane holds unsent text), <code>terminal list</code> (only to see which terminal tab is in front). Always an argument list, never a shell.</li>
+          <li>For a project on a paired Orca server: loads Orca's own runtime client from the app bundle to list and select that server's accounts, and to look up, read-only, which Orca a workspace runs on. These are Orca internals, not a published API</li>
           <li>Writes its status file and the status line script under <code>~/.orca/account-rotator/</code>, and, only when you install the console status line, that workspace's <code>.claude/settings.local.json</code></li>
           <li>Runs <b>git status</b> and <b>git diff --stat</b> for handoff prompts</li>
           <li><b>Never</b> reads tokens, keychains or credential files</li>
@@ -526,7 +526,7 @@ footer a{color:var(--fg-2)}
     <div class="note"><b>Coming from cux?</b> Run <code>cux uninstall-hooks</code> first so the two don't both rotate. Every cux setting key has the same name here. Per-directory project bindings and <code>cux attach</code> are not migrated yet.</div>
     <details>
       <summary>Working on the plugin itself</summary>
-      <pre style="margin-top:12px"><code>orca plugin test . --json        # 237 tests: adapters, selector, usage, status line, worker end to end, panel
+      <pre style="margin-top:12px"><code>orca plugin test . --json        # 243 tests: adapters, selector, usage, status line, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker
 npx -p typescript tsc -p .       # type-check
 orca plugin validate . --json

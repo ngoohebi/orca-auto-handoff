@@ -297,3 +297,24 @@ test('betterExpiring: only from an account that is fine, to one whose quota expi
   assert.equal(betterExpiring({ ...steady, chainIndex: 0 }, [{ ...leaving, chainIndex: 1 }], cfg()), null)
   assert.equal(betterExpiring({ ...steady, chainIndex: 1 }, [{ ...leaving, chainIndex: 0 }], cfg())?.seat.accountId, 'leaving')
 })
+
+test('assess: a pace from readings too old to forecast with does not hide a nearly full window', () => {
+  // The readings stopped 11 minutes ago (the pane went quiet): no runway, yet the last half
+  // hour still shows a pace. The level then decides, as it does with no pace at all.
+  const stale = rising([80, 84, 88, 92], T0)
+  const now = T0 + 11 * MIN
+  const full = seat('a', { s: 98, w: 20, source: 'cached' })
+  const a = assess(full, undefined, stale, cfg(), now)
+  assert.equal(a.runwayMs, null)
+  assert.ok(a.rate.s !== null)
+  assert.equal(a.state, 'low')
+  assert.deepEqual(a.low, { window: 's', by: 'level' })
+  assert.equal(shouldLeave(full, undefined, stale, cfg(), now).leave, true)
+  // The week likewise.
+  const week = assess(seat('a', { s: 30, w: 99.5, source: 'cached' }), undefined, stale.map((x, i) => ({ ...x, s: 30, w: 96 + i })), cfg(), now)
+  assert.deepEqual(week.low, { window: 'w', by: 'level' })
+  // With room it stays OK, and a fresh pace still decides by itself: 97 % at a crawl is not Low.
+  assert.equal(assess(seat('a', { s: 60, w: 20, source: 'cached' }), undefined, stale, cfg(), now).state, 'ok')
+  const slow = rising([95, 96, 97], T0, 10).map((x) => ({ ...x, sReset: T0 + 20 * MIN }))
+  assert.equal(assess(seat('a', { s: 97, w: 20, sReset: T0 + 20 * MIN }), undefined, slow, cfg(), T0).state, 'ok')
+})

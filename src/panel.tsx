@@ -103,26 +103,44 @@ async function act(key: string, fn: () => Promise<string | void>, reload?: () =>
   }
 }
 
-/** Switching terminal tabs raises no event, so while the panel is open it asks every few
- *  seconds which service the current terminal's agent belongs to. */
+/** Switching terminal tabs raises no event, so while the panel is open it asks which service the
+ *  current terminal's agent belongs to. Each answer costs the worker a CLI process, so the next
+ *  question is asked only after the answer, and less often while the tab stays the same (a
+ *  workspace or agent change is pushed by the worker anyway). */
 const FOCUS_POLL_MS = 3_000
+const FOCUS_POLL_MAX_MS = 15_000
 
 export function setup(ctx: PanelContext): void {
   ctx.subscriptions.push(plugin.on('rotator.changed', (payload) => set(snapshot, payload)))
   // The Status line switch is per workspace: the worker says when the focused one changes.
   ctx.subscriptions.push(plugin.on('rotator.consoleLine', (payload) => set(consoleLine, payload)))
-  const timer = setInterval(() => {
-    void plugin
-      .request('rotator.focus', {})
-      .then(({ focused }) => {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let closed = false
+  const poll = (wait: number): void => {
+    timer = setTimeout(async () => {
+      let moved = false
+      try {
+        const { focused } = await plugin.request('rotator.focus', {})
         const current = read(snapshot)
-        if (current && current.focused !== focused) set(snapshot, { ...current, focused })
-      })
-      .catch(() => undefined)
-  }, FOCUS_POLL_MS)
-  // Never keep a Node host (the test runner) alive for the poll.
-  ;(timer as unknown as { unref?: () => void }).unref?.()
-  ctx.subscriptions.push({ dispose: () => clearInterval(timer) })
+        if (!closed && current && current.focused !== focused) {
+          moved = true
+          set(snapshot, { ...current, focused })
+        }
+      } catch {
+        // The worker may be restarting; ask again later.
+      }
+      if (!closed) poll(moved ? FOCUS_POLL_MS : Math.min(wait * 2, FOCUS_POLL_MAX_MS))
+    }, wait)
+    // Never keep a Node host (the test runner) alive for the poll.
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+  }
+  poll(FOCUS_POLL_MS)
+  ctx.subscriptions.push({
+    dispose: () => {
+      closed = true
+      if (timer) clearTimeout(timer)
+    }
+  })
   // The first read can race the worker's restart: the worker's next push then fills the list,
   // and the Status line switch is still read.
   void load().catch(async () => set(consoleLine, await readConsoleLine()))

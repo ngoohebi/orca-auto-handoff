@@ -244,6 +244,9 @@ test('unknown pane right after a swap is treated as still on the old seat', asyn
   await worker.emit('agent.status.changed', statusEvent('tB'))
   // tB is moved to c2 (already active), not pushed on to c3.
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  // It is recorded as leaving c1, the seat that was limited, not the one just selected.
+  const moves = (w.host.data().storage.state as RotatorState).history.filter((h) => h.result === 'resumed')
+  assert.deepEqual(moves.map((h) => [h.from, h.to]), [['claude:c1', 'claude:c2'], ['claude:c1', 'claude:c2']])
   await worker.deactivate()
 })
 
@@ -1236,6 +1239,63 @@ test('the agent in the active terminal tab wins over the most recently changed o
   assert.equal((await worker.request('rotator.snapshot', {})).focused, 'codex')
 })
 
+test('focus reads never overlap: the panel poll, the tick and an event share one terminal listing, and a read asked for meanwhile runs after it', async () => {
+  let running = 0
+  let most = 0
+  let listings = 0
+  let slow = false
+  const gates: (() => void)[] = []
+  const options: Parameters<typeof world>[0] = {
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'working', stateStartedAt: 10 },
+      { terminalId: 't2', agent: 'codex', state: 'working', stateStartedAt: 20 }
+    ],
+    tails: {},
+    activeTerminals: ['t1'],
+    onActiveTerminals: async () => {
+      if (!slow) return
+      listings++
+      most = Math.max(most, ++running)
+      await new Promise<void>((resolve) => gates.push(resolve))
+      running--
+    }
+  }
+  const w = world(options)
+  const worker = await w.mount()
+  const settle = async () => {
+    for (let i = 0; i < 50; i++) await Promise.resolve()
+  }
+  const open = async () => {
+    await settle()
+    gates.shift()?.()
+    await settle()
+  }
+  await settle()
+  slow = true
+  // The CLI is slow (live: a process per call): three polls, an event and a tick arrive meanwhile.
+  const first = worker.request('rotator.focus', {})
+  await settle()
+  assert.equal(listings, 1)
+  options.activeTerminals = ['t2']
+  const later = [worker.request('rotator.focus', {}), worker.request('rotator.focus', {}), worker.emit('workspace.changed', { context: null }), w.rotator.refreshFocus()]
+  await settle()
+  // Nothing new starts while the first listing runs.
+  assert.equal(listings, 1)
+  await open()
+  await first
+  // One more listing serves everyone who asked meanwhile, and it sees the tab as it is now.
+  assert.equal(listings, 2)
+  await open()
+  await open()
+  const answers = await Promise.all(later)
+  assert.deepEqual(answers[0], { focused: 'codex' })
+  assert.deepEqual(answers[1], { focused: 'codex' })
+  assert.equal(most, 1)
+  assert.ok(listings <= 3, `listings ${listings}`)
+  assert.equal(w.rotator.focused, 'codex')
+  await worker.deactivate()
+})
+
 test('manual switch: selects the account, turns the service\u2019s automatic hand-off off, and says so', async () => {
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
@@ -1464,6 +1524,63 @@ test('Auto-switch manual: a limit is noted and said as such, not as "no healthy 
   assert.equal(lastNote(stop), 'Claude: no other account has room, and waiting for a reset is off. The session stays where it is.')
   assert.equal(stored(stop).history.at(-1)?.why, 'no other Claude account has room, and waiting for a reset is off')
   await sw.deactivate()
+})
+
+test('a limit: a turn the user starts while the accounts are read (live: seconds) is not closed', async () => {
+  let armed = false
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    // The move has seen the pane between turns and now reads the accounts: the user sends a prompt.
+    onListAccounts: async () => {
+      if (armed) w.panes[0]!.state = 'working'
+    }
+  })
+  const worker = await w.mount()
+  armed = true
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.panes[0]?.terminalId, 't1')
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.cliCalls.filter((c) => c.startsWith('close')).length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(w.typed, [])
+  // The limit itself was real: the account is still set aside.
+  assert.ok((w.host.data().storage.state as RotatorState).health['claude:c1']?.cooldownUntil! > 1_000_000)
+  // The end of that turn is a new event, and moves the session then.
+  armed = false
+  w.panes[0]!.state = 'done'
+  w.tails.t1 = [...fx.CLAUDE_SESSION_LIMIT, '❯ go on', ...fx.CLAUDE_SESSION_LIMIT]
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('manual move command: with several agents in the workspace it moves the one in the current terminal tab, never another', async () => {
+  const options: Parameters<typeof world>[0] = {
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
+      { terminalId: 'tB', agent: 'claude', state: 'done', sessionId: 'sB' }
+    ],
+    tails: { t1: ['⏺ Done.'], tB: ['⏺ Done.'] },
+    claudeUsage: { session: 5, weekly: 5 },
+    inactiveClaude: { c2: { session: 5, weekly: 5 } },
+    state: { paneSeat: { t1: 'claude:c1', tB: 'claude:c1' } },
+    activeTerminals: ['tB']
+  }
+  const w = world(options)
+  const worker = await w.mount()
+  // The tab in front is tB: t1, listed first, is left alone.
+  assert.match(String(await worker.command('rotator.swapThisPane')), /moved to/)
+  assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 'tB' }])
+  assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w1', agent: 'claude', sessionId: 'sB' }])
+  // The tab in front is in the middle of a turn: nothing moves, the idle pane behind it included.
+  options.activeTerminals = ['t1']
+  w.panes.find((p) => p.terminalId === 't1')!.state = 'working'
+  assert.match(String(await worker.command('rotator.swapThisPane')), /in the middle of a turn/)
+  assert.equal(w.host.callsOf('terminal.close').length, 1)
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
 })
 
 test('manual move command: a turn that started while the move waited its turn is not closed', async () => {
@@ -2957,6 +3074,8 @@ test('unsent text: a wait cancelled from the panel is not carried out; two looks
   c.tails.k1 = [...fx.CODEX_USAGE_LIMIT]
   await Promise.all([c.rotator.tick(), cw.emit('agent.status.changed', statusEvent('k1', 'waiting', 2))])
   assert.equal(c.host.callsOf('agent.launch').length, 1)
+  // ...and the second look does not take the pane the first one closed for one the user closed.
+  assert.deepEqual((c.host.data().storage.state as RotatorState).history.filter((h) => h.result === 'closed'), [])
   await cw.deactivate()
 })
 

@@ -440,6 +440,35 @@ test('wrapper script: a payload value that is not a plain number is shown as unk
   }
 })
 
+test('wrapper script: a status file value that is not a plain number is shown as unknown and never evaluated by the shell', async () => {
+  const fx = fakeHome()
+  try {
+    const { existsSync } = await fs()
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    const file = join(fx.home, '.orca/account-rotator/status.tsv')
+    const env = { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/zzz/home` }
+    const marker = join(fx.home, 'ran')
+    const evil = `x[$(touch ${marker})]`
+    // The worker writes numbers only; the script still reads the file as text anyone may have left.
+    for (const column of [5, 6, 7, 8]) {
+      const cells = ['seat', 'claude', 'aaa', 'work', '0', '10', '20', '0', '30', 'fable']
+      cells[column] = evil
+      writeFileSync(file, `${cells.join('\t')}\n`)
+      const run = await sh(script, '{}', env)
+      assert.equal(run.code, 0, `column ${column}`)
+      assert.equal(run.stderr, '', `column ${column}`)
+      assert.equal(existsSync(marker), false, `column ${column} ran a command`)
+      const row = plain(run.stdout).split('\n').find((l) => l.includes('work'))
+      assert.ok(row, `column ${column}: ${run.stdout}`)
+      // The odd cell reads as unknown (no cooldown for the cooldown column); the others stay.
+      assert.equal((row!.match(/n\/a/g) ?? []).length, column === 7 ? 0 : 1, `column ${column}: ${row}`)
+      assert.ok(!row!.includes('\u23f8'), `column ${column}: ${row}`)
+    }
+  } finally {
+    fx.cleanup()
+  }
+})
+
 test('wrapper script: a live dir that cannot be written still prints the line and feeds Orca\'s hook', async () => {
   const fx = fakeHome()
   try {
@@ -558,8 +587,12 @@ test('worker: install and uninstall edit the focused workspace, the status file 
 
     files.files.set('/repo/.claude/settings.local.json', '{"permissions":{"allow":["Bash(ls)"]}}\n')
     assert.deepEqual(await worker.request('rotator.consoleLine', {}), { installed: false, workspace: 'app' })
+    const start = worker.posts.length
+    const pushed = () => worker.posts.slice(start).filter((p) => p.event === 'rotator.consoleLine').map((p) => p.payload)
     const installed = await worker.command('rotator.installStatusLine')
     assert.match(String(installed), /installed for app/)
+    // An open panel is told at once: its Status line switch never shows the state before the command.
+    assert.deepEqual(pushed(), [{ installed: true, workspace: 'app' }])
     const local = JSON.parse(files.files.get('/repo/.claude/settings.local.json')!)
     assert.equal(local.statusLine.command, STATUSLINE_COMMAND)
     assert.deepEqual(local.permissions, { allow: ['Bash(ls)'] })
@@ -567,6 +600,8 @@ test('worker: install and uninstall edit the focused workspace, the status file 
     assert.deepEqual(await worker.request('rotator.consoleLine', {}), { installed: true, workspace: 'app' })
     const removed = await worker.command('rotator.uninstallStatusLine')
     assert.match(String(removed), /removed from app/)
+    assert.deepEqual(pushed().at(-1), { installed: false, workspace: 'app' })
+    assert.equal(pushed().length, 2)
     assert.deepEqual(JSON.parse(files.files.get('/repo/.claude/settings.local.json')!), { permissions: { allow: ['Bash(ls)'] } })
     assert.match(String(await worker.command('rotator.uninstallStatusLine')), /not installed/)
     // The panel switch goes through the same install and remove.

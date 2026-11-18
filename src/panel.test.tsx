@@ -351,3 +351,75 @@ test('"Yes, switch" gives the worker longer than the 30 s a request gets by defa
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
+
+test('the focus poll asks again only after its answer, slows down while the tab stays the same, and is quick again after a change', async () => {
+  // The poll's timers (the long ones the panel itself sets) are held here and fired by hand;
+  // every other timer, Orca's own included, runs as usual.
+  const g = globalThis as unknown as { setTimeout: (fn: () => void, ms?: number) => unknown }
+  const real = g.setTimeout
+  const held: { fn: () => void; ms: number }[] = []
+  g.setTimeout = (fn, ms) => {
+    if (typeof ms === 'number' && ms >= 3_000 && /[\\/]panel\.tsx/.test(new Error().stack ?? '')) {
+      held.push({ fn, ms })
+      return { unref() {} }
+    }
+    return real(fn, ms)
+  }
+  try {
+    let asked = 0
+    let answer: (focused: 'claude' | 'codex') => void = () => undefined
+    const host = mockHost({
+      requests: {
+        'rotator.snapshot': () => snapshot({ focused: 'claude' }),
+        'rotator.consoleLine': () => ({ installed: false, workspace: 'app' }),
+        'rotator.focus': () => {
+          asked++
+          return new Promise<{ focused: 'claude' | 'codex' }>((resolve) => {
+            answer = (focused) => resolve({ focused })
+          })
+        }
+      }
+    })
+    const view = await mount(panel, { host })
+    const settle = () => new Promise<void>((resolve) => real(resolve, 5))
+    /** Fires the one timer the poll holds and returns how long it had asked to wait. */
+    const fire = async () => {
+      assert.equal(held.length, 1, `timers held: ${held.map((h) => h.ms).join(',')}`)
+      const { fn, ms } = held.shift()!
+      fn()
+      await settle()
+      return ms
+    }
+    assert.equal(await fire(), 3_000)
+    assert.equal(asked, 1)
+    // The worker has not answered (live: a CLI process per answer): nothing is asked meanwhile.
+    assert.equal(held.length, 0)
+    answer('claude')
+    await settle()
+    // Same tab as before: the next question waits longer, up to 15 s.
+    const waits: number[] = []
+    for (let i = 0; i < 4; i++) {
+      waits.push(await fire())
+      answer('claude')
+      await settle()
+    }
+    assert.deepEqual(waits, [6_000, 12_000, 15_000, 15_000])
+    assert.equal(asked, 5)
+    // The user switched to a Codex tab: the panel follows, and asks quickly again.
+    assert.equal(await fire(), 15_000)
+    answer('codex')
+    await settle()
+    await view.settled()
+    assert.deepEqual(view.findAll({ text: /^(CLAUDE|CODEX)$/ }).map((n) => n.text), ['CODEX', 'CLAUDE'])
+    assert.equal(await fire(), 3_000)
+    // Closing the panel ends the poll, also when an answer is still on its way.
+    await view.unmount()
+    answer('codex')
+    await settle()
+    assert.equal(held.length, 0)
+    assert.equal(asked, 7)
+    assert.deepEqual(view.errors, [])
+  } finally {
+    g.setTimeout = real
+  }
+})

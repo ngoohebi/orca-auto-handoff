@@ -43,6 +43,14 @@ test('Claude API 529 is an api_error', () => {
 test('talking about limits is not a limit', () => {
   assert.equal(classify('claude', fx.CLAUDE_TALKING_ABOUT_LIMITS, NOW), null)
   assert.equal(classify('codex', ['plan: handle rate limits and quota in the adapter'], NOW), null)
+  // The banner's own words, where an agent wrote them: an indented line of a Claude reply, and a
+  // Codex line without an error mark. The same words as a CLI status line do count.
+  const words = '5-hour limit reached ∙ resets 3pm'
+  assert.equal(classify('claude', ['⏺ The adapter looks for this text:', `     ${words}`, '  Done.'], NOW), null)
+  assert.equal(classify('claude', [`  ⎿  ${words}`], NOW)?.kind, 'rate_limit')
+  const codex = "You've hit your usage limit. Upgrade to Pro or try again in 2 days."
+  assert.equal(classify('codex', [`• The banner reads: ${codex}`], NOW), null)
+  assert.equal(classify('codex', [`■ ${codex}`], NOW)?.kind, 'rate_limit')
 })
 
 test('Codex usage limit with a multi-unit duration', () => {
