@@ -12,15 +12,25 @@ export type Adapter = {
   rules: Rule[]
   /** Lines that are the agent's own prose (never a CLI banner), e.g. Claude's `⏺` replies. */
   prose?: RegExp
+  /** What a status/error line from the CLI itself looks like. Text that matches a rule but not
+   *  this shape (indented prose, quoted output) never counts. */
+  banner: RegExp
   /** Text typed to switch model in place, when the agent supports it. */
   modelSwitch?: (model: string) => string
 }
+
+/** Error/status markers the agent CLIs put in front of their own messages (Codex `■`,
+ *  Antigravity `⚠`, …). Agent prose that merely mentions a limit has none of them. */
+const ERROR_MARK = /^\s*(■|⚠|✗|✘|×|❌|⎿|\[?error\]?\b|error:)/i
 
 const CLAUDE: Adapter = {
   provider: 'claude',
   resume: 'by-session-id',
   modelSwitch: (model) => `/model ${model}`,
   prose: /^\s*⏺/,
+  // Claude Code prints limits and API errors as `⎿` result lines or unindented system lines;
+  // indented lines are the continuation of the agent's own reply.
+  banner: /^(\s*⎿|\S)/,
   rules: [
     {
       kind: 'auth',
@@ -48,6 +58,7 @@ const CODEX: Adapter = {
   // exist on another. Until a live check proves otherwise the engine hands off instead.
   resume: 'handoff-only',
   modelSwitch: (model) => `/model ${model}`,
+  banner: ERROR_MARK,
   rules: [
     { kind: 'auth', re: /(401 Unauthorized|token (has )?expired|please (log|sign) ?in again|codex login)/i },
     {
@@ -61,6 +72,7 @@ const CODEX: Adapter = {
 const ANTIGRAVITY: Adapter = {
   provider: 'antigravity',
   resume: 'handoff-only',
+  banner: ERROR_MARK,
   rules: [
     { kind: 'auth', re: /(sign in again|not signed in|unauthenticated)/i },
     { kind: 'rate_limit', re: /(quota reached|quota exceeded|RESOURCE_EXHAUSTED|rate limit (reached|exceeded))/i },
@@ -72,6 +84,7 @@ function generic(provider: Provider): Adapter {
   return {
     provider,
     resume: 'handoff-only',
+    banner: ERROR_MARK,
     rules: [
       { kind: 'auth', re: /(401 Unauthorized|authentication (failed|required)|please (log|sign) ?in)/i },
       {
@@ -92,10 +105,12 @@ export const ADAPTERS: Record<Provider, Adapter> = {
 }
 
 /** Lines that are the agent's input box or footer, never a status message. */
-export const CHROME = /^\s*(›|❯|>|\? for shortcuts|─{6,}|╭|╰|│\s*>)/
+export const CHROME = /^\s*(›|❯|>|✻|⏵|◐|←|\? for shortcuts|─{6,}|╭|╰|│\s*>)/
 
 /** How many non-empty lines from the bottom count as "the latest output". */
 export const TAIL_WINDOW = 14
+/** A banner must be among the last lines printed: an agent that stopped on a limit stops there. */
+export const MAX_LINES_AFTER = 4
 
 export function classify(provider: Provider, lines: readonly string[], now: number): Signal | null {
   const adapter = ADAPTERS[provider]
@@ -105,8 +120,9 @@ export function classify(provider: Provider, lines: readonly string[], now: numb
     .slice(-TAIL_WINDOW)
   // Newest line first: the most recent banner decides.
   for (let i = tail.length - 1; i >= 0; i--) {
+    if (tail.length - 1 - i > MAX_LINES_AFTER) break
     const line = tail[i]!
-    if (adapter.prose?.test(line)) continue
+    if (adapter.prose?.test(line) || !adapter.banner.test(line)) continue
     for (const rule of adapter.rules) {
       const m = line.match(rule.re)
       if (!m) continue
@@ -116,7 +132,7 @@ export function classify(provider: Provider, lines: readonly string[], now: numb
         line: line.trim().slice(0, 300),
         fingerprint: `${provider}|${rule.kind}|${normalise(line)}`,
         linesAfter: tail.length - 1 - i,
-        occurrences: lines.filter((l) => normalise(l) === normalise(line)).length
+        occurrences: countCopies(lines, line)
       }
       const resetsAt = parseReset(context, now)
       if (resetsAt !== undefined) signal.resetsAt = resetsAt
@@ -128,8 +144,14 @@ export function classify(provider: Provider, lines: readonly string[], now: numb
   return null
 }
 
-function normalise(line: string): string {
+export function normalise(line: string): string {
   return line.trim().replace(/\s+/g, ' ').slice(0, 200)
+}
+
+/** Copies of `line` in a terminal read. */
+export function countCopies(lines: readonly string[], line: string): number {
+  const want = normalise(line)
+  return lines.filter((l) => normalise(l) === want).length
 }
 
 const UNIT_MS: Record<string, number> = { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1000 }
@@ -153,6 +175,26 @@ export function parseReset(text: string, now: number): number | undefined {
       total += Number(part[1]) * (UNIT_MS[part[2]![0]!.toLowerCase()] ?? 0)
     }
     if (total > 0) return now + total
+  }
+
+  // "resets Mon 9am" (weekly and model caps): the next such weekday.
+  const day = text.match(
+    /(?:resets?(?:\s+on)?|try again on|available again on)\s+(sun|mon|tue|wed|thu|fri|sat)[a-z]*\.?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i
+  )
+  if (day) {
+    const want = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(day[1]!.toLowerCase())
+    let hour = Number(day[2])
+    const minute = day[3] ? Number(day[3]) : 0
+    const ampm = day[4]?.toLowerCase()
+    if (ampm === 'pm' && hour < 12) hour += 12
+    if (ampm === 'am' && hour === 12) hour = 0
+    if (hour > 23 || minute > 59) return undefined
+    const at = new Date(now)
+    at.setHours(hour, minute, 0, 0)
+    let add = (want - at.getDay() + 7) % 7
+    if (add === 0 && at.getTime() <= now) add = 7
+    at.setDate(at.getDate() + add)
+    return at.getTime()
   }
 
   const clock = text.match(

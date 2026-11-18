@@ -32,10 +32,28 @@ reads tokens or keychains.
 | A turn ends while the seat is over a threshold | Switch (thresholds default to 100 %, so this is reactive only) |
 | Every seat limited | Park; wake when the earliest seat frees up (*Wait for reset*) |
 
-Detection reads at most the last 14 non-empty lines when a pane turns `done` or `waiting`. It
-ignores input lines (`❯`, `›`, `>`), the TUI frame, and Claude's own `⏺` replies, so a
-conversation about rate limits never triggers a switch. Each banner is handled once, and a banner
-that has scrolled up is treated as old.
+Detection runs when a pane turns `done` or `waiting`. A banner only counts when all of these hold:
+
+- it is among the last five meaningful lines, because an agent that stopped on a limit stops there;
+- it has the shape of a CLI status line: Claude `⎿` or unindented system lines, or the error
+  markers other CLIs use (`■`, `⚠`, `error:`, …);
+- it is not an input line (`❯`, `›`, `>`), TUI frame or footer, or one of Claude's own `⏺` replies.
+
+An agent's reply that mentions rate limits is therefore not treated as a limit. Detection is
+heuristic, though; the `Automatic switching` toggle and the per-service switches are the off
+switches if it ever misfires.
+
+Each banner is handled once *per session*, so a session that Orca restores or restarts in a new
+pane, redrawing its old transcript, is not switched again. Once a banner has scrolled away, the
+same text appearing again later counts as a new limit.
+
+**Panes the plugin did not start** (opened before it loaded, or restored by Orca) have no recorded
+account. When one hits a limit while Orca reports plenty of room on the active account, the plugin
+assumes the pane was on another account. It cools nothing and resumes the session on the active
+account; from then on the pane's account is known.
+
+**`auto_resume` off:** the plugin only switches the account for new launches and tells you. The
+limited pane stays as it is for you to resume.
 
 **On/off per service.** Each service has its own switch: on its card in the panel, or as
 *Auto-switch Claude/Codex/Antigravity/OpenCode/Devin accounts* in Settings. All are on by default.
@@ -114,10 +132,24 @@ These cux features are not in the plugin yet:
 Disable cux's own hooks (`cux uninstall-hooks`) before you enable this plugin, so the two don't
 both rotate.
 
+## Permissions
+
+Orca asks you to approve the plugin's access. Beyond the host API, the worker runs the `orca` CLI
+(`account select`, `account list`, `terminal close`, `terminal send`) and `git status` and
+`git diff --stat`. It always uses an argument list, never a shell. The CLI is used because the host
+API cannot select accounts, and refuses to close or type into panes outside the focused workspace.
+
+A handoff prompt (for services that cannot resume by session id) includes up to 40 lines of the
+previous agent's output, so treat it like any pasted terminal output.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
+
 ## Develop
 
 ```sh
-orca plugin test . --json        # 41 tests: adapters (real captured banners), selector, worker end to end, panel
+orca plugin test . --json        # 42 tests: adapters (real captured banners), selector, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

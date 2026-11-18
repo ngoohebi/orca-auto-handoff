@@ -11,7 +11,10 @@ type Pane = { terminalId: string; agent: string; state: 'working' | 'waiting' | 
 function world(options: {
   panes: Pane[]
   tails: Record<string, string[]>
+  /** Orca's numbers for the active accounts; by default they are exhausted, as they are when a
+   *  pane on them hits a limit. */
   claudeUsage?: { session: number; weekly: number }
+  codexUsage?: { session: number; weekly: number }
   settings?: Record<string, string | number | boolean>
   state?: Partial<RotatorState>
   /** Resumed sessions redraw their transcript, as live Claude does; `late` = only after the
@@ -59,7 +62,14 @@ function world(options: {
     }
   }
   const accountListFor = () =>
-    fx.accountList({ claudeActive, codexActive, ...(options.claudeUsage ? { claudeUsage: options.claudeUsage } : {}) })
+    fx.accountList({
+      claudeActive,
+      codexActive,
+      // The given (or exhausted) numbers belong to the first active account; an account
+      // switched to later has room.
+      claudeUsage: claudeActive === 'c1' ? options.claudeUsage ?? { session: 100, weekly: 40 } : { session: 5, weekly: 5 },
+      codexUsage: codexActive === 'x1' ? options.codexUsage ?? { session: 100, weekly: 40 } : { session: 5, weekly: 5 }
+    })
   const spawn = (agent: string, sessionId?: string, from?: string) => {
     const terminalId = `t${next++}`
     if (options.redraw === true && from) options.tails[terminalId] = [...(options.tails[from] ?? [])]
@@ -314,7 +324,11 @@ test('threshold: a finished turn on a busy seat moves on; normal output never tr
   assert.ok(w.cliCalls.includes('select claude c2'))
   assert.equal((w.host.data().storage.state as RotatorState).history.at(-1)?.reason, 'threshold')
 
-  const quiet = world({ panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }], tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS } })
+  const quiet = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
+    claudeUsage: { session: 7, weekly: 18 }
+  })
   const w2 = await quiet.mount()
   await w2.emit('agent.status.changed', statusEvent('t1'))
   assert.equal(quiet.cliCalls.filter((c) => c.startsWith('select')).length, 0)
@@ -451,6 +465,22 @@ test('banners seen while paused are not acted on after resuming switching', asyn
   w.tails.t1!.push('❯ go on', '  ⎿  5-hour limit reached ∙ resets 3pm')
   await worker.emit('agent.status.changed', statusEvent('t1', 'done', 3))
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  await worker.deactivate()
+})
+
+test('review: an unknown pane hits a limit while the active account has room → resume it there, cool nothing', async () => {
+  const w = world({
+    panes: [{ terminalId: 'old', agent: 'claude', state: 'done', sessionId: 's9' }],
+    tails: { old: fx.CLAUDE_SESSION_LIMIT },
+    claudeUsage: { session: 7, weekly: 18 }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('old'))
+  assert.equal(w.cliCalls.filter((c) => c.startsWith('select')).length, 0)
+  assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w1', agent: 'claude', sessionId: 's9' }])
+  const state = w.host.data().storage.state as RotatorState
+  assert.deepEqual(state.health, {})
+  assert.equal(state.paneSeat.t2, 'claude:c1') // known from now on: a second limit there rotates
   await worker.deactivate()
 })
 

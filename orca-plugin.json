@@ -3,9 +3,15 @@
   "id": "account-rotator",
   "name": "Account Rotator",
   "version": "0.1.0",
-  "description": "Pools Orca's managed agent accounts (Claude, Codex, Antigravity, OpenCode, Devin): on a rate limit or usage threshold it switches to the next healthy account and resumes the session, like cux.",
+  "description": "Pools Orca's managed agent accounts per service (Claude, Codex, Antigravity, OpenCode, Devin): on a rate limit or usage threshold it switches the pane to another account of the same service and resumes the session. To reach panes outside the focused workspace it also runs the orca CLI (account select, terminal close/send).",
+  "author": {
+    "name": "ngoohebi",
+    "url": "https://github.com/ngoohebi"
+  },
+  "repository": "https://github.com/ngoohebi/orca-account-rotator",
+  "license": "MIT",
   "engines": {
-    "orca": ">=1.4.259"
+    "orca": ">=1.4.261"
   },
   "execution": "trusted-worker",
   "pluginApi": 1,

@@ -51,7 +51,12 @@ export type Signal = {
   occurrences: number
 }
 
-export type SeenSignal = { fingerprint: string; occurrences: number }
+export type SeenSignal = {
+  fingerprint: string
+  occurrences: number
+  /** The banner text, to recount copies as it scrolls away. */
+  line?: string
+}
 
 export type SeatHealth = {
   cooldownUntil?: number
@@ -84,6 +89,8 @@ export type WaitingEntry = {
   terminalId: string
   workspaceId: string
   agent: Provider
+  /** Orca's own agent id when it differs from the provider (e.g. `opencode2`). */
+  agentId?: string
   sessionId?: string
   fromSeat?: string
   wakeAt: number

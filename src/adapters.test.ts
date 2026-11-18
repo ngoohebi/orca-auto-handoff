@@ -8,7 +8,7 @@ test('real Codex/Ollama credits banner is a rate limit, not a transient API erro
   const s = classify('codex', fx.CODEX_OLLAMA_CREDITS, NOW)
   assert.equal(s?.kind, 'rate_limit')
   assert.match(s!.line, /Add usage credits/)
-  assert.equal(s!.linesAfter, 2)
+  assert.equal(s!.linesAfter, 1)
 })
 
 test('real Antigravity quota banner is a rate limit with a parsed reset', () => {

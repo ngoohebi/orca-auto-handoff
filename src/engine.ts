@@ -1,8 +1,8 @@
 // The rotator: reacts to agent status, classifies the terminal tail, and swaps seats.
 // Every side effect goes through Deps so tests run it with a fake host, CLI and clock.
-import { ADAPTERS, CHROME, classify, parseModelFallback } from './adapters'
+import { ADAPTERS, CHROME, classify, countCopies, parseModelFallback } from './adapters'
 import { parseAccounts, type AccountView } from './accounts'
-import { buildChain, earliestReset, overThreshold, pickNext } from './selector'
+import { buildChain, earliestReset, isEligible, overThreshold, pickNext } from './selector'
 import {
   HISTORY_CAP,
   allServices,
@@ -50,6 +50,8 @@ export type PaneInfo = {
   terminalId: string
   workspaceId: string
   agent: Provider
+  /** Orca's own agent id when it differs from the provider (e.g. `opencode2`). */
+  agentId?: string
   sessionId?: string
   title?: string
 }
@@ -143,7 +145,14 @@ export class Rotator {
   }
 
   private seatOf(terminalId: string, provider: Provider, view: AccountView): Seat | undefined {
+    return this.locate(terminalId, provider, view).seat
+  }
+
+  /** Which seat a pane runs on, and whether the plugin actually knows (launch hook, own swap,
+   *  recent swap) or only assumes it is the provider's active seat. */
+  private locate(terminalId: string, provider: Provider, view: AccountView): { seat: Seat | undefined; known: boolean } {
     let key: string | undefined = this.state.paneSeat[terminalId]
+    let known = !!key
     if (!key) {
       // Unknown pane (started before the plugin). If the plugin just moved this provider off a
       // seat, a pane still hitting a limit is almost certainly on that old seat, not the new one.
@@ -151,9 +160,19 @@ export class Rotator {
         .reverse()
         .find((h) => h.provider === provider && h.to && (h.result === 'resumed' || h.result === 'handoff' || h.result === 'selected'))
       const fresh = recent && this.deps.now() - recent.at < 10 * 60_000
-      key = fresh && recent.to === view.active[provider] && recent.from ? recent.from : view.active[provider]
+      if (fresh && recent.to === view.active[provider] && recent.from) {
+        key = recent.from
+        known = true
+      } else key = view.active[provider]
     }
-    return view.seats.find((s) => s.key === key)
+    return { seat: view.seats.find((s) => s.key === key), known }
+  }
+
+  /** Automatic action allowed for this provider right now (re-read after every wait). */
+  private async allowed(provider: Provider): Promise<boolean> {
+    const config = await this.deps.config()
+    this.services = { ...config.services }
+    return !this.state.paused && config.services[provider] !== false
   }
 
   // ---- events -----------------------------------------------------------------------------
@@ -205,6 +224,7 @@ export class Rotator {
       const agent = providerOf(row.agent)
       if (!agent) return null
       const pane: PaneInfo = { terminalId: event.terminalId!, workspaceId, agent }
+      if (row.agent !== agent) pane.agentId = row.agent
       const sessionId = row.sessionId ?? event.sessionId
       if (sessionId) pane.sessionId = sessionId
       const title = row.title ?? event.title
@@ -224,6 +244,15 @@ export class Rotator {
     return false
   }
 
+  /** Copies of a handled banner that have scrolled out of the read window no longer count, so
+   *  the next identical banner (same limit text hours later) is seen as new. */
+  private recount(key: string, lines: readonly string[]): void {
+    const seen = this.state.seen[key]
+    if (!seen?.line) return
+    const copies = countCopies(lines, seen.line)
+    if (copies < seen.occurrences) seen.occurrences = copies
+  }
+
   /** Handled banners are remembered per session: Orca can restore or restart a session in a new
    *  pane (live: after an account switch), and its redrawn transcript shows the old banner. */
   private seenKey(pane: { terminalId: string; sessionId?: string }): string {
@@ -239,10 +268,11 @@ export class Rotator {
     })
     const signal = classify(pane.agent, lines, this.deps.now())
     const key = this.seenKey(pane)
+    this.recount(key, lines)
     if (observeOnly || !config.services[pane.agent]) {
       // Paused or service off: record what is on screen without acting on it.
       if (signal && this.isNew(key, signal)) {
-        this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences }
+        this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences, line: signal.line }
         await this.save()
       }
       return
@@ -259,7 +289,7 @@ export class Rotator {
       return
     }
     if (!this.isNew(key, signal)) return
-    this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences }
+    this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences, line: signal.line }
     await this.save()
     this.deps.log(`${pane.agent} ${pane.terminalId}: ${signal.kind} — ${signal.line}`)
 
@@ -289,6 +319,7 @@ export class Rotator {
     this.state.apiRetries[pane.terminalId] = attempt + 1
     await this.save()
     await this.deps.sleep(backoffMs(attempt))
+    if (!(await this.allowed(pane.agent))) return
     await this.type(pane.terminalId, config.autoMessage || 'continue')
     this.record({ provider: pane.agent, terminalId: pane.terminalId, reason: 'api_error', result: 'retried', detail: `attempt ${attempt + 1}` })
     await this.save()
@@ -314,26 +345,38 @@ export class Rotator {
   }
 
   private async limitHit(pane: PaneInfo, signal: Signal, config: Config, lines: string[], reason: SwapReason): Promise<void> {
-    const view = await this.accounts(true)
-    const seat = this.seatOf(pane.terminalId, pane.agent, view)
-    if (seat) {
-      const now = this.deps.now()
-      const usageReset = [seat.usage.session, seat.usage.weekly]
-        .filter((w) => w && w.usedPercent >= 100 && w.resetsAt && w.resetsAt > now)
-        .map((w) => w!.resetsAt!)
-      const until =
-        signal.resetsAt ??
-        (usageReset.length ? Math.max(...usageReset) : undefined) ??
-        now + (reason === 'auth' ? 12 * 60 : config.defaultCooldownMinutes) * 60_000
-      this.state.health[seat.key] = { cooldownUntil: until, reason: `${reason}: ${signal.line}`.slice(0, 200) }
-      await this.save()
-    }
     if (!config.autoSwitchOnRateLimit) {
-      await this.deps.notify('Account Rotator', `${pane.agent} hit a limit on ${seat?.label ?? 'its account'}; auto switch is off.`)
-      this.publishNow()
+      await this.withLock(pane.agent, async () => {
+        const view = await this.accounts(true)
+        const at = this.locate(pane.terminalId, pane.agent, view)
+        if (at.seat && (at.known || this.plausiblyLimited(at.seat))) await this.coolDown(at.seat, signal, config, reason)
+        await this.deps.notify('Account Rotator', `${pane.agent} hit a limit on ${at.seat?.label ?? 'its account'}; switching on rate limit is off.`)
+        this.publishNow()
+      })
       return
     }
     await this.swap(pane, reason, lines, signal)
+  }
+
+  private async coolDown(seat: Seat, signal: Signal, config: Config, reason: SwapReason): Promise<void> {
+    const now = this.deps.now()
+    const usageReset = [seat.usage.session, seat.usage.weekly]
+      .filter((w) => w && w.usedPercent >= 100 && w.resetsAt && w.resetsAt > now)
+      .map((w) => w!.resetsAt!)
+    const until =
+      signal.resetsAt ??
+      (usageReset.length ? Math.max(...usageReset) : undefined) ??
+      now + (reason === 'auth' ? 12 * 60 : config.defaultCooldownMinutes) * 60_000
+    this.state.health[seat.key] = { cooldownUntil: until, reason: `${reason}: ${signal.line}`.slice(0, 200) }
+    await this.save()
+  }
+
+  /** Could this seat be the one that just hit a limit? False when Orca's own numbers say it has
+   *  plenty of room, i.e. the limited pane must be on some other (older) account. */
+  private plausiblyLimited(seat: Seat): boolean {
+    const u = seat.usage
+    if (!u.known) return true
+    return Math.max(u.session?.usedPercent ?? 0, u.weekly?.usedPercent ?? 0, u.model?.usedPercent ?? 0) >= 90
   }
 
   // ---- swapping ---------------------------------------------------------------------------
@@ -347,12 +390,32 @@ export class Rotator {
 
   async swap(pane: PaneInfo, reason: SwapReason, lines: string[], signal?: Signal): Promise<void> {
     await this.withLock(pane.agent, async () => {
-      const config = await this.deps.config()
+      // Anything could have changed while this waited for the lock.
+      if (reason !== 'manual' && !(await this.allowed(pane.agent))) return
+      const base = await this.deps.config()
+      // A manual move works under the manual strategy too.
+      const config: Config = reason === 'manual' && base.strategy === 'manual' ? { ...base, strategy: 'drain' } : base
       const view = await this.accounts(true)
       const now = this.deps.now()
-      const from = this.seatOf(pane.terminalId, pane.agent, view)
+      const at = this.locate(pane.terminalId, pane.agent, view)
+      let from = at.seat
+      const active = view.seats.find((s) => s.key === view.active[pane.agent])
+      let preferActive = false
+      if (signal && from) {
+        if (at.known || this.plausiblyLimited(from)) {
+          await this.coolDown(from, signal, config, reason)
+        } else {
+          // Unknown pane (started before the plugin, or restored) while the active account has
+          // plenty of room: the pane is on some other account. Cool nothing; move it to the
+          // healthy active account.
+          from = undefined
+          preferActive = true
+        }
+      }
       const chain = buildChain(view.seats, pane.agent, config)
-      const picked = pickNext(chain, from?.key, this.state.health, config, now)
+      const healthyActive =
+        preferActive && active && isEligible(active, this.state.health[active.key], config, now) ? active : null
+      const picked = healthyActive ?? pickNext(chain, from?.key, this.state.health, config, now)
       // Only ever another account of the same service.
       const target = picked && picked.provider === pane.agent ? picked : null
       if (!target) {
@@ -376,6 +439,7 @@ export class Rotator {
     const wakeAt = earliestReset(chain, this.state.health, now) ?? now + config.defaultCooldownMinutes * 60_000
     const entry: WaitingEntry = { terminalId: pane.terminalId, workspaceId: pane.workspaceId, agent: pane.agent, wakeAt }
     if (pane.sessionId) entry.sessionId = pane.sessionId
+    if (pane.agentId) entry.agentId = pane.agentId
     if (from) entry.fromSeat = from.key
     this.state.waiting = [...this.state.waiting.filter((w) => w.terminalId !== pane.terminalId), entry]
     this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'waiting', ...(from ? { from: from.key } : {}), detail: `until ${new Date(wakeAt).toISOString()}` })
@@ -394,33 +458,45 @@ export class Rotator {
     view: AccountView,
     config: Config
   ): Promise<void> {
-    const canResume =
-      config.autoResume && !!pane.sessionId && ADAPTERS[pane.agent].resume === 'by-session-id'
+    const canResume = !!pane.sessionId && ADAPTERS[pane.agent].resume === 'by-session-id'
+    const agentId = pane.agentId ?? pane.agent
     try {
       if (view.active[target.provider] !== target.key) {
         await this.deps.cli.select(target.provider, target.accountId)
         view.active[target.provider] = target.key
         for (const s of view.seats) if (s.provider === target.provider) s.active = s.key === target.key
       }
+      if (!config.autoResume) {
+        // Only the account changes; the pane stays as it is for the user to resume.
+        this.state.waiting = this.state.waiting.filter((w) => w.terminalId !== pane.terminalId)
+        this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'selected', ...(from ? { from: from.key } : {}), to: target.key, detail: 'auto_resume off' })
+        await this.save()
+        this.publishNow()
+        await this.deps.notify('Account Rotator', `${pane.agent}: new launches now use ${target.label}. Resume the session yourself (auto resume is off).`)
+        return
+      }
       let newTerminal: string
       if (canResume) {
+        // agent.resume refuses while the session still runs, so the old pane goes first.
         await this.closePane(pane)
         const resumed = await this.deps.host.call('agent.resume', {
           workspaceId: pane.workspaceId,
-          agent: pane.agent,
+          agent: agentId,
           sessionId: pane.sessionId
         })
         newTerminal = resumed.terminalId
-        if (!resumed.started) throw new Error('agent.resume did not start: the session still runs in a pane')
+        if (!resumed.started) throw new Error('agent.resume did not start: the session already runs in another pane')
       } else {
+        // A handoff starts a new session: launch it first and close the old pane only once the
+        // new one exists, so a failed launch loses nothing.
         const prompt = await this.handoffPrompt(pane, from, lines, signal, config)
-        await this.closePane(pane)
         const launched = await this.deps.host.call('agent.launch', {
           workspaceId: pane.workspaceId,
-          agent: target.provider,
+          agent: agentId,
           prompt
         })
         newTerminal = launched.terminalId
+        await this.closePane(pane)
       }
       // The resumed session redraws the same transcript, old banner included, possibly a while
       // after it starts: carry what this pane had already handled over to the new one.
@@ -449,6 +525,8 @@ export class Rotator {
     } catch (error) {
       const message = String((error as Error)?.message ?? error)
       this.deps.log(`swap failed: ${message}`)
+      // Never retry a parked session forever: a failure ends its wait.
+      this.state.waiting = this.state.waiting.filter((w) => w.terminalId !== pane.terminalId)
       this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', ...(from ? { from: from.key } : {}), to: target.key, detail: message.slice(0, 200) })
       await this.save()
       await this.deps.notify('Account Rotator', `Swap to ${target.label} failed: ${message}`)
@@ -586,6 +664,20 @@ export class Rotator {
 
   private async wake(w: WaitingEntry): Promise<void> {
     await this.withLock(w.agent, async () => {
+      if (!(await this.allowed(w.agent))) return
+      // The user went on in the parked pane, or the session already runs elsewhere: stop waiting.
+      const { agents } = await this.deps.host.call('agents.list', { workspaceId: w.workspaceId }).catch(() => ({ agents: [] as any[] }))
+      const busy = agents.some(
+        (a: any) =>
+          (a.terminalId === w.terminalId && a.state === 'working') ||
+          (w.sessionId && a.sessionId === w.sessionId && a.terminalId !== w.terminalId)
+      )
+      if (busy) {
+        this.state.waiting = this.state.waiting.filter((x) => x.terminalId !== w.terminalId)
+        await this.save()
+        this.publishNow()
+        return
+      }
       const config = await this.deps.config()
       const view = await this.accounts(true)
       const now = this.deps.now()
@@ -598,6 +690,7 @@ export class Rotator {
       }
       const pane: PaneInfo = { terminalId: w.terminalId, workspaceId: w.workspaceId, agent: w.agent }
       if (w.sessionId) pane.sessionId = w.sessionId
+      if (w.agentId) pane.agentId = w.agentId
       const from = view.seats.find((s) => s.key === w.fromSeat)
       let lines: string[] = []
       try {
@@ -644,10 +737,18 @@ export class Rotator {
       agents.find((a: any) => providerOf(a.agent))
     if (!row || !context?.workspaceId) return 'No agent in the focused workspace'
     const pane: PaneInfo = { terminalId: row.terminalId, workspaceId: context.workspaceId, agent: providerOf(row.agent)! }
+    if (row.agent !== pane.agent) pane.agentId = row.agent
     if (row.sessionId) pane.sessionId = row.sessionId
     const { lines } = await this.deps.host.call('terminal.read', { terminalId: row.terminalId, maxLines: 80 })
+    const before = this.state.history.length
     await this.swap(pane, 'manual', lines)
-    return `Swapped ${pane.agent} in the focused workspace`
+    const last = this.state.history.length > before ? this.state.history.at(-1) : undefined
+    if (!last) return `${pane.agent}: nothing to do`
+    const label = (key?: string) => this.view?.seats.find((s) => s.key === key)?.label ?? key ?? '?'
+    if (last.result === 'resumed' || last.result === 'handoff' || last.result === 'selected') {
+      return `${pane.agent}: moved to ${label(last.to)} (${last.result})`
+    }
+    return `${pane.agent}: ${last.result}${last.detail ? ` — ${last.detail}` : ''}`
   }
 
   async setPaused(paused: boolean): Promise<void> {
