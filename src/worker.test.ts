@@ -15,6 +15,8 @@ function world(options: {
    *  pane on them hits a limit. */
   claudeUsage?: { session: number; weekly: number }
   codexUsage?: { session: number; weekly: number }
+  /** Orca's numbers for a Claude account switched to later (default: plenty of room). */
+  laterClaudeUsage?: { session: number; weekly: number }
   settings?: Record<string, string | number | boolean>
   state?: Partial<RotatorState>
   /** Resumed sessions redraw their transcript, as live Claude does; `late` = only after the
@@ -67,7 +69,7 @@ function world(options: {
       codexActive,
       // The given (or exhausted) numbers belong to the first active account; an account
       // switched to later has room.
-      claudeUsage: claudeActive === 'c1' ? options.claudeUsage ?? { session: 100, weekly: 40 } : { session: 5, weekly: 5 },
+      claudeUsage: claudeActive === 'c1' ? options.claudeUsage ?? { session: 100, weekly: 40 } : options.laterClaudeUsage ?? { session: 5, weekly: 5 },
       codexUsage: codexActive === 'x1' ? options.codexUsage ?? { session: 100, weekly: 40 } : { session: 5, weekly: 5 }
     })
   const spawn = (agent: string, sessionId?: string, from?: string) => {
@@ -481,6 +483,95 @@ test('review: an unknown pane hits a limit while the active account has room →
   const state = w.host.data().storage.state as RotatorState
   assert.deepEqual(state.health, {})
   assert.equal(state.paneSeat.t2, 'claude:c1') // known from now on: a second limit there rotates
+  await worker.deactivate()
+})
+
+test('review: a resumed pane read before its transcript is redrawn does not forget the handled banner', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  // The new pane reports ready while it is still empty (live: the redraw raced the first read)…
+  w.tails.t2 = []
+  await worker.emit('agent.status.changed', statusEvent('t2', 'waiting'))
+  // …then draws the old transcript, and the agent answers briefly.
+  w.tails.t2 = [...fx.CLAUDE_SESSION_LIMIT, '❯ Go continue.', '⏺ Continuing.']
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('review: a handled banner that scrolled out of a full read window counts again', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { auto_resume: false }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  // The user goes on in the same pane; 80 lines later the old banner is out of the read window.
+  w.tails.t1 = Array.from({ length: 80 }, (_, i) => `  line ${i}`)
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  w.tails.t1 = [...Array.from({ length: 77 }, (_, i) => `  line ${i}`), ...fx.CLAUDE_SESSION_LIMIT.slice(2, 4)]
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 3))
+  // Handled as a new limit (c2 is already selected, so there is no second select).
+  const state = w.host.data().storage.state as RotatorState
+  assert.equal(state.history.filter((h) => h.reason === 'rate_limit').length, 2)
+  await worker.deactivate()
+})
+
+test('review: a parked session the user went on with is not closed and resumed at wake time', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    state: {
+      health: {
+        'claude:c2': { cooldownUntil: 1_000_000 + 10 * 60_000 },
+        'claude:c3': { cooldownUntil: 1_000_000 + 20 * 60_000 }
+      }
+    }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal((w.host.data().storage.state as RotatorState).waiting.length, 1)
+  // The limit lifted early; the user typed in the parked pane and the agent finished a turn.
+  w.tails.t1!.push('❯ carry on', '⏺ Done.', '  All 12 tests pass.', '  Nothing else is left to do.', '  The branch is ready for review.', '  See the summary above.')
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.equal((w.host.data().storage.state as RotatorState).waiting.length, 0)
+  w.advance(11 * 60_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(w.typed, [])
+  await worker.deactivate()
+})
+
+test('review: every account over a threshold does not rotate (and type) forever', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'waiting', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
+    claudeUsage: { session: 60, weekly: 10 },
+    laterClaudeUsage: { session: 70, weekly: 10 },
+    settings: { thresholds_five_hour: 50 },
+    redraw: true
+  })
+  const worker = await w.mount()
+  // Each resumed pane ends its turn on an account that is over the threshold too.
+  for (const id of ['t1', 't2', 't3', 't4', 't5']) {
+    w.advance(61_000) // past the usage poll interval: Orca's numbers for the new account are in
+    if (w.panes.some((p) => p.terminalId === id)) await worker.emit('agent.status.changed', statusEvent(id, 'waiting'))
+  }
+  // c1 → c2 → c3, then it stays: c1 and c2 are still over until their windows reset.
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c3'])
+  assert.equal(w.host.callsOf('agent.resume').length, 2)
+  const state = w.host.data().storage.state as RotatorState
+  assert.equal(state.health['claude:c1']?.cooldownUntil, 1_000_000 + 3_600_000)
+  assert.equal(state.waiting.length, 0)
   await worker.deactivate()
 })
 

@@ -262,13 +262,16 @@ export class Rotator {
   async inspect(pane: PaneInfo, observeOnly = false): Promise<void> {
     const config = await this.deps.config()
     this.services = { ...config.services }
-    const { lines } = await this.deps.host.call('terminal.read', {
+    const { lines, truncated } = await this.deps.host.call('terminal.read', {
       terminalId: pane.terminalId,
       maxLines: 80
     })
     const signal = classify(pane.agent, lines, this.deps.now())
     const key = this.seenKey(pane)
-    this.recount(key, lines)
+    // A banner can only have scrolled away when the read window is full. A shorter read without
+    // it is a resumed pane that has not redrawn its transcript yet (live: the redraw can come
+    // after the pane reports ready); forgetting the banner then would make the redraw look new.
+    if (truncated || lines.length >= 80) this.recount(key, lines)
     if (observeOnly || !config.services[pane.agent]) {
       // Paused or service off: record what is on screen without acting on it.
       if (signal && this.isNew(key, signal)) {
@@ -279,6 +282,13 @@ export class Rotator {
     }
     if (!signal) {
       delete this.state.apiRetries[pane.terminalId]
+      if (this.state.waiting.some((w) => w.terminalId === pane.terminalId)) {
+        // A turn ended in a parked pane with no limit in its latest output: the user went on
+        // there. Stop waiting, or the wake would close the pane and resume it unasked.
+        this.state.waiting = this.state.waiting.filter((w) => w.terminalId !== pane.terminalId)
+        await this.save()
+        this.publishNow()
+      }
       if (config.autoSwitchOnThreshold) {
         const view = await this.accounts()
         const seat = this.seatOf(pane.terminalId, pane.agent, view)
@@ -371,6 +381,27 @@ export class Rotator {
     await this.save()
   }
 
+  /** A seat left because of a threshold stays out of rotation until the window that is over
+   *  resets. Once it is inactive Orca may report no usage for it, and it would look free again:
+   *  with every seat over a threshold the session would rotate (and be typed into) forever. */
+  private async coolOverThreshold(seat: Seat, config: Config, now: number): Promise<void> {
+    if (!overThreshold(seat, config, now)) return
+    const resets = (
+      [
+        [seat.usage.session, config.thresholdFiveHour],
+        [seat.usage.weekly, config.thresholdSevenDay]
+      ] as const
+    )
+      .filter(([w, limit]) => w && w.usedPercent >= Math.min(limit, 100) && w.resetsAt !== null && w.resetsAt > now)
+      .map(([w]) => w!.resetsAt!)
+    const until = Math.max(
+      resets.length ? Math.max(...resets) : now + config.defaultCooldownMinutes * 60_000,
+      this.state.health[seat.key]?.cooldownUntil ?? 0
+    )
+    this.state.health[seat.key] = { cooldownUntil: until, reason: 'threshold: over the usage threshold' }
+    await this.save()
+  }
+
   /** Could this seat be the one that just hit a limit? False when Orca's own numbers say it has
    *  plenty of room, i.e. the limited pane must be on some other (older) account. */
   private plausiblyLimited(seat: Seat): boolean {
@@ -412,6 +443,7 @@ export class Rotator {
           preferActive = true
         }
       }
+      if (reason === 'threshold' && from) await this.coolOverThreshold(from, config, now)
       const chain = buildChain(view.seats, pane.agent, config)
       const healthyActive =
         preferActive && active && isEligible(active, this.state.health[active.key], config, now) ? active : null

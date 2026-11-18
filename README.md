@@ -29,8 +29,8 @@ reads tokens or keychains.
 | Model-specific cap (e.g. Claude Fable weekly) | Type `/model <next>` from *Model fallback* in place; switch accounts only when the list runs out |
 | API error (529, overloaded, stream disconnected) | Type the first message again after a Fibonacci backoff (5 s … 120 s), up to *Maximum API error retries* |
 | Auth failure | 12 h cooldown on that seat, switch |
-| A turn ends while the seat is over a threshold | Switch (thresholds default to 100 %, so this is reactive only) |
-| Every seat limited | Park; wake when the earliest seat frees up (*Wait for reset*) |
+| A turn ends while the seat is over a threshold | Switch (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets |
+| Every seat limited | Park; wake when the earliest seat frees up (*Wait for reset*). Carry on in the parked pane yourself and the wait ends |
 
 Detection runs when a pane turns `done` or `waiting`. A banner only counts when all of these hold:
 
@@ -149,7 +149,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 42 tests: adapters (real captured banners), selector, worker end to end, panel
+orca plugin test . --json        # 46 tests: adapters (real captured banners), selector, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json
