@@ -233,7 +233,7 @@ footer a{color:var(--fg-2)}
         <span class="badge">v<b>0.2.0</b></span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
         <span class="badge"><b>MIT</b> license</span>
-        <span class="badge"><b>210</b> tests, real captured banners</span>
+        <span class="badge"><b>217</b> tests, real captured banners</span>
         <span class="badge">Never switches <b>across services</b></span>
       </div>
       <div class="cta">
@@ -266,7 +266,7 @@ footer a{color:var(--fg-2)}
         <div class="acct">
           <div class="row"><span>third@example.com</span></div>
           <div class="muted">Usage unknown until this account runs.</div>
-          <span class="ghost">Use for new claude launches</span>
+          <span class="ghost">Hand off</span>
         </div>
       </div>
       <div class="card">
@@ -399,11 +399,11 @@ footer a{color:var(--fg-2)}
       <div class="tile">
         <h3>Status bar</h3>
         <p>One glance at every service: accounts in rotation and the 5-hour and weekly usage of the active one. Warning tone at 80 %, danger while a session is parked. Click it to move Claude to the next account.</p>
-        <div class="sb"><svg class="gauge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 17a8 8 0 1 1 14 0"/><path d="M12 17l4-5"/></svg>claude 2/3 · 7%·18% | codex 1/3 · <span class="w">84%</span></div>
+        <div class="sb"><svg class="gauge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 17a8 8 0 1 1 14 0"/><path d="M12 17l4-5"/></svg>Claude 2/3 · 7%·18% | Codex 1/3 · <span class="w">84%</span></div>
       </div>
       <div class="tile">
         <h3>Panel</h3>
-        <p>Gauge icon in the right sidebar. Each account with 5-hour, weekly and model bars, active and limited badges, a cooldown countdown, <em>Clear</em> and <em>Use for new launches</em>. Plus the automatic-switching toggle, parked sessions and the swap history.</p>
+        <p>Gauge icon in the right sidebar. Each account with 5-hour, weekly and model bars, active and limited badges, a cooldown countdown, <em>Clear</em> and, on each standby account, <em>Hand off</em> (it asks first, then new sessions start on that account and the session in the current tab moves too if it is between turns with nothing unsent). Plus the automatic-switching toggle, parked sessions and the swap history.</p>
       </div>
       <div class="tile">
         <h3>Commands</h3>
@@ -436,7 +436,7 @@ footer a{color:var(--fg-2)}
 <tr><td><code>running_sessions</code><div class="st">Running sessions</div></td><td>move</td><td>move: a session moves between turns or when idle, never in the middle of a turn and never with unsent text in its input box. limit: only when it hits a limit. launches: running sessions are never moved. Not used in custom mode.</td></tr>
 <tr><td><code>when_all_used</code><div class="st">When everything is used up</div></td><td>wait</td><td>wait: the session waits for the first account to reset and resumes by itself. stop: it stops and you are told. Not used in custom mode.</td></tr>
 <tr><td><code>strategy</code><div class="st">Advanced: Strategy</div></td><td>drain</td><td>Only used when Auto-switch is custom. drain, balanced, priority, soonest-reset or manual. See <a href="#strategies">Strategies</a>.</td></tr>
-<tr><td><code>chain</code><div class="st">Account chain</div></td><td><em>empty</em></td><td>Comma-separated order of accounts within each service: emails, seat keys (claude:&lt;id&gt;, codex:system) or provider:*. Example: me@example.com, claude:*. Empty = Orca's order. Switching never leaves the agent's own service.</td></tr>
+<tr><td><code>chain</code><div class="st">Account order</div></td><td><em>empty</em></td><td>Comma-separated order of accounts within each service: emails, seat keys (claude:&lt;id&gt;, codex:system) or provider:*. Example: me@example.com, claude:*. Empty = Orca's order. Switching never leaves the agent's own service.</td></tr>
 <tr><td><code>exclude</code><div class="st">Never switch to</div></td><td><em>empty</em></td><td>Comma-separated accounts that automatic hand-off never picks (emails, seat keys, or provider:*). Picking them from the panel still works.</td></tr>
 <tr><td><code>service_claude</code><div class="st">Auto hand-off Claude accounts</div></td><td>on</td><td>Off: Claude panes are never switched or resumed automatically (manual switching still works). The same switch exists for <code>service_codex</code>, <code>service_antigravity</code>, <code>service_opencode</code> and <code>service_devin</code>.</td></tr>
 <tr><td><code>switch_back</code><div class="st">Switch back when a higher-priority account resets</div></td><td>on</td><td>drain and priority only: once an account earlier in the chain is healthy again, new launches use it and sessions on lower accounts move back when they finish a turn (or sit idle).</td></tr>
@@ -447,14 +447,15 @@ footer a{color:var(--fg-2)}
 <tr><td><code>auto_switch_on_threshold</code><div class="st">Switch at usage threshold</div></td><td>on</td><td>Checked when an agent finishes a turn.</td></tr>
 <tr><td><code>thresholds_five_hour</code><div class="st">5-hour threshold (%)</div></td><td>100</td><td>100 = only when exhausted.</td></tr>
 <tr><td><code>thresholds_seven_day</code><div class="st">Weekly threshold (%)</div></td><td>100</td><td></td></tr>
-<tr><td><code>auto_resume</code><div class="st">Resume the session after a switch</div></td><td>on</td><td>Off: the plugin only switches the account for new launches and tells you. The limited pane stays for you to resume.</td></tr>
+<tr><td><code>auto_resume</code><div class="st">Resume the session after a switch</div></td><td>on</td><td>Only used when Auto-switch is custom (otherwise see Running sessions). Off: the plugin only switches the account for new launches and tells you. The limited pane stays for you to resume.</td></tr>
 <tr><td><code>auto_message</code><div class="st">First message after a switch</div></td><td>Go continue.</td><td>Empty = resume silently.</td></tr>
 <tr><td><code>wait_for_reset</code><div class="st">Wait for reset when every account is exhausted</div></td><td>on</td><td></td></tr>
 <tr><td><code>retry_on_api_error</code><div class="st">Retry on API errors</div></td><td>on</td><td>Types the first message again after a Fibonacci backoff (5 s … 120 s).</td></tr>
 <tr><td><code>max_api_retries</code><div class="st">Maximum API error retries</div></td><td>6</td><td></td></tr>
 <tr><td><code>model_fallback</code><div class="st">Model fallback</div></td><td><em>empty</em></td><td>Models to try on the same account when one model's limit is hit, e.g. claude=sonnet,haiku; codex=gpt-5-mini</td></tr>
 <tr><td><code>default_cooldown_minutes</code><div class="st">Default cooldown (minutes)</div></td><td>60</td><td>Used when neither the message nor Orca says when a limit resets.</td></tr>
-<tr><td><code>poll_interval_seconds</code><div class="st">Usage refresh interval (seconds)</div></td><td>60</td><td></td></tr>
+<tr><td><code>poll_interval_seconds</code><div class="st">Read usage from Orca every (seconds)</div></td><td>60</td><td>How often the plugin reads Orca's usage numbers (15–3600).</td></tr>
+<tr><td><code>usage_cache_max_age_hours</code><div class="st">Remember usage of accounts not in use for (hours)</div></td><td>168</td><td>When Orca has no current numbers for an account, the plugin uses its last reading, shown with its age. 0 = only Orca's current numbers.</td></tr>
 <tr><td><code>handoff_max_chars</code><div class="st">Handoff prompt size limit</div></td><td>6000</td><td></td></tr>
 <tr><td><code>orca_cli_path</code><div class="st">Orca CLI path</div></td><td><em>empty</em></td><td>Empty = detect (ORCA_CLI_COMMAND, the app bundle, then orca).</td></tr>
 <tr><td><code>console_statusline_format</code><div class="st">Console status line header</div></td><td><em>empty</em></td><td>Optional line above the account rows; empty = rows only. Placeholders: {model}, {ctxbar} context-left gauge, {ctx} context left %, {5h} and {7d} this pane's % left, {reset} time until the 5-hour window resets, {best} the best-model window's name. Example: {model} │ ctx {ctxbar} │ 5h reset {reset} │ best={best}</td></tr>
@@ -525,7 +526,7 @@ footer a{color:var(--fg-2)}
     <div class="note"><b>Coming from cux?</b> Run <code>cux uninstall-hooks</code> first so the two don't both rotate. Every cux setting key has the same name here. Per-directory project bindings and <code>cux attach</code> are not migrated yet.</div>
     <details>
       <summary>Working on the plugin itself</summary>
-      <pre style="margin-top:12px"><code>orca plugin test . --json        # 210 tests: adapters, selector, usage, status line, worker end to end, panel
+      <pre style="margin-top:12px"><code>orca plugin test . --json        # 217 tests: adapters, selector, usage, status line, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker
 npx -p typescript tsc -p .       # type-check
 orca plugin validate . --json

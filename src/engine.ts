@@ -1288,6 +1288,9 @@ export class Rotator {
         }
       }
       if (advisory && !(await this.advisoryOk(pane, from, target, lines, view, config, now, low ? 'low' : 'gap'))) return
+      // A move the user asked for skips the headroom gap and the selection cooldown, not the
+      // guards that protect the session: it waited for the lock and a fresh account read too.
+      if (reason === 'manual' && (await this.unsafeToMove(pane, lines))) return
       const why = low && from ? this.explained('low', from, target, view, { idle: reason === 'idle', assessment: leave!.assessment }) : undefined
       if (low && from) this.markLeftLow(from, now)
       await this.moveTo(pane, from, target, reason, lines, signal, view, config, why)
@@ -1392,6 +1395,21 @@ export class Rotator {
     return true
   }
 
+  /** What keeps a pane from being closed and resumed right now, whoever asked for the move: it is
+   *  in the middle of a turn (`busy`), or its input box holds unsent text (`draft`). Null when
+   *  neither. `lines` stand in when the pane cannot be read. */
+  private async unsafeToMove(pane: PaneInfo, lines: readonly string[]): Promise<'busy' | 'draft' | null> {
+    if (await this.midTurn(pane)) {
+      this.deps.log(`${pane.agent} ${pane.terminalId}: in the middle of a turn, not moving it`)
+      return 'busy'
+    }
+    if (await this.draftIn(pane, lines)) {
+      this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not moving it`)
+      return 'draft'
+    }
+    return null
+  }
+
   /** Is the pane in the middle of a turn right now? False when Orca cannot say. */
   private async midTurn(pane: PaneInfo): Promise<boolean> {
     const { agents } = await this.deps.host.call('agents.list', { workspaceId: pane.workspaceId }).catch(() => ({ agents: [] as any[] }))
@@ -1444,9 +1462,18 @@ export class Rotator {
   ) {
     const now = this.deps.now()
     if (config.strategy === 'manual' || !config.waitForReset) {
-      this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', ...(from ? { from: from.key } : {}), detail: config.strategy === 'manual' ? 'manual strategy' : 'no healthy seat', why: `no other ${PROVIDER_NAME[pane.agent]} account has room, and ${config.strategy === 'manual' ? 'the strategy is manual' : 'waiting for a reset is off'}` })
+      // Two different causes: nothing is switched automatically at all (manual), or no other
+      // account has room and waiting for one is off.
+      const manual = config.strategy === 'manual'
+      const service = PROVIDER_NAME[pane.agent]
+      this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', ...(from ? { from: from.key } : {}), detail: manual ? 'manual strategy' : 'no healthy seat', why: manual ? 'Auto-switch is manual, so nothing is switched automatically' : `no other ${service} account has room, and waiting for a reset is off` })
       await this.save()
-      await this.deps.notify('Auto Hand-off', `${pane.agent}: no healthy account to switch to.`)
+      await this.deps.notify(
+        'Auto Hand-off',
+        manual
+          ? `${service} hit a limit${from ? ` on ${from.label}` : ''}. Auto-switch is set to manual, so nothing was switched.`
+          : `${service}: no other account has room, and waiting for a reset is off. The session stays where it is.`
+      )
       this.publishNow()
       return
     }
@@ -1499,11 +1526,17 @@ export class Rotator {
       if (!config.autoResume) {
         // Only the account changes; the pane stays as it is for the user to resume.
         this.state.waiting = this.state.waiting.filter((w) => w.terminalId !== pane.terminalId)
-        this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'selected', ...(from ? { from: from.key } : {}), to: target.key, detail: 'auto_resume off', why: explained ?? this.why(reason, from, target, view, { selectionOnly: true, ...(signal?.model ? { model: signal.model } : {}) }) })
+        // Why the session is not resumed: "Running sessions: new launches only", or (custom mode)
+        // the legacy "Resume the session after a switch" setting.
+        const byKnob = config.mode !== 'custom' && config.runningSessions === 'launches'
+        this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'selected', ...(from ? { from: from.key } : {}), to: target.key, detail: byKnob ? 'Running sessions: new launches only' : 'auto_resume off', why: explained ?? this.why(reason, from, target, view, { selectionOnly: true, ...(signal?.model ? { model: signal.model } : {}) }) })
         if (reason !== 'manual') this.startProbation(target, config, this.deps.now())
         await this.save()
         this.publishNow()
-        await this.deps.notify('Auto Hand-off', `${pane.agent}: new launches now use ${target.label}. Resume the session yourself (auto resume is off).`)
+        await this.deps.notify(
+          'Auto Hand-off',
+          `${PROVIDER_NAME[pane.agent]}: new launches now use ${target.label}. The session stays where it is for you to resume, because ${byKnob ? 'Running sessions is set to new launches only' : 'Resume the session after a switch is off'}.`
+        )
         return
       }
       const whyLine = explained ?? this.why(reason, from, target, view, signal?.model ? { model: signal.model } : {})
@@ -2149,7 +2182,7 @@ export class Rotator {
 
   // ---- commands ---------------------------------------------------------------------------
 
-  async selectSeat(seatKey: string): Promise<string> {
+  async selectSeat(seatKey: string, chosen?: (provider: Provider) => Promise<void>): Promise<string> {
     const view = await this.accounts(true)
     const server = this.server
     const seat = view.seats.find((s) => s.key === seatKey)
@@ -2157,6 +2190,9 @@ export class Rotator {
     return this.withLock(seat.provider, async () => {
       const from = view.active[seat.provider]
       if (from !== seat.key) await this.selectOn(seat.provider, seat.accountId, server)
+      // Still under the lock: whatever automatic move waits behind this one sees what `chosen`
+      // did (the panel's switch turns the service's automatic hand-off off) before it acts.
+      await chosen?.(seat.provider)
       this.record({ provider: seat.provider, reason: 'manual', result: 'selected', ...(from ? { from } : {}), to: seat.key, why: this.why('manual', view.seats.find((s) => s.key === from), seat, view, { selectionOnly: true }) })
       await this.save()
       await this.accountsFor(server, true)
@@ -2179,8 +2215,9 @@ export class Rotator {
    *  move the current terminal's pane over if it runs this service and is between turns. The
    *  worker then turns the service's automatic hand-off off, so the rotator never undoes a
    *  choice the user made by hand; the panel says so and offers the toggle. A limited account
-   *  is refused. Returns what happened and whether anything was switched. */
-  async forceTo(seatKey: string): Promise<{ message: string; switched: boolean; provider: Provider }> {
+   *  is refused. Returns what happened and whether anything was switched. `chosen` runs as soon
+   *  as the account is selected, before any other move of that service can run. */
+  async forceTo(seatKey: string, chosen?: (provider: Provider) => Promise<void>): Promise<{ message: string; switched: boolean; provider: Provider }> {
     const config = await this.deps.config()
     const view = await this.accounts(true)
     const seat = view.seats.find((s) => s.key === seatKey)
@@ -2192,7 +2229,7 @@ export class Rotator {
       return { message: `${PROVIDER_NAME[provider]}: ${seat.label} is limited until ${new Date(health.cooldownUntil).toLocaleTimeString()}; clear the cooldown first`, switched: false, provider }
     }
     if (view.active[provider] === seat.key) return { message: `${PROVIDER_NAME[provider]}: new launches already use ${seat.label}`, switched: false, provider }
-    const selected = await this.selectSeat(seat.key)
+    const selected = await this.selectSeat(seat.key, chosen)
     const pane = await this.currentPane(provider)
     if (!pane) return { message: selected, switched: true, provider }
     if (pane.sshHost) return { message: `${selected}; this pane runs on SSH target ${pane.sshHost} with that machine's own login and is left alone`, switched: true, provider }
@@ -2201,13 +2238,26 @@ export class Rotator {
       const fresh = await this.accountsFor(pane.server)
       const at = this.locate(pane.terminalId, provider, fresh)
       const target = fresh.seats.find((s) => s.key === seat.key)
-      if (!target || at.seat?.key === target.key) return null
-      const { lines } = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 })
-      if (!(await this.advisoryOk(pane, at.seat, target, lines, fresh, config, this.deps.now()))) return null
+      if (!target || target.provider !== provider || at.seat?.key === target.key) return null
+      // Limited since the choice was made (another pane showed a banner while this waited).
+      const cooling = this.state.health[target.key]?.cooldownUntil
+      if (cooling && cooling > this.deps.now()) return null
+      const screen = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
+      // Unreadable: nothing shows that closing it is safe.
+      if (!screen) return null
+      // The user chose this account, so the guards of a move that is only advice (the headroom
+      // gap, the selection cooldown, probation) do not apply. What protects the session does:
+      // never in the middle of a turn, never over unsent text.
+      const unsafe = await this.unsafeToMove(pane, screen.lines)
+      if (unsafe) return unsafe
       const before = this.state.history.length
-      await this.moveTo(pane, at.seat, target, 'manual', [...lines], undefined, fresh, config)
-      return this.state.history.length > before ? this.state.history.at(-1) : null
+      // "Running sessions: new launches only" (and the legacy `auto_resume` off) say what the
+      // plugin does by itself; this move was asked for, and the confirmation said it happens.
+      await this.moveTo(pane, at.seat, target, 'manual', [...screen.lines], undefined, fresh, { ...config, autoResume: true })
+      return this.state.history.length > before ? this.state.history.at(-1)! : null
     })
+    if (moved === 'busy') return { message: `${selected}; this pane keeps its account while it works`, switched: true, provider }
+    if (moved === 'draft') return { message: `${selected}; this pane has unsent text in its input box and keeps its account`, switched: true, provider }
     if (moved && (moved.result === 'resumed' || moved.result === 'handoff')) return { message: `${selected}; this pane moved (${moved.result})`, switched: true, provider }
     return { message: `${selected}; this pane keeps its account until it is relaunched`, switched: true, provider }
   }
@@ -2244,6 +2294,8 @@ export class Rotator {
       agents.find((a: any) => providerOf(a.agent) && (a.state === 'waiting' || a.state === 'done')) ??
       agents.find((a: any) => providerOf(a.agent))
     if (!row || !context?.workspaceId) return 'No agent in the focused workspace'
+    // Moving closes the pane: never in the middle of a turn.
+    if (row.state !== 'waiting' && row.state !== 'done') return `${providerOf(row.agent)}: this pane is in the middle of a turn; run the command again once it has finished`
     const sshHost = await this.sshTargetOfWorkspace(context.workspaceId)
     if (sshHost) return `${providerOf(row.agent)}: this pane runs on SSH target ${sshHost}; Orca manages no accounts there`
     const server = await this.serverOfWorkspace(context.workspaceId)

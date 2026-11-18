@@ -300,12 +300,17 @@ export async function activateWith(
     return { ...(await consoleLine.status()), message }
   })
   orca.panels.handle('rotator.switchTo', async ({ seatKey }) => {
-    const { message, switched, provider } = await rotator.forceTo(seatKey)
-    if (!switched || rotator.services[provider] === false) return { message }
     // A manual choice must not be undone by the rotator: automatic hand-off for the service
-    // stops here, and the user turns it on again when they want rotation back.
-    await orca.settings.set(`service_${provider}`, false)
-    await rotator.refreshServices()
+    // stops as soon as the account is selected (before any automatic move that waits behind the
+    // switch can run), and the user turns it on again when they want rotation back.
+    let turnedOff = false
+    const { message, switched, provider } = await rotator.forceTo(seatKey, async (chosen) => {
+      if (rotator.services[chosen] === false) return
+      await orca.settings.set(`service_${chosen}`, false)
+      await rotator.refreshServices(false)
+      turnedOff = true
+    })
+    if (!switched || !turnedOff) return { message }
     rotator.publishNow()
     const name = PROVIDER_NAME[provider]
     void orca.host.call('notifications.show', { title: 'Auto Hand-off', body: `${name}: automatic hand-off is off after your manual switch. Turn Auto hand-off ${name} on to resume.` }).catch(() => undefined)

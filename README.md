@@ -157,8 +157,14 @@ account. When one hits a limit while Orca reports plenty of room on the active a
 assumes the pane was on another account. It cools nothing and resumes the session on the active
 account; from then on the pane's account is known.
 
-**`auto_resume` off:** the plugin only switches the account for new launches and tells you. The
-limited pane stays as it is for you to resume.
+**`auto_resume` off** (`custom` mode), or **Running sessions: `launches`:** the plugin only
+switches the account for new launches and tells you. The limited pane stays as it is for you to
+resume. The notification names the setting that keeps it there ("… because Running sessions is set
+to new launches only", or "… because Resume the session after a switch is off").
+
+**Auto-switch `manual`:** a limit is noted in History and you are told ("Claude hit a limit on
+*account*. Auto-switch is set to manual, so nothing was switched."); nothing is selected, closed
+or resumed.
 
 **On/off per service.** Each service has its own switch: on its card in the panel, or as
 *Auto hand-off Claude/Codex/Antigravity/OpenCode/Devin accounts* in Settings. All are on by default.
@@ -184,11 +190,13 @@ without numbers, as long as it has no strikes.
 included: a pane whose input box holds unsent text is never closed. An advisory move is dropped
 and considered again at the next turn end or idle check; a limit move stays pending until the
 text is sent or cleared (see the table above). The *Move this workspace's agent to another
-account* command refuses such a pane as well. The plugin asks Orca for that text
+account* command and the panel's *Hand off* leave such a pane alone as well, and say so; like every
+other move they also never close a pane that is in the middle of a turn. The plugin asks Orca for that text
 (`orca terminal read --json`, field `draft`) and also looks at the input line on screen; if Orca
 cannot be asked, the screen alone decides.
 
-**Guards on advisory moves** (threshold, idle, switch-back; hard limits ignore these two):
+**Guards on advisory moves** (threshold, idle, switch-back; hard limits ignore these two, and so
+does a move you ask for yourself from the panel or the command):
 
 - the target needs at least *Minimum headroom gap* (10 %) more room than the current account when
   both are known, and an exhausted account may always leave; a target without numbers never counts
@@ -262,13 +270,17 @@ and these are ignored.
     "% left" plus the reset time on the same bar Orca's account switcher draws (green, yellow
     from 80 % used, red from 90 %), and *Clear* on a cooldown;
   - on each standby account, *Hand off*, which asks first: new sessions of that
-    service start on it, and the session in the current tab moves once it finishes its reply
-    (a working pane keeps its account). Automatic hand-off for that service then turns off, so
+    service start on it, and the session in the current tab moves there too when it is between
+    turns and its input box holds no unsent text, whatever the headroom of the account you chose.
+    A pane that is working, or that holds unsent text, keeps its account, and the panel says
+    which; it is not moved later. This move is yours, so it also happens with *Running sessions*
+    on `launches` or `auto_resume` off. Automatic hand-off for that service turns off as soon as the
+    account is selected, so
     the plugin never undoes a choice you made by hand: no switch-back, no threshold or limit
     handling, until you turn *Auto hand-off* for the service on again. The block says so while it
     is off, and a desktop notification reminds you at the time. A limited standby cannot be
-    chosen until its cooldown is cleared. The panel only displays;
-    selection changes come from the plugin, the status-bar click or the commands;
+    chosen until its cooldown is cleared. Otherwise the panel only
+    displays: other selection changes come from the plugin, the status-bar click or the commands;
   - the automatic-switching toggle and when usage was last read;
   - parked sessions;
   - under an account's bars, "About 8 min left at this pace" when its last readings show a pace
@@ -532,7 +544,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 210 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 217 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

@@ -38,6 +38,8 @@ function world(options: {
   /** Unsent text Orca reports apart from the screen lines (`orca terminal read` → `draft`), by
    *  terminal; read on every look, so a test can change it. `'!'` makes that read fail. */
   drafts?: Record<string, string>
+  /** Called while the CLI lists the active terminals (live: a process that takes a moment). */
+  onActiveTerminals?: () => Promise<void>
 }) {
   let clock = 1_000_000
   let claudeActive: string | null = 'c1'
@@ -70,6 +72,7 @@ function world(options: {
       cliCalls.push(`close ${id}`)
     },
     async activeTerminals() {
+      await options.onActiveTerminals?.()
       return options.activeTerminals ?? []
     },
     async draft(terminalId) {
@@ -1296,6 +1299,226 @@ test('manual switch: a working pane is left alone; an already selected or limite
   w.rotator.state.health['claude:c3'] = { cooldownUntil: w.rotator['deps'].now() + 3_600_000, reason: 'rate_limit' }
   assert.match((await worker.request('rotator.switchTo', { seatKey: 'claude:c3' })).message, /limited until/)
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  await worker.deactivate()
+})
+
+test('manual switch: the chosen account takes the pane in the tab whatever its headroom or the selection cooldown', async () => {
+  // c2 has far less room than c1, both by Orca's live numbers, and the selection changed a moment
+  // ago: an automatic move would not go there. The user chose it, so the pane moves.
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: ['⏺ Done.'] },
+    claudeUsage: { session: 5, weekly: 5 },
+    laterClaudeUsage: { session: 60, weekly: 60 },
+    inactiveClaude: { c1: { session: 5, weekly: 5 }, c2: { session: 60, weekly: 60 } },
+    activeTerminals: ['t1'],
+    state: { paneSeat: { t1: 'claude:c1' }, lastAutoSwitchAt: { claude: 1_000_000 - 1000 }, probation: { claude: { key: 'claude:c1', until: 1_000_000 + 10 * MIN } } }
+  })
+  const worker = await w.mount()
+  const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+  assert.match(message, /this pane moved \(resumed\)/)
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
+  assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w1', agent: 'claude', sessionId: 's1' }])
+  const state = stored(w)
+  assert.equal(state.paneSeat.t2, 'claude:c2')
+  assert.deepEqual(state.history.at(-1), { ...state.history.at(-1), reason: 'manual', result: 'resumed', from: 'claude:c1', to: 'claude:c2' })
+  await worker.deactivate()
+})
+
+test('manual switch: the pane in the tab moves as the confirmation says, also when running sessions are otherwise left alone', async () => {
+  // "Running sessions: new launches only" and (custom) "Resume the session after a switch: off"
+  // are about what the plugin does by itself. Here the user asked, and was told the session moves.
+  const cases: Record<string, string | number | boolean>[] = [{ running_sessions: 'launches' }, { mode: 'custom', auto_resume: false }, { mode: 'manual' }]
+  for (const settings of cases) {
+    const label = JSON.stringify(settings)
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: ['⏺ Done.'] },
+      claudeUsage: { session: 5, weekly: 5 },
+      activeTerminals: ['t1'],
+      settings,
+      state: { paneSeat: { t1: 'claude:c1' } }
+    })
+    const worker = await w.mount()
+    const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+    assert.match(message, /this pane moved \(resumed\)/, label)
+    assert.deepEqual(selects(w), ['select claude c2'], label)
+    assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }], label)
+    assert.equal(stored(w).paneSeat.t2, 'claude:c2', label)
+    assert.deepEqual(stored(w).history.map((h) => [h.reason, h.result]), [['manual', 'selected'], ['manual', 'resumed']], label)
+    await worker.deactivate()
+  }
+})
+
+test('manual switch: the pane still waits for the end of its turn and for unsent text, and the message says which', async () => {
+  // Unsent text, on screen or as Orca reports it apart from the screen: the account is selected,
+  // the pane is not closed.
+  for (const how of ['screen', 'orca'] as const) {
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: how === 'screen' ? ['⏺ Done.', ...DRAFT_BOX] : ['⏺ Done.', ...EMPTY_BOX] },
+      claudeUsage: { session: 5, weekly: 5 },
+      activeTerminals: ['t1'],
+      state: { paneSeat: { t1: 'claude:c1' } },
+      ...(how === 'orca' ? { drafts: { t1: 'also update the docs' } } : {})
+    })
+    const worker = await w.mount()
+    const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+    assert.match(message, /new launches use two@example\.test; this pane has unsent text in its input box and keeps its account/, how)
+    assert.deepEqual(selects(w), ['select claude c2'], how)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, how)
+    assert.equal(w.host.callsOf('agent.resume').length, 0, how)
+    assert.deepEqual(w.typed, [], how)
+    assert.equal(stored(w).paneSeat.t1, 'claude:c1', how)
+    await worker.deactivate()
+  }
+
+  // In the middle of a turn (asking for permission counts): left alone, also by the command that
+  // moves this workspace's agent.
+  for (const busy of ['working', 'blocked'] as const) {
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: busy, sessionId: 's1' }],
+      tails: { t1: ['⏺ Working on it…'] },
+      claudeUsage: { session: 5, weekly: 5 },
+      inactiveClaude: { c2: { session: 5, weekly: 5 } },
+      activeTerminals: ['t1'],
+      state: { paneSeat: { t1: 'claude:c1' } }
+    })
+    const worker = await w.mount()
+    assert.match(String(await worker.command('rotator.swapThisPane')), /in the middle of a turn/, busy)
+    assert.deepEqual(selects(w), [], busy)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, busy)
+    const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+    assert.match(message, /keeps its account while it works/, busy)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, busy)
+    assert.equal(w.host.callsOf('agent.resume').length, 0, busy)
+    assert.ok(w.panes.some((p) => p.terminalId === 't1'), busy)
+    await worker.deactivate()
+  }
+})
+
+test('manual switch: a timer tick that comes while the switch is still being carried out does not undo the choice', async () => {
+  // Follow my order, c1 first and healthy: switch-back would return to c1 at once. The user picks
+  // c2 by hand. The account is selected, and while the plugin looks for the pane in the current
+  // tab (an `orca` call that takes a moment) the timer ticks.
+  let ticked = false
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', stateStartedAt: 1_000_000 }],
+    tails: { t1: ['⏺ Done.'] },
+    claudeUsage: { session: 5, weekly: 5 },
+    inactiveClaude: { c1: { session: 5, weekly: 5 } },
+    settings: { chain: 'claude:c1, claude:c2, claude:c3' },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    onActiveTerminals: async () => {
+      if (!ticked && selects(w).length > 0) {
+        ticked = true
+        await w.rotator.tick()
+      }
+    }
+  })
+  const worker = await w.mount()
+  const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+  assert.ok(ticked, 'a tick ran during the switch')
+  assert.match(message, /new launches use two@example\.test/)
+  assert.match(message, /Automatic hand-off for Claude is now off/)
+  // The choice stands: nothing selected c1 again.
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.data().settings.service_claude, false)
+  assert.equal(stored(w).history.filter((h) => h.reason === 'switch_back').length, 0)
+  w.advance(10 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  await worker.deactivate()
+})
+
+test('Auto-switch manual: a limit is noted and said as such, not as "no healthy account"', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    inactiveClaude: { c2: { session: 5, weekly: 5 } },
+    settings: { mode: 'manual' },
+    state: { paneSeat: { t1: 'claude:c1' } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), [])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(lastNote(w), 'Claude hit a limit on one@example.test. Auto-switch is set to manual, so nothing was switched.')
+  const last = stored(w).history.at(-1)
+  assert.deepEqual([last?.result, last?.detail, last?.why], ['failed', 'manual strategy', 'Auto-switch is manual, so nothing is switched automatically'])
+  await worker.deactivate()
+
+  // "When everything is used up: Stop", with every other account limited: that is the cause.
+  const stop = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { when_all_used: 'stop' },
+    state: { paneSeat: { t1: 'claude:c1' }, health: { 'claude:c2': { cooldownUntil: 1_000_000 + 60 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 60 * MIN } } }
+  })
+  const sw = await stop.mount()
+  await sw.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(lastNote(stop), 'Claude: no other account has room, and waiting for a reset is off. The session stays where it is.')
+  assert.equal(stored(stop).history.at(-1)?.why, 'no other Claude account has room, and waiting for a reset is off')
+  await sw.deactivate()
+})
+
+test('manual move command: a turn that started while the move waited its turn is not closed', async () => {
+  // The user sends a prompt right after running the command: by the time the move has its turn
+  // (the lock, a fresh account read) Orca reports the pane as working.
+  const drafts: Record<string, string> = {}
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: ['⏺ Done.'] },
+    claudeUsage: { session: 5, weekly: 5 },
+    inactiveClaude: { c2: { session: 5, weekly: 5 } },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    drafts
+  })
+  // The command's own look at the input box comes after it has seen the pane between turns.
+  Object.defineProperty(drafts, 't1', {
+    get: () => {
+      w.panes[0]!.state = 'working'
+      return undefined
+    }
+  })
+  const worker = await w.mount()
+  assert.match(await w.rotator.swapFocused(), /nothing to do/)
+  assert.equal(w.panes[0]!.state, 'working')
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(selects(w), [])
+  await worker.deactivate()
+})
+
+test('selection only: the notification names what keeps the session where it is', async () => {
+  // Running sessions: new launches only. Nothing called "auto resume" was turned off.
+  const launches = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { running_sessions: 'launches' }
+  })
+  let worker = await launches.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(launches), ['select claude c2'])
+  assert.equal(launches.host.callsOf('terminal.close').length, 0)
+  assert.equal(lastNote(launches), 'Claude: new launches now use two@example.test. The session stays where it is for you to resume, because Running sessions is set to new launches only.')
+  assert.ok(!/auto.resume/i.test(notes(launches).join('\n')))
+  assert.equal(stored(launches).history.at(-1)?.detail, 'Running sessions: new launches only')
+  await worker.deactivate()
+
+  // Custom mode with "Resume the session after a switch" off.
+  const custom = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { auto_resume: false }
+  })
+  worker = await custom.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(custom), ['select claude c2'])
+  assert.equal(lastNote(custom), 'Claude: new launches now use two@example.test. The session stays where it is for you to resume, because Resume the session after a switch is off.')
+  assert.ok(!/Running sessions/.test(notes(custom).join('\n')))
+  assert.equal(stored(custom).history.at(-1)?.detail, 'auto_resume off')
   await worker.deactivate()
 })
 
