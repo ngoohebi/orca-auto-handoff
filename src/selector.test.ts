@@ -1,5 +1,6 @@
 import { assert, test } from 'orca/testing'
 import { parseAccounts } from './accounts'
+import { activeTerminalsIn } from './cli'
 import { accountList } from './fixtures'
 import { buildChain, earliestReset, enoughGap, pickNext, preferredOver } from './selector'
 import { DEFAULT_CONFIG, type Config } from './types'
@@ -19,6 +20,32 @@ test('parses seats, dedupes the system login, maps usage', () => {
   assert.equal(c1.usage.model?.name, 'fable')
   assert.equal(seats[1]!.usage.known, false) // stale-token inactive Claude seat
   assert.equal(seats.find((s) => s.key === 'codex:x2')!.usage.session?.usedPercent, 100)
+})
+
+test('the Antigravity host login is a seat of its own when no managed account is selected', () => {
+  const list = accountList()
+  list.antigravity = {
+    accounts: [],
+    activeAccountId: null,
+    selectedAccountId: null,
+    currentAccount: { email: null, subject: null, authMethod: 'consumer', identityKnown: false }
+  }
+  list.rateLimits.antigravity = {
+    provider: 'antigravity',
+    status: 'ok',
+    session: { usedPercent: 12, resetsAt: NOW + 3_600_000 },
+    weekly: { usedPercent: 3, resetsAt: NOW + 86_400_000 }
+  }
+  const { seats, active } = parseAccounts(list)
+  const agy = seats.find((s) => s.provider === 'antigravity')!
+  assert.equal(agy.key, 'antigravity:system')
+  assert.equal(agy.label, 'system')
+  assert.equal(agy.active, true)
+  assert.equal(agy.usage.session?.usedPercent, 12)
+  assert.equal(active.antigravity, 'antigravity:system')
+  // Without a login or usage there is nothing to show.
+  const none = accountList()
+  assert.equal(parseAccounts(none).seats.some((s) => s.provider === 'antigravity'), false)
 })
 
 test('system login active and duplicate of a managed seat marks that seat active', () => {
@@ -114,4 +141,35 @@ test('headroom gap: a threshold move needs a clearly better seat; exhausted seat
   assert.equal(enoughGap(undefined, seat('b', 0, 84), cfg()), true)
   assert.equal(enoughGap(seat('a', 0, 85), { ...seat('b', 0, 0), usage: { known: false } }, cfg()), true)
   assert.equal(enoughGap(seat('a', 0, 85), seat('b', 0, 80), cfg({ minHeadroomGap: 0 })), true)
+})
+
+test('activeTerminalsIn picks the active leaf of each workspace\u2019s active tab', () => {
+  const result = {
+    visualLayouts: [
+      {
+        worktreeId: 'w1',
+        root: {
+          type: 'group',
+          activeTabId: 'tab2',
+          tabs: [
+            { tabId: 'tab1', activeLeafId: 'l1', panes: { type: 'terminal', handle: 'term_a', leafId: 'l1', active: true } },
+            {
+              tabId: 'tab2',
+              activeLeafId: 'l3',
+              panes: {
+                type: 'split',
+                children: [
+                  { type: 'terminal', handle: 'term_b', leafId: 'l2', active: false },
+                  { type: 'terminal', handle: 'term_c', leafId: 'l3', active: true }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      { worktreeId: 'w2', root: { type: 'group', activeTabId: 'x', tabs: [{ tabId: 'x', activeLeafId: 'y', panes: { type: 'terminal', handle: 'term_d', leafId: 'y', active: true } }] } }
+    ]
+  }
+  assert.deepEqual(activeTerminalsIn(result), ['term_c', 'term_d'])
+  assert.deepEqual(activeTerminalsIn({}), [])
 })

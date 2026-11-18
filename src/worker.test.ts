@@ -26,6 +26,8 @@ function world(options: {
   refuseHostSend?: boolean
   /** `orca account select` fails for these account ids. */
   failSelect?: string[]
+  /** Terminals in the active tab of each workspace (`orca terminal list --include-visual-layouts`). */
+  activeTerminals?: string[]
 }) {
   let clock = 1_000_000
   let claudeActive: string | null = 'c1'
@@ -56,6 +58,9 @@ function world(options: {
     },
     async closeTerminal(id) {
       cliCalls.push(`close ${id}`)
+    },
+    async activeTerminals() {
+      return options.activeTerminals ?? []
     },
     async sendText(terminalId, text) {
       cliCalls.push(`send ${terminalId}`)
@@ -357,9 +362,8 @@ test('paused: nothing happens; panel requests and commands work', async () => {
   assert.equal(snap.paused, true)
   assert.equal(snap.seats.length, 6)
   assert.match(await worker.command('rotator.togglePause') as string, /resumed/)
-  assert.match(await worker.command('rotator.nextCodex') as string, /codex: new launches use/)
+  assert.match(await worker.command('rotator.nextCodex') as string, /Codex: new launches use/)
   assert.ok(w.cliCalls.includes('select codex system'), w.cliCalls.join(','))
-  assert.deepEqual(await worker.request('rotator.select', { seatKey: 'claude:c3' }), { message: 'claude: new launches use me@example.test' })
   assert.ok(worker.posts.some((p) => p.event === 'rotator.changed'))
   assert.ok(w.host.callsOf('statusBar.update').length > 0)
   assert.deepEqual(worker.refusals, [])
@@ -702,7 +706,7 @@ test('status bar text', () => {
       { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'b', active: true, usage: { known: true, session: { usedPercent: 85, resetsAt: null }, weekly: { usedPercent: 18.4, resetsAt: null } } }
     ]
   })
-  assert.equal(s.text, 'claude 2/2 · 85%·18%')
+  assert.equal(s.text, 'Claude 2/2 · 85%·18%')
   assert.equal(s.tone, 'warning')
   const off = statusText({
     paused: false,
@@ -715,5 +719,327 @@ test('status bar text', () => {
       { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'b', active: false, usage: { known: false } }
     ]
   })
-  assert.equal(off.text, 'claude off')
+  assert.equal(off.text, 'Claude off')
+})
+
+test('swap history keeps 7 days and cleans itself up', async () => {
+  const DAY = 86_400_000
+  const w = world({
+    panes: [],
+    tails: {},
+    state: {
+      history: [
+        { at: 1_000_000 - 8 * DAY, provider: 'claude', reason: 'rate_limit', result: 'resumed', from: 'claude:c1', to: 'claude:c2' },
+        { at: 1_000_000 - 6 * DAY, provider: 'claude', reason: 'rate_limit', result: 'resumed', from: 'claude:c2', to: 'claude:c3' },
+        { at: 1_000_000 - 60_000, provider: 'codex', reason: 'manual', result: 'selected', from: 'codex:x1', to: 'codex:x2' }
+      ]
+    }
+  })
+  const worker = await w.mount()
+  // Loading drops what is older than 7 days.
+  let state = w.host.data().storage.state as RotatorState
+  assert.deepEqual(state.history.map((h) => h.to), ['claude:c3', 'codex:x2'])
+  // Time passes: the tick cleans up on its own.
+  w.advance(2 * DAY)
+  await w.rotator.tick()
+  state = w.host.data().storage.state as RotatorState
+  assert.deepEqual(state.history.map((h) => h.to), ['codex:x2'])
+  assert.deepEqual((await worker.request('rotator.snapshot', {})).history.map((h) => h.to), ['codex:x2'])
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
+})
+
+test('the snapshot names the service of the agent the user is working with', async () => {
+  const w = world({
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'working', stateStartedAt: 10 },
+      { terminalId: 't2', agent: 'codex', state: 'working', stateStartedAt: 20 }
+    ],
+    tails: {}
+  })
+  const worker = await w.mount()
+  // Without a layout listing, the agent whose state changed last stands in for the focused pane.
+  assert.equal((await worker.request('rotator.snapshot', {})).focused, 'codex')
+})
+
+test('the agent in the active terminal tab wins over the most recently changed one', async () => {
+  const options: Parameters<typeof world>[0] = {
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'working', stateStartedAt: 10 },
+      { terminalId: 't2', agent: 'codex', state: 'working', stateStartedAt: 20 }
+    ],
+    tails: {},
+    activeTerminals: ['t1']
+  }
+  const w = world(options)
+  const worker = await w.mount()
+  assert.deepEqual(await worker.request('rotator.focus', {}), { focused: 'claude' })
+  // The user switches tabs: the panel's next poll sees it.
+  options.activeTerminals = ['t2']
+  assert.deepEqual(await worker.request('rotator.focus', {}), { focused: 'codex' })
+  assert.equal((await worker.request('rotator.snapshot', {})).focused, 'codex')
+})
+
+test('manual switch: selects the account, turns the service\u2019s automatic hand-off off, and says so', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [] },
+    claudeUsage: { session: 5, weekly: 5 },
+    settings: { auto_swap_idle_after_seconds: 0 }
+  })
+  const worker = await w.mount()
+  // c1 is healthy and first in the chain; the user still wants another account.
+  const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+  assert.match(message, /new launches use/)
+  assert.match(message, /Automatic hand-off for Claude is now off/)
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  let snap = await worker.request('rotator.snapshot', {})
+  assert.equal(snap.services.claude, false)
+  assert.equal(snap.history.at(-1)?.reason, 'manual')
+  assert.equal(w.host.data().settings.service_claude, false)
+  assert.ok(w.host.callsOf('notifications.show').some((c: any) => /automatic hand-off is off/.test(c.body)))
+  // Switch-back would return to c1 at once; with the service off nothing moves, tick after tick,
+  // and a turn ending on c1 stays put too.
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  w.advance(48 * 3_600_000)
+  await w.rotator.tick()
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  // Turning the service on again hands the decision back: c1 is preferred.
+  await worker.request('rotator.setService', { provider: 'claude', enabled: true })
+  await w.rotator.tick()
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c1'])
+  assert.equal((w.host.data().storage.state as RotatorState).history.at(-1)?.reason, 'switch_back')
+  await worker.deactivate()
+})
+
+test('manual switch: the pane in the current tab moves at once when it is between turns', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [] },
+    claudeUsage: { session: 5, weekly: 5 },
+    activeTerminals: ['t1']
+  })
+  const worker = await w.mount()
+  const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+  assert.match(message, /this pane moved \(resumed\)/)
+  assert.deepEqual(w.host.callsOf('terminal.close').map((c: any) => c.terminalId), ['t1'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  const state = w.host.data().storage.state as RotatorState
+  assert.equal(state.paneSeat.t2, 'claude:c2')
+  assert.deepEqual(state.history.at(-1), { ...state.history.at(-1), reason: 'manual', result: 'resumed', from: 'claude:c1', to: 'claude:c2' })
+  await worker.deactivate()
+})
+
+test('manual switch: a working pane is left alone; an already selected or limited account is refused', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'working', sessionId: 's1' }],
+    tails: { t1: [] },
+    claudeUsage: { session: 5, weekly: 5 },
+    activeTerminals: ['t1']
+  })
+  const worker = await w.mount()
+  const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+  assert.match(message, /keeps its account while it works/)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.match((await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })).message, /already use/)
+  w.rotator.state.health['claude:c3'] = { cooldownUntil: w.rotator['deps'].now() + 3_600_000, reason: 'rate_limit' }
+  assert.match((await worker.request('rotator.switchTo', { seatKey: 'claude:c3' })).message, /limited until/)
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  await worker.deactivate()
+})
+
+test('project on a remote Orca server: reads accounts and switches seats on the current project server', async () => {
+  let focusedWorkspace = 'w-remote'
+  let localActive = 'c1'
+  let remoteActive = 'r1'
+  const cliCalls: string[] = []
+  const panes: Pane[] = [{ terminalId: 'tr1', agent: 'claude', state: 'done', sessionId: 'sr1' }]
+  const tails: Record<string, string[]> = { tr1: fx.CLAUDE_SESSION_LIMIT }
+  let next = 2
+  const cli: Cli = {
+    async listAccounts(server) {
+      cliCalls.push(server ? `list@${server}` : 'list')
+      if (server === 'remote-box') {
+        return {
+          claude: {
+            accounts: [
+              { id: 'r1', email: 'remote1@example.test' },
+              { id: 'r2', email: 'remote2@example.test' }
+            ],
+            activeAccountId: remoteActive,
+            systemDefaultHome: null
+          },
+          codex: { accounts: [], activeAccountId: null, systemDefault: { hasAuth: false } },
+          rateLimits: {
+            claude: {
+              status: 'ok',
+              session: { usedPercent: remoteActive === 'r1' ? 100 : 12, resetsAt: 1_000_000 + 3_600_000 },
+              weekly: { usedPercent: 20, resetsAt: 1_000_000 + 86_400_000 }
+            }
+          }
+        }
+      }
+      return fx.accountList({ claudeActive: localActive, claudeUsage: { session: 15, weekly: 20 } })
+    },
+    async select(provider, accountId, server) {
+      cliCalls.push(server ? `select@${server} ${provider} ${accountId}` : `select ${provider} ${accountId}`)
+      if (provider === 'claude') {
+        if (server === 'remote-box') remoteActive = accountId
+        else localActive = accountId
+      }
+    },
+    async closeTerminal(id, server) {
+      cliCalls.push(server ? `close@${server} ${id}` : `close ${id}`)
+    },
+    async sendText(id, _text, server) {
+      cliCalls.push(server ? `send@${server} ${id}` : `send ${id}`)
+    },
+    async git() {
+      return ''
+    }
+  }
+  const host = mockHost({
+    settings: {},
+    storage: {},
+    results: {
+      'agents.list': () => ({ agents: panes.map((p) => ({ title: null, task: null, stateStartedAt: 1, sessionId: null, ...p })) }),
+      'terminal.read': ({ terminalId }: { terminalId: string }) => ({ lines: tails[terminalId] ?? [], truncated: false }),
+      'terminal.close': ({ terminalId }: { terminalId: string }) => {
+        const i = panes.findIndex((p) => p.terminalId === terminalId)
+        if (i >= 0) panes.splice(i, 1)
+        return { closed: true }
+      },
+      'agent.resume': ({ agent, sessionId }: { agent: string; sessionId: string }) => {
+        const terminalId = `tr${next++}`
+        panes.push({ terminalId, agent, state: 'waiting', sessionId })
+        return { terminalId, started: true }
+      },
+      'terminal.sendText': () => {
+        throw Object.assign(new Error('terminal is outside the active worktree'), { code: 'action_failed' })
+      },
+      'workspace.list': {
+        workspaces: [
+          { id: 'w-local', kind: 'worktree', name: 'local-app', projectId: 'p-local', path: '/local/repo', branch: 'main', hostId: 'local' },
+          { id: 'w-remote', kind: 'worktree', name: 'remote-app', projectId: 'p-remote', path: '/srv/repo', branch: 'main', hostId: null }
+        ],
+        truncated: false
+      },
+      'project.list': {
+        projects: [
+          { id: 'p-local', name: 'local-app', kind: 'git', hostId: 'local', path: '/local/repo' },
+          { id: 'p-remote', name: 'remote-app', kind: 'git', hostId: 'runtime:remote-box', path: '/srv/repo' }
+        ],
+        truncated: false
+      },
+      'workspace.readContext': () => ({ workspaceId: focusedWorkspace, branch: 'main', displayName: focusedWorkspace, terminals: [] }),
+      'notifications.show': { delivered: true },
+      'statusBar.update': { ok: true }
+    }
+  })
+  let rotator!: Rotator
+  const worker = await mountWorker(
+    {
+      default: async (orca: OrcaWorkerApi) => {
+        rotator = await activateWith(orca, { cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false })
+      }
+    },
+    { host }
+  )
+  const snapRemote = await worker.request('rotator.snapshot', { refresh: true })
+  assert.equal(snapRemote.server, 'remote-box')
+  assert.deepEqual(snapRemote.seats.map((s) => s.label), ['remote1@example.test', 'remote2@example.test'])
+  assert.ok(cliCalls.includes('list@remote-box'), cliCalls.join(','))
+
+  // A limit in the remote workspace selects the next account on that remote server.
+  await worker.emit('agent.status.changed', {
+    workspaceId: 'w-remote',
+    paneKey: 'pane-tr1',
+    terminalId: 'tr1',
+    state: 'done',
+    receivedAt: 1,
+    mainAgent: { state: 'done', stateStartedAt: 1 }
+  })
+  assert.ok(cliCalls.includes('select@remote-box claude r2'), cliCalls.join(','))
+  assert.ok(cliCalls.includes('send@remote-box tr2'), cliCalls.join(','))
+
+  // Switching focus to the local project switches the panel's accounts to the local server.
+  focusedWorkspace = 'w-local'
+  await worker.emit('workspace.changed', { context: { workspaceId: 'w-local', branch: 'main', displayName: 'local-app', terminals: [] } })
+  const snapLocal = await worker.request('rotator.snapshot', {})
+  assert.equal(snapLocal.server, undefined)
+  assert.ok(snapLocal.seats.some((s) => s.label === 'one@example.test'))
+  assert.ok(cliCalls.includes('list'), cliCalls.join(','))
+  await worker.deactivate()
+})
+
+test('project on a direct SSH target: Orca manages no accounts there, so a limited pane is left alone and the panel says so', async () => {
+  const cliCalls: string[] = []
+  const panes: Pane[] = [{ terminalId: 'ts1', agent: 'claude', state: 'done', sessionId: 'ss1' }]
+  const cli: Cli = {
+    async listAccounts(server) {
+      cliCalls.push(server ? `list@${server}` : 'list')
+      return fx.accountList({ claudeUsage: { session: 100, weekly: 40 } })
+    },
+    async select(provider, accountId) {
+      cliCalls.push(`select ${provider} ${accountId}`)
+    },
+    async closeTerminal(id) {
+      cliCalls.push(`close ${id}`)
+    },
+    async sendText(id) {
+      cliCalls.push(`send ${id}`)
+    },
+    async git() {
+      return ''
+    }
+  }
+  const host = mockHost({
+    settings: {},
+    storage: {},
+    results: {
+      'agents.list': () => ({ agents: panes.map((p) => ({ title: null, task: null, stateStartedAt: 1, sessionId: null, ...p })) }),
+      'terminal.read': () => ({ lines: fx.CLAUDE_SESSION_LIMIT, truncated: false }),
+      'terminal.close': () => ({ closed: true }),
+      'agent.resume': () => ({ terminalId: 'never', started: true }),
+      'terminal.sendText': () => ({ accepted: true }),
+      // The workspace row names no host; its project does.
+      'workspace.list': { workspaces: [{ id: 'w-ssh', kind: 'worktree', name: 'build-app', projectId: 'p-ssh', path: '/home/me/repo', branch: 'main', hostId: null }], truncated: false },
+      'project.list': { projects: [{ id: 'p-ssh', name: 'build-app', kind: 'git', hostId: 'ssh:build-box', path: '/home/me/repo' }], truncated: false },
+      'workspace.readContext': { workspaceId: 'w-ssh', branch: 'main', displayName: 'build-app', terminals: [] },
+      'notifications.show': { delivered: true },
+      'statusBar.update': { ok: true }
+    }
+  })
+  let rotator!: Rotator
+  const worker = await mountWorker(
+    {
+      default: async (orca: OrcaWorkerApi) => {
+        rotator = await activateWith(orca, { cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false })
+      }
+    },
+    { host }
+  )
+  const snap = await worker.request('rotator.snapshot', { refresh: true })
+  assert.equal(snap.sshHost, 'build-box')
+  assert.equal(snap.server, undefined)
+  const event = (stamp: number) => ({ workspaceId: 'w-ssh', paneKey: 'pane-ts1', terminalId: 'ts1', state: 'done' as const, receivedAt: stamp, mainAgent: { state: 'done' as const, stateStartedAt: stamp } })
+  await worker.emit('agent.status.changed', event(1))
+  // Nothing is selected, closed or resumed: the accounts here are not the SSH machine's.
+  assert.deepEqual(cliCalls.filter((c) => !c.startsWith('list')), [])
+  assert.equal(host.callsOf('agent.resume').length, 0)
+  assert.equal(host.callsOf('terminal.close').length, 0)
+  let state = host.data().storage.state as RotatorState
+  assert.equal(state.history.length, 1)
+  assert.equal(state.history[0]?.result, 'failed')
+  assert.match(state.history[0]?.detail ?? '', /SSH target build-box/)
+  assert.equal(state.health['claude:c1'], undefined)
+  assert.equal(host.callsOf('notifications.show').length, 1)
+  // The same banner again is not reported twice.
+  await worker.emit('agent.status.changed', event(2))
+  state = host.data().storage.state as RotatorState
+  assert.equal(state.history.length, 1)
+  assert.match(await rotator.swapFocused(), /SSH target build-box/)
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
 })

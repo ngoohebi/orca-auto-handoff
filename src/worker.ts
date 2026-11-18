@@ -3,6 +3,8 @@
 import type { OrcaWorkerApi } from 'orca/worker'
 import { nodeCli } from './cli'
 import { Rotator, type Deps, type StatusEvent } from './engine'
+import { PROVIDER_NAME } from './labels'
+import { ConsoleStatusLine, nodeFiles, memoryFiles, type Files } from './statusline-files'
 import { DEFAULT_CONFIG, PROVIDERS, type Config, type Provider, type RotatorState, type Snapshot } from './types'
 import './protocol'
 
@@ -44,7 +46,7 @@ export async function readConfig(orca: Pick<OrcaWorkerApi, 'settings'>): Promise
   }
 }
 
-/** `claude 2/3 · 7%·18% | codex 1/3 · 0%` — only providers with more than one seat. */
+/** `Claude 2/3 · 7%·18% | Codex 1/3 · 0%` — only providers with more than one seat. */
 export function statusText(snapshot: Snapshot): { text: string; tone: 'neutral' | 'warning' | 'danger'; tooltip: string } {
   const parts: string[] = []
   let tone: 'neutral' | 'warning' | 'danger' = 'neutral'
@@ -52,7 +54,7 @@ export function statusText(snapshot: Snapshot): { text: string; tone: 'neutral' 
     const seats = snapshot.seats.filter((s) => s.provider === provider)
     if (seats.length < 2) continue
     if (snapshot.services?.[provider] === false) {
-      parts.push(`${provider} off`)
+      parts.push(`${PROVIDER_NAME[provider]} off`)
       continue
     }
     const index = seats.findIndex((s) => s.active)
@@ -61,17 +63,17 @@ export function statusText(snapshot: Snapshot): { text: string; tone: 'neutral' 
       .filter((n): n is number => typeof n === 'number')
       .map((n) => `${Math.round(n)}%`)
       .join('·')
-    parts.push(`${provider} ${index + 1}/${seats.length}${pct ? ` · ${pct}` : ''}`)
+    parts.push(`${PROVIDER_NAME[provider]} ${index + 1}/${seats.length}${pct ? ` · ${pct}` : ''}`)
     const worst = Math.max(seat?.usage.session?.usedPercent ?? 0, seat?.usage.weekly?.usedPercent ?? 0)
     if (worst >= 80 && tone === 'neutral') tone = 'warning'
   }
   if (snapshot.waiting.length > 0) tone = 'danger'
-  const text = (snapshot.paused ? 'paused · ' : '') + (parts.join(' | ') || 'Account Rotator')
+  const text = (snapshot.paused ? 'paused · ' : '') + (parts.join(' | ') || 'Auto Hand-off')
   const tooltip = snapshot.waiting.length
     ? `${snapshot.waiting.length} session(s) waiting for a limit to reset`
     : snapshot.paused
-      ? 'Automatic switching is paused'
-      : 'Automatic account switching is on. Click to switch to the next account.'
+      ? 'Automatic hand-off is paused'
+      : 'Automatic hand-off is on. Click to hand Claude off to the next account.'
   return { text, tone, tooltip }
 }
 
@@ -80,9 +82,17 @@ let timer: ReturnType<typeof setInterval> | undefined
 export async function activateWith(
   orca: OrcaWorkerApi,
   overrides: Partial<Deps> = {},
-  options: { tick?: boolean } = {}
+  /** `files` defaults to an in-memory stand-in so tests never touch the real home directory;
+   *  `activate` passes the real one. */
+  options: { tick?: boolean; files?: Files } = {}
 ): Promise<Rotator> {
   let lastStatus = ''
+  const consoleLine = new ConsoleStatusLine(options.files ?? memoryFiles(), {
+    host: orca.host as unknown as Deps['host'],
+    settings: () => orca.settings.get().catch(() => ({})) as Promise<Record<string, unknown>>,
+    log: (m) => orca.log(m),
+    now: () => overrides.now?.() ?? Date.now()
+  })
   const deps: Deps = {
     host: orca.host as unknown as Deps['host'],
     cli: nodeCli(async () => (await readConfig(orca)).orcaCliPath),
@@ -97,6 +107,7 @@ export async function activateWith(
     },
     publish: (snapshot) => {
       orca.panels.post('rotator.changed', snapshot as never)
+      void consoleLine.writeStatus(snapshot)
       const status = statusText(snapshot)
       const key = JSON.stringify(status)
       if (key === lastStatus) return
@@ -113,9 +124,13 @@ export async function activateWith(
   void rotator.accounts().then(() => rotator.publishNow())
 
   orca.events.on('agent.status.changed', (payload) => rotator.onAgentStatus(payload as StatusEvent))
+  // The panel lists the service of the agent in the focused workspace first.
+  orca.events.on('workspace.changed', async () => {
+    if (await rotator.refreshFocus()) rotator.publishNow()
+  })
 
   orca.hooks.on('agent.launch.before', (event) => {
-    rotator.noteLaunch(event.agent, event.terminalId)
+    rotator.noteLaunch(event.agent, event.terminalId, event.workspaceId)
   })
 
   orca.commands.register('rotator.next', async (args) => {
@@ -126,19 +141,20 @@ export async function activateWith(
   orca.commands.register('rotator.swapThisPane', () => rotator.swapFocused())
   orca.commands.register('rotator.togglePause', async () => {
     await rotator.setPaused(!rotator.state.paused)
-    return rotator.state.paused ? 'Automatic switching paused' : 'Automatic switching resumed'
+    return rotator.state.paused ? 'Automatic hand-off paused' : 'Automatic hand-off resumed'
   })
   orca.commands.register('rotator.refresh', async () => {
     await rotator.accounts(true)
     rotator.publishNow()
     return 'Usage refreshed'
   })
+  orca.commands.register('rotator.installStatusLine', () => consoleLine.install())
+  orca.commands.register('rotator.uninstallStatusLine', () => consoleLine.uninstall())
 
   orca.panels.handle('rotator.snapshot', async ({ refresh }) => {
-    await rotator.accounts(!!refresh)
+    await Promise.all([rotator.accounts(!!refresh), rotator.refreshFocus()])
     return rotator.snapshot()
   })
-  orca.panels.handle('rotator.select', async ({ seatKey }) => ({ message: await rotator.selectSeat(seatKey) }))
   orca.panels.handle('rotator.pause', async ({ paused }) => {
     await rotator.setPaused(paused)
     return { paused }
@@ -154,8 +170,32 @@ export async function activateWith(
   // Changing it in Orca's Settings takes effect at once too.
   orca.settings.onDidChange(() => {
     void rotator.refreshServices()
+    // The console status line format lives in the status file.
+    consoleLine.invalidate()
+    rotator.publishNow()
   })
 
+  orca.panels.handle('rotator.consoleLine', async ({ enabled }) => {
+    if (typeof enabled !== 'boolean') return consoleLine.status()
+    const message = enabled ? await consoleLine.install() : await consoleLine.uninstall()
+    return { ...(await consoleLine.status()), message }
+  })
+  orca.panels.handle('rotator.switchTo', async ({ seatKey }) => {
+    const { message, switched, provider } = await rotator.forceTo(seatKey)
+    if (!switched || rotator.services[provider] === false) return { message }
+    // A manual choice must not be undone by the rotator: automatic hand-off for the service
+    // stops here, and the user turns it on again when they want rotation back.
+    await orca.settings.set(`service_${provider}`, false)
+    await rotator.refreshServices()
+    rotator.publishNow()
+    const name = PROVIDER_NAME[provider]
+    void orca.host.call('notifications.show', { title: 'Auto Hand-off', body: `${name}: automatic hand-off is off after your manual switch. Turn Auto hand-off ${name} on to resume.` }).catch(() => undefined)
+    return { message: `${message}. Automatic hand-off for ${name} is now off; turn Auto hand-off ${name} on again to resume` }
+  })
+  orca.panels.handle('rotator.focus', async () => {
+    if (await rotator.refreshFocus()) rotator.publishNow()
+    return rotator.focused ? { focused: rotator.focused } : {}
+  })
   orca.panels.handle('rotator.cancelWaiting', async ({ terminalId }) => {
     await rotator.cancelWaiting(terminalId)
     return { ok: true as const }
@@ -184,7 +224,7 @@ export async function activateWith(
 }
 
 export default async function activate(orca: OrcaWorkerApi): Promise<void> {
-  await activateWith(orca)
+  await activateWith(orca, {}, { files: nodeFiles() })
 }
 
 export function deactivate(): void {

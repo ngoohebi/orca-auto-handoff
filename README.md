@@ -1,4 +1,6 @@
-# Account Rotator (Orca plugin)
+# Auto Hand-off (Orca plugin)
+
+**Hit a rate limit? Auto-switch to your next account.** Automatic account switching for Orca agents. When a Claude, Codex, Antigravity, OpenCode or Devin account hits a limit, Auto Hand-off moves the session to your next account and keeps working. Claude stays Claude, Codex stays Codex: a session always keeps its provider.
 
 Product page: <https://ngoohebi.github.io/orca-account-rotator/>
 
@@ -23,6 +25,16 @@ previous run stopped, the session title, branch, `git status`, `git diff --stat`
 Usage numbers come from Orca itself (`orca account list --json` → `rateLimits`). The plugin never
 reads tokens or keychains.
 
+**Projects on a paired Orca server.** Managed accounts belong to the Orca that runs the agent, so a
+project on a paired server (Orca host `runtime:<server>`) has its own accounts and its own active
+selection. The plugin follows the project: the panel lists that server's accounts and names the
+server, and a pane there is switched, closed and resumed with that server's accounts. Each server's
+accounts are cached separately. Since the `orca account` commands refuse `--environment`, the
+worker reaches a paired server through Orca's own runtime client (see *Permissions*). A project on
+a direct SSH target (host `ssh:<target>`) is different: its agents run with that machine's own
+login and Orca manages no accounts for it, so the plugin leaves those panes alone, notes a limit
+there in the history instead of switching, and the panel says so.
+
 ## What it does
 
 | Trigger | Action |
@@ -45,7 +57,7 @@ Detection runs when a pane turns `done` or `waiting`. A banner only counts when 
 - it is not an input line (`❯`, `›`, `>`), TUI frame or footer, or one of Claude's own `⏺` replies.
 
 An agent's reply that mentions rate limits is therefore not treated as a limit. Detection is
-heuristic, though; the `Automatic switching` toggle and the per-service switches are the off
+heuristic, though; the `Automatic hand-off` toggle and the per-service switches are the off
 switches if it ever misfires.
 
 Each banner is handled once *per session*, so a session that Orca restores or restarts in a new
@@ -61,10 +73,10 @@ account; from then on the pane's account is known.
 limited pane stays as it is for you to resume.
 
 **On/off per service.** Each service has its own switch: on its card in the panel, or as
-*Auto-switch Claude/Codex/Antigravity/OpenCode/Devin accounts* in Settings. All are on by default.
+*Auto hand-off Claude/Codex/Antigravity/OpenCode/Devin accounts* in Settings. All are on by default.
 For a service that is off, the plugin never closes, switches or resumes its panes, and its parked
 sessions stay parked. Manual switching from the panel or the commands still works. The status bar
-shows it as `codex off`. The *Automatic switching* toggle at the top pauses every service at once.
+shows it as `codex off`. The *Automatic hand-off* toggle at the top pauses every service at once.
 
 Strategies: **drain** (next account in chain order; the default), **balanced** (most room),
 **priority** (always the first healthy account in the chain), **soonest-reset** (the account whose
@@ -92,15 +104,36 @@ automatic rotation and switch-back; picking them from the panel still works.
 
 - **Status bar:** `claude 2/3 · 7%·18% | codex 1/3 · 0%`. The tone turns to warning at 80 % and to
   danger while a session is parked. Click it to move Claude to the next account.
-- **Panel** (gauge icon, right sidebar):
-  - each account with 5-hour, weekly and model bars, active and limited badges, a cooldown
-    countdown, *Clear* and *Use for new launches*;
-  - the automatic-switching toggle;
+- **Panel** (gauge icon, right sidebar), laid out after Orca's own style guide (quiet and
+  monochrome, colour only for state):
+  - one section per service, in Orca's order except that the service of the agent in the current
+    terminal tab comes first, marked *this terminal* (the panel re-checks every few seconds while
+    open, since switching tabs raises no event); each sits on a band
+    washed in the tone nearest its brand with a brand-coloured rule under its name, a status
+    light, "n of m ready" and, when it has more than one account, that service's auto hand-off
+    toggle; the Claude section also has a
+    *Status line* switch that installs or removes the console status line in the focused
+    workspace (the same as the install and remove commands);
+  - each account, the one in use first, then the usable ones with the most headroom first, then
+    the drained and limited ones; each with a status light (solid green in use, hollow green
+    ready, amber low, red limited or drained, grey idle), its 5-hour, weekly and model windows as
+    "% left" plus the reset time on the same bar Orca's account switcher draws (green, yellow
+    from 80 % used, red from 90 %), and *Clear* on a cooldown;
+  - on each standby account, *Hand off*, which asks first: new sessions of that
+    service start on it, and the session in the current tab moves once it finishes its reply
+    (a working pane keeps its account). Automatic hand-off for that service then turns off, so
+    the plugin never undoes a choice you made by hand: no switch-back, no threshold or limit
+    handling, until you turn *Auto hand-off* for the service on again. The block says so while it
+    is off, and a desktop notification reminds you at the time. A limited standby cannot be
+    chosen until its cooldown is cleared. The panel only displays;
+    selection changes come from the plugin, the status-bar click or the commands;
+  - the automatic-switching toggle and when usage was last read;
   - parked sessions;
-  - swap history (the last 1,000 entries are kept).
+  - swap history: the last 7 days, older entries are cleaned up automatically (at most 1,000 kept).
 - **Commands:** switch Claude or Codex to the next account, move this workspace's agent to
-  another account, pause or resume, refresh usage.
-- **Settings** (Settings → Plugins → Account Rotator): every cux key (`thresholds`, `strategy`,
+  another account, pause or resume, refresh usage, install or remove the console status line.
+- **Console status line** (Claude panes): see below.
+- **Settings** (Settings → Plugins → Auto Hand-off): every cux key (`thresholds`, `strategy`,
   `auto_resume`, `auto_message`, `wait_for_reset`, `retry_on_api_error`, `model_fallback`, …) plus
   `chain`, `exclude`, `switch_back`, `switch_cooldown_minutes`, `min_headroom_gap`,
   `auto_swap_idle_after_seconds`, `default_cooldown_minutes`, `handoff_max_chars` and
@@ -109,6 +142,44 @@ automatic rotation and switch-back; picking them from the panel still works.
 `chain` example: `me@example.com, claude:*`. It orders the accounts *within* each service. Accounts
 are matched by email or by seat key (`claude:<id>`, `codex:system`); an email matches that address
 on every service, but each service keeps its own chain.
+
+## Console status line
+
+Orca points Claude Code's `statusLine` at its own hook, which feeds Orca's status bar and prints
+nothing, so a Claude pane in Orca shows no status line. *Auto Hand-off: Install the console
+status line in this workspace* writes a wrapper into the focused workspace's
+`.claude/settings.local.json` (project settings win over the user settings Orca manages). The
+wrapper still forwards every payload to Orca's hook, then prints one row per account of the pane's
+own service (a Claude pane lists the Claude accounts, never Codex):
+
+```
+▶ work          5h ██████░░  78%  7d ████████  96%  fable ████████  94%
+· personal      5h ████████ 100%  7d ████████ 100%  fable ████████ 100%
+· side          5h ░░░░░░░░   0%  7d ██████░░  81%  fable ██████░░  81%  ⏸1h20m
+```
+
+Every gauge is **percent left**: the 5-hour window, the 7-day window and the best model's weekly
+window, headed by that window's name as Orca reports it (`fableWeekly` → `fable`; `model` when
+Orca has none for that account). Green above 50 %, yellow from 50 down to 21, red at 20 or less,
+bold red at 0; a window without numbers shows `········  n/a`. `▶` and a bold label mark the
+account this pane runs on (from `CLAUDE_CONFIG_DIR`; its 5h/7d come from the live numbers Claude
+just reported); every other account gets a dim `·`, because Claude trims leading spaces off a row.
+`⏸1h20m` at the end of a row is a cooldown. Rows keep Orca's account order so they never jump. The
+name column shows the account email (or `system (email)` for the provider's own login); when every
+account of the service shares one domain the domain is dropped, otherwise the full address shows.
+The column is as wide as the longest name up to 15 characters; a longer name keeps its first 14
+and an `…`, so the start of the local part, which tells accounts apart, stays.
+
+Settings: *Console status line header* is an optional line above the rows (empty by default), with
+`{model}`, `{ctxbar}` (context-left gauge), `{ctx}` (context left %), `{5h}` and `{7d}` (this pane,
+% left), `{reset}` (time until the 5-hour window resets) and `{best}` (the best model's name); it
+ends with `⏸ switching paused` while automatic hand-off is off. *Console status line bar width*
+is the cells per gauge (8). The worker rewrites `~/.orca/account-rotator/status.tsv` whenever a
+seat changes and keeps the script at `~/.orca/account-rotator/claude-statusline.sh`; the line
+never runs the Orca CLI, so it stays well inside Claude's status line budget (about 40 ms with jq,
+which macOS ships; a sed fallback covers machines without it). *Remove the console status line
+from this workspace* restores whatever `statusLine` the file had before, and deletes the file when
+the wrapper was all it held.
 
 ## Provider notes
 
@@ -120,7 +191,9 @@ on every service, but each service keeps its own chain.
   routes to another backend (such as Ollama Cloud) reports billing limits as
   `stream disconnected … Add usage credits`, which the plugin treats as a rate limit.
 - **Antigravity, OpenCode, Devin:** move by handoff. OpenCode and Devin report no usage, so only
-  rate limits trigger a switch for them.
+  rate limits trigger a switch for them. Antigravity's own host login shows in the panel with its
+  usage even when no managed account exists, so you can watch it; with one account there is
+  nothing to switch to.
 
 ## Verified live (Orca 1.4.261)
 
@@ -177,6 +250,13 @@ Orca asks you to approve the plugin's access. Beyond the host API, the worker ru
 `git diff --stat`. It always uses an argument list, never a shell. The CLI is used because the host
 API cannot select accounts, and refuses to close or type into panes outside the focused workspace.
 
+For a project on a paired Orca server the worker loads Orca's own runtime client from the app
+bundle (`app.asar.unpacked/out/cli/runtime/client.js`) and calls that server's `accounts.*` RPCs
+(`accounts.list`, `accounts.selectClaude`, …) over the pairing saved on this computer, because the
+CLI's account commands only answer for this computer. Those modules are Orca internals, not a
+published API: an Orca update can break the server path, in which case the panel shows the error
+and this computer's accounts keep working.
+
 A handoff prompt (for services that cannot resume by session id) includes up to 40 lines of the
 previous agent's output, so treat it like any pasted terminal output.
 
@@ -187,7 +267,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 46 tests: adapters (real captured banners), selector, worker end to end, panel
+orca plugin test . --json        # 76 tests: adapters (real captured banners), selector, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

@@ -22,28 +22,36 @@ function snapshot(over: Partial<Snapshot> = {}): Snapshot {
   }
 }
 
-test('shows every seat with usage, cooldown and history; switching asks the worker', async () => {
-  const selected: string[] = []
+test('shows every seat with usage, cooldown and history; the panel never switches accounts', async () => {
   const host = mockHost({
     requests: {
       'rotator.snapshot': () => snapshot(),
-      'rotator.select': ({ seatKey }) => {
-        selected.push(seatKey)
-        return { message: `claude: new launches use ${seatKey}` }
-      },
       'rotator.clearCooldown': () => ({ ok: true as const }),
-      'rotator.pause': ({ paused }) => ({ paused })
+      'rotator.pause': ({ paused }) => ({ paused }),
+      'rotator.consoleLine': ({ enabled }) => {
+        if (typeof enabled === 'boolean') lineOn = enabled
+        return { installed: lineOn, workspace: 'app', ...(typeof enabled === 'boolean' ? { message: `line ${enabled ? 'on' : 'off'}` } : {}) }
+      }
     }
   })
+  let lineOn = false
   const view = await mount(panel, { host })
+  // Full labels in the panel; windows read as % left.
   assert.ok(view.find({ text: 'one@example.test' }))
+  assert.ok(view.find({ text: '93% left' }))
+  assert.ok(view.find({ text: 'Fable week' }) && view.find({ text: '81% left' }))
   assert.ok(view.find({ text: 'limited' }))
-  assert.ok(view.find({ text: /Usage unknown/ }))
-  await view.press({ text: 'Use for new claude launches' })
-  assert.deepEqual(selected, ['claude:c1'])
-  assert.ok(view.find({ text: /new launches use claude:c1/ }))
+  assert.ok(view.find({ text: /No usage yet/ }))
+  assert.ok(!view.find({ text: /Use for new/ }))
+  // The Claude console status line switch, for the focused workspace.
+  assert.equal(view.valueOf({ label: 'Status line' }), false)
+  await view.toggle({ label: 'Status line' })
+  assert.equal(lineOn, true)
+  assert.equal(view.valueOf({ label: 'Status line' }), true)
+  assert.ok(view.find({ text: /line on/ }))
   await view.select({ role: 'tablist' }, 'history')
-  assert.deepEqual(view.rowsOf({ type: 'Table' }).length, 1)
+  assert.equal(view.findAll({ text: /^resumed$/ }).length, 1)
+  assert.ok(view.find({ text: /one@example.test → two@example.test/ }))
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.refusals, [])
   await view.unmount()
@@ -65,7 +73,7 @@ test('worker pushes keep the panel current; waiting sessions are called out', as
   assert.ok(view.find({ text: /Waiting for a limit to reset/ }))
   await view.press({ text: 'Cancel' })
   assert.deepEqual(cancelled, ['t1'])
-  assert.equal(view.valueOf({ label: 'Automatic switching' }), false)
+  assert.equal(view.valueOf({ label: 'Automatic hand-off' }), false)
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
@@ -79,11 +87,16 @@ test('empty and error states', async () => {
   await view.unmount()
 })
 
-test('each service has its own auto-switch toggle', async () => {
+test('each service with more than one account has its own auto hand-off toggle', async () => {
   const calls: { provider: string; enabled: boolean }[] = []
+  const base = snapshot()
+  const twoCodex: Snapshot = {
+    ...base,
+    seats: [...base.seats, { key: 'codex:x2', provider: 'codex', accountId: 'x2', label: 'spare@example.test', active: false, usage: { known: false } }]
+  }
   const host = mockHost({
     requests: {
-      'rotator.snapshot': () => snapshot(),
+      'rotator.snapshot': () => twoCodex,
       'rotator.setService': ({ provider, enabled }) => {
         calls.push({ provider, enabled })
         return { services: { claude: true, codex: enabled, antigravity: true, opencode: true, devin: true } }
@@ -91,12 +104,112 @@ test('each service has its own auto-switch toggle', async () => {
     }
   })
   const view = await mount(panel, { host })
-  assert.equal(view.valueOf({ label: 'Auto-switch claude accounts' }), true)
-  await view.toggle({ label: 'Auto-switch codex accounts' })
+  assert.equal(view.valueOf({ label: 'Auto hand-off Claude' }), true)
+  await view.toggle({ label: 'Auto hand-off Codex' })
   assert.deepEqual(calls, [{ provider: 'codex', enabled: false }])
-  assert.equal(view.valueOf({ label: 'Auto-switch codex accounts' }), false)
-  assert.equal(view.valueOf({ label: 'Auto-switch claude accounts' }), true)
-  assert.ok(view.find({ text: /codex: automatic switching off/ }))
+  assert.equal(view.valueOf({ label: 'Auto hand-off Codex' }), false)
+  assert.equal(view.valueOf({ label: 'Auto hand-off Claude' }), true)
+  assert.ok(view.find({ text: /Codex: automatic hand-off off/ }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('services keep Orca’s order, except the one the user is working with comes first', async () => {
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snapshot({ focused: 'codex' }),
+      'rotator.consoleLine': () => ({ installed: false })
+    }
+  })
+  const view = await mount(panel, { host })
+  assert.deepEqual(view.findAll({ text: /^(CLAUDE|CODEX)$/ }).map((n) => n.text), ['CODEX', 'CLAUDE'])
+  // ...and is marked as the one behind the current terminal.
+  assert.equal(view.findAll({ text: /this terminal/ }).length, 1)
+})
+
+test('accounts in a service block: in use first, then by headroom, drained and limited last', async () => {
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () =>
+        snapshot({
+          seats: [
+            { key: 'claude:a', provider: 'claude', accountId: 'a', label: 'drained@example.test', active: false, usage: { known: true, session: { usedPercent: 95, resetsAt: NOW + 3_600_000 } } },
+            { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'half@example.test', active: false, usage: { known: true, session: { usedPercent: 50, resetsAt: NOW + 3_600_000 } } },
+            { key: 'claude:c', provider: 'claude', accountId: 'c', label: 'idle@example.test', active: false, usage: { known: false } },
+            { key: 'claude:d', provider: 'claude', accountId: 'd', label: 'limited@example.test', active: false, usage: { known: true, session: { usedPercent: 20, resetsAt: NOW + 3_600_000 } }, cooldownUntil: NOW + 3_600_000, cooldownReason: 'rate_limit' },
+            { key: 'claude:e', provider: 'claude', accountId: 'e', label: 'fresh@example.test', active: false, usage: { known: true, session: { usedPercent: 2, resetsAt: NOW + 3_600_000 } } },
+            { key: 'claude:f', provider: 'claude', accountId: 'f', label: 'active@example.test', active: true, usage: { known: true, session: { usedPercent: 80, resetsAt: NOW + 3_600_000 } } }
+          ]
+        }),
+      'rotator.consoleLine': () => ({ installed: false })
+    }
+  })
+  const view = await mount(panel, { host })
+  assert.deepEqual(
+    view.findAll({ text: /@example\.test$/ }).map((n) => n.text),
+    ['active@example.test', 'fresh@example.test', 'half@example.test', 'idle@example.test', 'limited@example.test', 'drained@example.test']
+  )
+})
+
+test('a service with a single account shows no auto hand-off toggle', async () => {
+  const host = mockHost({ requests: { 'rotator.snapshot': () => snapshot(), 'rotator.consoleLine': () => ({ installed: false }) } })
+  const view = await mount(panel, { host })
+  // The fixture's Codex has one account; Claude has two.
+  assert.ok(view.find({ label: 'Auto hand-off Claude' }))
+  assert.ok(!view.find({ label: 'Auto hand-off Codex' }))
+  assert.ok(view.find({ text: 'plus@example.test' }))
+})
+
+test('a standby offers Hand off, asks first, and the block then says automatic hand-off is off', async () => {
+  const calls: string[] = []
+  let auto = true
+  const seats: Snapshot['seats'] = [
+    { key: 'claude:a', provider: 'claude', accountId: 'a', label: 'inuse@example.test', active: true, usage: { known: true, session: { usedPercent: 50, resetsAt: NOW + 3_600_000 } } },
+    { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'spare@example.test', active: false, usage: { known: true, session: { usedPercent: 5, resetsAt: NOW + 3_600_000 } } }
+  ]
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snapshot({ seats, services: { claude: auto, codex: true, antigravity: true, opencode: true, devin: true } }),
+      'rotator.consoleLine': () => ({ installed: false }),
+      'rotator.switchTo': ({ seatKey }) => {
+        calls.push(`switch ${seatKey}`)
+        auto = false
+        return { message: 'Claude: new launches use spare@example.test. Automatic hand-off for Claude is now off' }
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  // Only the standby can be chosen; the account in use has no such button.
+  assert.equal(view.findAll({ text: 'Hand off' }).length, 1)
+  assert.ok(!view.find({ text: /Hand off Claude to spare@example.test/ }))
+  assert.ok(!view.find({ text: /Automatic hand-off for Claude is off/ }))
+  await view.press({ text: 'Hand off' })
+  assert.ok(view.find({ text: 'Hand off Claude to spare@example.test?' }))
+  assert.ok(view.find({ text: 'New Claude sessions will start on this account.' }))
+  assert.ok(view.find({ text: 'The session in this tab moves too if it is idle; a busy one stays where it is.' }))
+  assert.ok(view.find({ text: "Auto hand-off for Claude turns off, so it won't switch back on its own." }))
+  // Cancel backs out without switching.
+  await view.press({ text: 'Cancel' })
+  assert.ok(!view.find({ text: /Hand off Claude to spare@example.test/ }))
+  assert.deepEqual(calls, [])
+  await view.press({ text: 'Hand off' })
+  await view.press({ text: 'Hand off' })
+  assert.deepEqual(calls, ['switch claude:b'])
+  assert.ok(view.find({ text: /new launches use/ }))
+  assert.ok(view.find({ text: /Automatic hand-off for Claude is off/ }))
+  assert.equal(view.valueOf({ label: 'Auto hand-off Claude' }), false)
+})
+
+test('a project on an SSH target: the panel says Orca manages no accounts there', async () => {
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snapshot({ sshHost: 'build-box' }),
+      'rotator.consoleLine': () => ({ installed: false })
+    }
+  })
+  const view = await mount(panel, { host })
+  assert.ok(view.find({ text: /SSH target build-box/ }))
+  assert.ok(view.find({ text: /Orca manages no accounts there/ }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })

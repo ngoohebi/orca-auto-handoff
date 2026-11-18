@@ -2,9 +2,11 @@
 // Every side effect goes through Deps so tests run it with a fake host, CLI and clock.
 import { ADAPTERS, CHROME, classify, countCopies, hasDraft, parseModelFallback } from './adapters'
 import { parseAccounts, type AccountView } from './accounts'
+import { PROVIDER_NAME } from './labels'
 import { buildChain, earliestReset, enoughGap, isEligible, overThreshold, pickNext, preferredOver } from './selector'
 import {
   HISTORY_CAP,
+  HISTORY_MAX_AGE_MS,
   PROVIDERS,
   allServices,
   emptyState,
@@ -23,14 +25,20 @@ import {
 export type HostLike = { call(method: string, params?: unknown): Promise<any> }
 
 export type Cli = {
-  /** `orca account list --json` → its `result`. */
-  listAccounts(): Promise<Record<string, any>>
-  select(provider: Provider, accountId: string): Promise<void>
+  /** `orca account list --json` → its `result` (on `server` when the project runs on a remote Orca server). */
+  listAccounts(server?: string): Promise<Record<string, any>>
+  select(provider: Provider, accountId: string, server?: string): Promise<void>
   /** `orca terminal close`, which also closes terminals outside the focused workspace. */
-  closeTerminal(terminalId: string): Promise<void>
+  closeTerminal(terminalId: string, server?: string): Promise<void>
   /** `orca terminal send --enter`, which also reaches terminals outside the focused workspace. */
-  sendText(terminalId: string, text: string): Promise<void>
+  sendText(terminalId: string, text: string, server?: string): Promise<void>
   git(cwd: string, args: string[]): Promise<string>
+  /** The terminals in the active tab of every workspace (`orca terminal list
+   *  --include-visual-layouts`); the host API does not say which pane is focused. */
+  activeTerminals?(server?: string): Promise<string[]>
+  /** Resolves a workspace's host (`runtime:<env>` or `local`) from the desktop's paired-server
+   *  catalog when local `workspace.list` / `project.list` does not carry the paired server's rows. */
+  workspaceServer?(workspaceId?: string): Promise<string | undefined>
 }
 
 export type Deps = {
@@ -55,6 +63,11 @@ export type PaneInfo = {
   agentId?: string
   sessionId?: string
   title?: string
+  /** Remote Orca server (`environmentId` from `runtime:<environmentId>`) when the workspace is not on `local`. */
+  server?: string
+  /** Direct SSH target (`ssh:<target>`) the workspace runs on. Agents there use that machine's
+   *  own login: Orca manages no accounts for it, so the plugin never switches such a pane. */
+  sshHost?: string
 }
 
 export type StatusEvent = {
@@ -85,23 +98,77 @@ export function backoffMs(attempt: number): number {
   return Math.min(a * 5000, 120_000)
 }
 
+/** Turns an Orca `hostId` (`local`, `ssh:…`, `runtime:<encodedEnv>`) into the remote Orca server's
+ *  `environmentId`, or `undefined` when accounts belong to this computer's local Orca runtime. */
+export function parseServer(hostId: string | null | undefined): string | undefined {
+  const raw = hostId?.trim()
+  if (!raw || raw === 'local' || raw === 'all' || raw === 'runtime:unresolved-owner' || raw.startsWith('ssh:')) {
+    return undefined
+  }
+  if (raw.startsWith('runtime:')) {
+    const encoded = raw.slice('runtime:'.length)
+    if (!encoded || encoded.includes('|')) return undefined
+    try {
+      const decoded = decodeURIComponent(encoded).trim()
+      return decoded && decoded !== 'unresolved-owner' ? decoded : undefined
+    } catch {
+      return undefined
+    }
+  }
+  return raw
+}
+
+/** The SSH target id of an `ssh:<encodedTarget>` host; undefined for any other host. */
+export function parseSshTarget(hostId: string | null | undefined): string | undefined {
+  const raw = hostId?.trim()
+  if (!raw || !raw.startsWith('ssh:')) return undefined
+  const encoded = raw.slice('ssh:'.length)
+  if (!encoded) return undefined
+  try {
+    return decodeURIComponent(encoded).trim() || undefined
+  } catch {
+    return undefined
+  }
+}
+
+function hostFromWorkspaceIdentity(id: string | null | undefined): string | undefined {
+  if (!id) return undefined
+  const m = id.match(/^(?:identity:)?wt2:([^:]+):/)
+  if (!m?.[1]) return undefined
+  try {
+    return decodeURIComponent(m[1])
+  } catch {
+    return undefined
+  }
+}
+
+type ServerView = { view: AccountView; at: number; error?: string }
+
 export class Rotator {
   state: RotatorState = emptyState()
   private view: AccountView | null = null
   private viewAt = 0
   private viewError: string | undefined
+  private views = new Map<string, ServerView>()
   private locks = new Map<Provider, Promise<unknown>>()
   private inflight = new Set<string>()
-  /** Services with automatic switching on (from settings). */
+  /** Services with automatic hand-off on (from settings). */
   services: Record<Provider, boolean> = allServices(true)
   /** The last few status events, for `rotator.debug`. */
   recentEvents: StatusEvent[] = []
+  /** See `Snapshot.focused`. */
+  focused: Provider | undefined
+  /** Remote Orca server (`environmentId`) of the currently focused project/workspace, or `undefined` for `local`. */
+  server: string | undefined
+  /** SSH target of the focused project when it runs on a direct SSH host (see `PaneInfo.sshHost`). */
+  sshHost: string | undefined
 
   constructor(private deps: Deps) {}
 
   async init(): Promise<void> {
     const saved = await this.deps.loadState()
     this.state = { ...emptyState(), ...(saved ?? {}) }
+    if (this.pruneHistory()) await this.deps.saveState(this.state)
     await this.refreshServices(false)
   }
 
@@ -110,10 +177,16 @@ export class Rotator {
     if (publish) this.publishNow()
   }
 
+  /** Keeps the last 7 days of history (and at most HISTORY_CAP entries). True when it dropped any. */
+  private pruneHistory(): boolean {
+    const cutoff = this.deps.now() - HISTORY_MAX_AGE_MS
+    const before = this.state.history.length
+    this.state.history = this.state.history.filter((h) => h.at >= cutoff).slice(-HISTORY_CAP)
+    return this.state.history.length !== before
+  }
+
   private async save(): Promise<void> {
-    if (this.state.history.length > HISTORY_CAP) {
-      this.state.history = this.state.history.slice(-HISTORY_CAP)
-    }
+    this.pruneHistory()
     const seenKeys = Object.keys(this.state.seen)
     if (seenKeys.length > 500) {
       for (const k of seenKeys.slice(0, seenKeys.length - 500)) delete this.state.seen[k]
@@ -125,27 +198,177 @@ export class Rotator {
     this.state.history.push({ at: this.deps.now(), ...entry })
   }
 
-  // ---- accounts ---------------------------------------------------------------------------
+  // ---- server & accounts ------------------------------------------------------------------
+
+  /** Resolves which Orca server (`environmentId`, or `undefined` for `local`) owns `workspaceId`. */
+  async serverOfWorkspace(workspaceId?: string | null, workspaceListId?: string | null): Promise<string | undefined> {
+    for (const id of [workspaceListId, workspaceId]) {
+      const host = hostFromWorkspaceIdentity(id)
+      if (host === 'local') return undefined
+      const srv = parseServer(host)
+      if (srv) return srv
+    }
+    if (!workspaceId && !workspaceListId) return undefined
+    const sep = workspaceId ? workspaceId.indexOf('::') : -1
+    const repoId = sep > 0 && workspaceId ? workspaceId.slice(0, sep) : undefined
+    const worktreePath = sep > 0 && workspaceId ? workspaceId.slice(sep + 2) : undefined
+    let matchedWorkspace: any
+    let projectId: string | undefined = repoId
+    try {
+      const { workspaces } = await this.deps.host.call('workspace.list')
+      if (Array.isArray(workspaces)) {
+        matchedWorkspace =
+          workspaces.find((w: any) => (workspaceId && w.id === workspaceId) || (workspaceListId && w.id === workspaceListId)) ??
+          (repoId
+            ? workspaces.find((w: any) => w.projectId === repoId && worktreePath && w.path === worktreePath) ??
+              workspaces.find((w: any) => w.projectId === repoId)
+            : undefined)
+        if (matchedWorkspace) {
+          if (matchedWorkspace.hostId === 'local') return undefined
+          const srv = parseServer(matchedWorkspace.hostId)
+          if (srv) return srv
+          if (typeof matchedWorkspace.projectId === 'string') projectId = matchedWorkspace.projectId
+        }
+      }
+    } catch {
+      // Fall through to project.list / CLI catalog.
+    }
+    if (projectId) {
+      try {
+        const { projects } = await this.deps.host.call('project.list')
+        if (Array.isArray(projects)) {
+          const project =
+            projects.find((p: any) => p.id === projectId && worktreePath && typeof p.path === 'string' && worktreePath.startsWith(p.path)) ??
+            projects.find((p: any) => p.id === projectId)
+          if (project) {
+            if (project.hostId === 'local') return undefined
+            const srv = parseServer(project.hostId)
+            if (srv) return srv
+            return undefined
+          }
+        }
+      } catch {
+        // `project.list` may not be mocked in tests or available.
+      }
+    }
+    if (matchedWorkspace) return undefined
+    try {
+      return parseServer(await this.deps.cli.workspaceServer?.(workspaceId ?? undefined))
+    } catch {
+      return undefined
+    }
+  }
+
+  /** The SSH target a workspace runs on (`ssh:<target>` on its `workspace.list` row, else on its
+   *  project), or undefined when it runs on this Orca or a paired server. */
+  async sshTargetOfWorkspace(workspaceId?: string | null): Promise<string | undefined> {
+    if (!workspaceId) return undefined
+    try {
+      const { workspaces } = await this.deps.host.call('workspace.list')
+      const ws = Array.isArray(workspaces) ? workspaces.find((w: any) => w.id === workspaceId) : undefined
+      const fromWorkspace = parseSshTarget(ws?.hostId)
+      if (fromWorkspace) return fromWorkspace
+      if (typeof ws?.hostId === 'string' && ws.hostId) return undefined
+      const sep = workspaceId.indexOf('::')
+      const projectId: string | undefined = ws?.projectId ?? (sep > 0 ? workspaceId.slice(0, sep) : undefined)
+      if (!projectId) return undefined
+      const { projects } = await this.deps.host.call('project.list')
+      const project = Array.isArray(projects) ? projects.find((p: any) => p.id === projectId) : undefined
+      return parseSshTarget(project?.hostId)
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Resolves the Orca server of the currently focused project/workspace (`undefined` for `local`). */
+  async currentServer(): Promise<string | undefined> {
+    try {
+      const context = await this.deps.host.call('workspace.readContext')
+      if (context?.workspaceId) {
+        return await this.serverOfWorkspace(context.workspaceId)
+      }
+      if (context?.displayName) {
+        const { workspaces } = await this.deps.host.call('workspace.list').catch(() => ({ workspaces: [] }))
+        const ws = Array.isArray(workspaces)
+          ? workspaces.find((w: any) => w.name === context.displayName && (!context.branch || w.branch === context.branch)) ??
+            workspaces.find((w: any) => w.name === context.displayName)
+          : undefined
+        if (ws) return await this.serverOfWorkspace(ws.id)
+      }
+    } catch {
+      // Ignore context lookup failures.
+    }
+    try {
+      return parseServer(await this.deps.cli.workspaceServer?.())
+    } catch {
+      return undefined
+    }
+  }
 
   async accounts(force = false): Promise<AccountView> {
+    const server = await this.currentServer()
+    this.server = server
+    return this.accountsFor(server, force)
+  }
+
+  private async accountsFor(server: string | undefined, force = false): Promise<AccountView> {
     const config = await this.deps.config()
-    const fresh = this.deps.now() - this.viewAt < config.pollIntervalSeconds * 1000
-    if (this.view && fresh && !force) return this.view
-    try {
-      this.view = parseAccounts(await this.deps.cli.listAccounts())
-      this.viewAt = this.deps.now()
-      this.viewError = undefined
-    } catch (error) {
-      this.viewError = `orca account list failed: ${String((error as Error)?.message ?? error)}`
-      this.deps.log(this.viewError)
-      if (!this.view) this.view = { seats: [], active: {} }
+    const key = server ?? 'local'
+    const current = this.views.get(key)
+    const fresh = current && this.deps.now() - current.at < config.pollIntervalSeconds * 1000
+    if (current && fresh && !force) {
+      if (server === this.server) {
+        this.view = current.view
+        this.viewAt = current.at
+        this.viewError = current.error
+      }
+      return current.view
     }
-    return this.view
+    let nextView = current?.view ?? null
+    let nextAt = current?.at ?? 0
+    let nextError: string | undefined
+    try {
+      const raw = server ? await this.deps.cli.listAccounts(server) : await this.deps.cli.listAccounts()
+      nextView = parseAccounts(raw)
+      nextAt = this.deps.now()
+      nextError = undefined
+    } catch (error) {
+      nextError = `orca account list failed: ${String((error as Error)?.message ?? error)}`
+      this.deps.log(nextError)
+      if (!nextView) nextView = { seats: [], active: {} }
+    }
+    const entry: ServerView = { view: nextView, at: nextAt }
+    if (nextError) entry.error = nextError
+    this.views.set(key, entry)
+    if (server === this.server) {
+      this.view = nextView
+      this.viewAt = nextAt
+      this.viewError = nextError
+    }
+    return nextView
+  }
+
+  private selectOn(provider: Provider, accountId: string, server?: string): Promise<void> {
+    return server ? this.deps.cli.select(provider, accountId, server) : this.deps.cli.select(provider, accountId)
+  }
+
+  private closeOn(terminalId: string, server?: string): Promise<void> {
+    return server ? this.deps.cli.closeTerminal(terminalId, server) : this.deps.cli.closeTerminal(terminalId)
+  }
+
+  private sendOn(terminalId: string, text: string, server?: string): Promise<void> {
+    return server ? this.deps.cli.sendText(terminalId, text, server) : this.deps.cli.sendText(terminalId, text)
+  }
+
+  private activeTerminalsOn(server?: string): Promise<string[]> {
+    const fn = this.deps.cli.activeTerminals
+    if (!fn) return Promise.resolve([])
+    return (server ? fn.call(this.deps.cli, server) : fn.call(this.deps.cli)).catch(() => [] as string[])
   }
 
   /** The cached view without a CLI call; for hooks, which must answer within 2 s. */
   cachedView(): AccountView | null {
-    return this.view
+    return this.views.get(this.server ?? 'local')?.view ?? this.view
   }
 
   private seatOf(terminalId: string, provider: Provider, view: AccountView): Seat | undefined {
@@ -182,18 +405,56 @@ export class Rotator {
   // ---- events -----------------------------------------------------------------------------
 
   /** `agent.launch.before`: remember which seat a new pane starts on. */
-  noteLaunch(agent: string, terminalId: string | undefined): void {
+  noteLaunch(agent: string, terminalId: string | undefined, workspaceId?: string | null): void {
     const provider = providerOf(agent)
-    if (!provider || !terminalId || !this.view) return
-    const key = this.view.active[provider]
+    if (!provider || !terminalId) return
+    const hostServer = parseServer(hostFromWorkspaceIdentity(workspaceId))
+    const view = (hostServer ? this.views.get(hostServer)?.view : undefined) ?? this.cachedView()
+    if (!view) return
+    const key = view.active[provider]
     if (key) {
       this.state.paneSeat[terminalId] = key
       void this.save()
     }
   }
 
+  /** Re-reads which project server and which agent the user is working with: the agent in the
+   *  focused workspace's active terminal tab (from the CLI's layout listing); failing that, the
+   *  agent whose state changed last, since the host API names the focused workspace but not the
+   *  focused pane. Returns whether the focused server or agent moved. */
+  async refreshFocus(): Promise<boolean> {
+    const nextServer = await this.currentServer()
+    const serverMoved = nextServer !== this.server
+    if (serverMoved) {
+      this.server = nextServer
+      await this.accountsFor(nextServer)
+    }
+    const context = await this.deps.host.call('workspace.readContext').catch(() => null)
+    const nextSsh = await this.sshTargetOfWorkspace(context?.workspaceId)
+    const sshMoved = nextSsh !== this.sshHost
+    this.sshHost = nextSsh
+    let next: Provider | undefined
+    try {
+      const [{ agents }, active] = await Promise.all([
+        this.deps.host.call('agents.list'),
+        this.activeTerminalsOn(nextServer)
+      ])
+      const candidates = agents.filter((a: any) => providerOf(a.agent))
+      const inActiveTab = candidates.find((a: any) => a.terminalId && active.includes(a.terminalId))
+      const latest = [...candidates].sort((a: any, b: any) => (b.stateStartedAt ?? 0) - (a.stateStartedAt ?? 0))[0]
+      const pick = inActiveTab ?? latest
+      next = pick ? providerOf(pick.agent) ?? undefined : undefined
+    } catch {
+      next = undefined
+    }
+    if (next === this.focused) return serverMoved || sshMoved
+    this.focused = next
+    return true
+  }
+
   async onAgentStatus(event: StatusEvent): Promise<void> {
     this.recentEvents = [...this.recentEvents.slice(-9), event]
+    if (await this.refreshFocus()) this.publishNow()
     if (!event.terminalId) return
     const state = event.state
     if (state !== 'done' && state !== 'waiting') return
@@ -233,6 +494,10 @@ export class Rotator {
       if (sessionId) pane.sessionId = sessionId
       const title = row.title ?? event.title
       if (title) pane.title = title
+      const server = await this.serverOfWorkspace(workspaceId, event.workspaceListId)
+      if (server) pane.server = server
+      const sshHost = await this.sshTargetOfWorkspace(workspaceId)
+      if (sshHost) pane.sshHost = sshHost
       return pane
     }
     return null
@@ -276,6 +541,22 @@ export class Rotator {
     // it is a resumed pane that has not redrawn its transcript yet (live: the redraw can come
     // after the pane reports ready); forgetting the banner then would make the redraw look new.
     if (truncated || lines.length >= 80) this.recount(key, lines)
+    if (pane.sshHost && signal?.kind !== 'api_error') {
+      // The agent runs on a direct SSH target with that machine's own login. This Orca's managed
+      // accounts neither apply there nor can be selected there, so the pane is left alone; a
+      // limit is noted once in the history so the user knows why nothing moved. (An API error
+      // falls through: retrying in place only types into the pane.)
+      if (signal && this.isNew(key, signal)) {
+        this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences, line: signal.line }
+        const detail = `runs on SSH target ${pane.sshHost}: Orca manages no accounts there`
+        this.record({ provider: pane.agent, terminalId: pane.terminalId, reason: signal.kind, result: 'failed', detail })
+        await this.save()
+        this.deps.log(`${pane.agent} ${pane.terminalId}: ${signal.kind} — ${detail}`)
+        await this.deps.notify('Auto Hand-off', `${PROVIDER_NAME[pane.agent]} hit a limit on SSH target ${pane.sshHost}; Orca manages no accounts there, so the pane was left alone.`)
+        this.publishNow()
+      }
+      return
+    }
     if (observeOnly || !config.services[pane.agent]) {
       // Paused or service off: record what is on screen without acting on it.
       if (signal && this.isNew(key, signal)) {
@@ -293,7 +574,7 @@ export class Rotator {
         await this.save()
         this.publishNow()
       }
-      const view = await this.accounts()
+      const view = await this.accountsFor(pane.server)
       const seat = this.seatOf(pane.terminalId, pane.agent, view)
       if (config.autoSwitchOnThreshold && seat && overThreshold(seat, config, this.deps.now())) {
         await this.swap(pane, 'threshold', lines)
@@ -327,7 +608,7 @@ export class Rotator {
     if (attempt >= config.maxApiRetries) {
       this.record({ provider: pane.agent, terminalId: pane.terminalId, reason: 'api_error', result: 'failed', detail: `gave up after ${attempt} retries` })
       await this.save()
-      await this.deps.notify('Account Rotator', `${pane.agent}: API errors persist after ${attempt} retries.`)
+      await this.deps.notify('Auto Hand-off', `${pane.agent}: API errors persist after ${attempt} retries.`)
       this.publishNow()
       return
     }
@@ -335,7 +616,7 @@ export class Rotator {
     await this.save()
     await this.deps.sleep(backoffMs(attempt))
     if (!(await this.allowed(pane.agent))) return
-    await this.type(pane.terminalId, config.autoMessage || 'continue')
+    await this.type(pane.terminalId, config.autoMessage || 'continue', pane.server)
     this.record({ provider: pane.agent, terminalId: pane.terminalId, reason: 'api_error', result: 'retried', detail: `attempt ${attempt + 1}` })
     await this.save()
     this.publishNow()
@@ -350,9 +631,9 @@ export class Rotator {
     if (!adapter.modelSwitch || step >= models.length) return false
     const model = models[step]!
     this.state.modelStep[pane.terminalId] = step + 1
-    await this.type(pane.terminalId, adapter.modelSwitch(model))
+    await this.type(pane.terminalId, adapter.modelSwitch(model), pane.server)
     await this.deps.sleep(1500)
-    if (config.autoMessage) await this.type(pane.terminalId, config.autoMessage)
+    if (config.autoMessage) await this.type(pane.terminalId, config.autoMessage, pane.server)
     this.record({ provider: pane.agent, terminalId: pane.terminalId, reason: 'model_cap', result: 'model', detail: `${signal.model ?? 'model'} capped → ${model}` })
     await this.save()
     this.publishNow()
@@ -362,10 +643,10 @@ export class Rotator {
   private async limitHit(pane: PaneInfo, signal: Signal, config: Config, lines: string[], reason: SwapReason): Promise<void> {
     if (!config.autoSwitchOnRateLimit) {
       await this.withLock(pane.agent, async () => {
-        const view = await this.accounts(true)
+        const view = await this.accountsFor(pane.server, true)
         const at = this.locate(pane.terminalId, pane.agent, view)
         if (at.seat && (at.known || this.plausiblyLimited(at.seat))) await this.coolDown(at.seat, signal, config, reason)
-        await this.deps.notify('Account Rotator', `${pane.agent} hit a limit on ${at.seat?.label ?? 'its account'}; switching on rate limit is off.`)
+        await this.deps.notify('Auto Hand-off', `${pane.agent} hit a limit on ${at.seat?.label ?? 'its account'}; switching on rate limit is off.`)
         this.publishNow()
       })
       return
@@ -431,7 +712,7 @@ export class Rotator {
       const base = await this.deps.config()
       // A manual move works under the manual strategy too.
       const config: Config = reason === 'manual' && base.strategy === 'manual' ? { ...base, strategy: 'drain' } : base
-      const view = await this.accounts(true)
+      const view = await this.accountsFor(pane.server, true)
       const now = this.deps.now()
       const at = this.locate(pane.terminalId, pane.agent, view)
       let from = at.seat
@@ -505,7 +786,7 @@ export class Rotator {
       if (!(await this.allowed(pane.agent))) return
       const config = await this.deps.config()
       if (!config.switchBack) return
-      const view = await this.accounts()
+      const view = await this.accountsFor(pane.server)
       const now = this.deps.now()
       const at = this.locate(pane.terminalId, pane.agent, view)
       if (!at.seat) return
@@ -522,7 +803,7 @@ export class Rotator {
     if (config.strategy === 'manual' || !config.waitForReset) {
       this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', ...(from ? { from: from.key } : {}), detail: config.strategy === 'manual' ? 'manual strategy' : 'no healthy seat' })
       await this.save()
-      await this.deps.notify('Account Rotator', `${pane.agent}: no healthy account to switch to.`)
+      await this.deps.notify('Auto Hand-off', `${pane.agent}: no healthy account to switch to.`)
       this.publishNow()
       return
     }
@@ -531,10 +812,11 @@ export class Rotator {
     if (pane.sessionId) entry.sessionId = pane.sessionId
     if (pane.agentId) entry.agentId = pane.agentId
     if (from) entry.fromSeat = from.key
+    if (pane.server) entry.server = pane.server
     this.state.waiting = [...this.state.waiting.filter((w) => w.terminalId !== pane.terminalId), entry]
     this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'waiting', ...(from ? { from: from.key } : {}), detail: `until ${new Date(wakeAt).toISOString()}` })
     await this.save()
-    await this.deps.notify('Account Rotator', `Every ${pane.agent} account is exhausted; resuming at ${new Date(wakeAt).toLocaleString()}.`)
+    await this.deps.notify('Auto Hand-off', `Every ${pane.agent} account is exhausted; resuming at ${new Date(wakeAt).toLocaleString()}.`)
     this.publishNow()
   }
 
@@ -552,7 +834,7 @@ export class Rotator {
     const agentId = pane.agentId ?? pane.agent
     try {
       if (view.active[target.provider] !== target.key) {
-        await this.deps.cli.select(target.provider, target.accountId)
+        await this.selectOn(target.provider, target.accountId, pane.server)
         view.active[target.provider] = target.key
         for (const s of view.seats) if (s.provider === target.provider) s.active = s.key === target.key
         this.noteSelectionChange(target.provider, reason, this.deps.now())
@@ -563,7 +845,7 @@ export class Rotator {
         this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'selected', ...(from ? { from: from.key } : {}), to: target.key, detail: 'auto_resume off' })
         await this.save()
         this.publishNow()
-        await this.deps.notify('Account Rotator', `${pane.agent}: new launches now use ${target.label}. Resume the session yourself (auto resume is off).`)
+        await this.deps.notify('Auto Hand-off', `${pane.agent}: new launches now use ${target.label}. Resume the session yourself (auto resume is off).`)
         return
       }
       let newTerminal: string
@@ -610,9 +892,9 @@ export class Rotator {
       if (canResume) {
         await this.waitReady(newTerminal, pane.workspaceId)
         await this.seedSeen(newTerminal, pane.agent, pane.sessionId)
-        if (config.autoMessage) await this.type(newTerminal, config.autoMessage)
+        if (config.autoMessage) await this.type(newTerminal, config.autoMessage, pane.server)
       }
-      await this.deps.notify('Account Rotator', `${pane.agent}: ${from?.label ?? 'account'} → ${target.label} (${reason}).`)
+      await this.deps.notify('Auto Hand-off', `${pane.agent}: ${from?.label ?? 'account'} → ${target.label} (${reason}).`)
     } catch (error) {
       const message = String((error as Error)?.message ?? error)
       this.deps.log(`swap failed: ${message}`)
@@ -627,7 +909,7 @@ export class Rotator {
       }
       this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', ...(from ? { from: from.key } : {}), to: target.key, detail: message.slice(0, 200) })
       await this.save()
-      await this.deps.notify('Account Rotator', `Swap to ${target.label} failed: ${message}`)
+      await this.deps.notify('Auto Hand-off', `Swap to ${target.label} failed: ${message}`)
       this.publishNow()
     }
   }
@@ -662,7 +944,7 @@ export class Rotator {
     } catch {
       // Refused outside the focused workspace; the CLI has no such limit.
       try {
-        await this.deps.cli.closeTerminal(pane.terminalId)
+        await this.closeOn(pane.terminalId, pane.server)
       } catch (error) {
         failure = String((error as Error)?.message ?? error)
       }
@@ -687,7 +969,7 @@ export class Rotator {
     }
   }
 
-  private async type(terminalId: string, text: string): Promise<void> {
+  private async type(terminalId: string, text: string, server?: string): Promise<void> {
     try {
       const { accepted } = await this.deps.host.call('terminal.sendText', { terminalId, text, enter: true })
       if (accepted) return
@@ -695,7 +977,7 @@ export class Rotator {
       // Live Orca refuses plugin sends outside the focused workspace ("terminal is outside the
       // active worktree"); the CLI has no such limit.
     }
-    await this.deps.cli.sendText(terminalId, text)
+    await this.sendOn(terminalId, text, server)
     this.deps.log(`typed via orca CLI into ${terminalId}: ${text.slice(0, 40)}`)
   }
 
@@ -741,7 +1023,7 @@ export class Rotator {
     this.services = { ...config.services }
     const view = await this.accounts()
     const now = this.deps.now()
-    let changed = false
+    let changed = this.pruneHistory()
     for (const [key, h] of Object.entries(this.state.health)) {
       if (h.cooldownUntil && h.cooldownUntil <= now) {
         delete this.state.health[key]
@@ -752,13 +1034,16 @@ export class Rotator {
     if (!this.state.paused) {
       for (const w of [...this.state.waiting]) {
         if (!config.services[w.agent]) continue
-        const chain = buildChain(view.seats, w.agent, config)
+        const wServer = w.server ?? (await this.serverOfWorkspace(w.workspaceId))
+        const wView = wServer === this.server ? view : await this.accountsFor(wServer)
+        const chain = buildChain(wView.seats, w.agent, config)
         const ready = w.wakeAt <= now || pickNext(chain, undefined, this.state.health, config, now)
         if (ready) await this.wake(w)
       }
       await this.reselectPreferred(config)
       await this.sweepIdle(config)
     }
+    await this.refreshFocus()
     this.publishNow()
   }
 
@@ -766,22 +1051,23 @@ export class Rotator {
    *  it, so the next launch uses it. Panes follow when they finish a turn or sit idle. */
   private async reselectPreferred(config: Config): Promise<void> {
     if (!config.switchBack) return
+    const server = this.server
     for (const provider of PROVIDERS) {
       if (!config.services[provider]) continue
-      const view = await this.accounts()
+      const view = await this.accountsFor(server)
       const chain = buildChain(view.seats, provider, config)
       const now = this.deps.now()
       if (!preferredOver(chain, view.active[provider], this.state.health, config, now)) continue
       if (!this.canChangeSelection(provider, config, now)) continue
       await this.withLock(provider, async () => {
         if (!(await this.allowed(provider))) return
-        const fresh = await this.accounts(true)
+        const fresh = await this.accountsFor(server, true)
         const chain = buildChain(fresh.seats, provider, config)
         const from = fresh.active[provider]
         const preferred = preferredOver(chain, from, this.state.health, config, this.deps.now())
         if (!preferred) return
         try {
-          await this.deps.cli.select(provider, preferred.accountId)
+          await this.selectOn(provider, preferred.accountId, server)
         } catch (error) {
           const message = String((error as Error)?.message ?? error)
           this.deps.log(`switch back failed: ${message}`)
@@ -794,7 +1080,7 @@ export class Rotator {
         this.noteSelectionChange(provider, 'switch_back', this.deps.now())
         this.record({ provider, reason: 'switch_back', result: 'selected', ...(from ? { from } : {}), to: preferred.key })
         await this.save()
-        await this.deps.notify('Account Rotator', `${provider}: ${preferred.label} is available again; new launches use it.`)
+        await this.deps.notify('Auto Hand-off', `${PROVIDER_NAME[provider]}: ${preferred.label} is available again; new launches use it.`)
         this.publishNow()
       })
     }
@@ -805,7 +1091,7 @@ export class Rotator {
    *  turn. Only looked at when some seat gives a reason to. */
   private async sweepIdle(config: Config): Promise<void> {
     if (config.autoSwapIdleAfterSeconds <= 0) return
-    const view = await this.accounts()
+    const view = await this.accountsFor(this.server)
     const now = this.deps.now()
     const due = PROVIDERS.filter((p) => {
       if (!config.services[p]) return false
@@ -818,7 +1104,7 @@ export class Rotator {
       )
     })
     if (due.length === 0) return
-    let workspaces: { id: string }[]
+    let workspaces: { id: string; hostId?: string | null }[]
     try {
       workspaces = (await this.deps.host.call('workspace.list')).workspaces
     } catch {
@@ -826,27 +1112,32 @@ export class Rotator {
     }
     const idleMs = config.autoSwapIdleAfterSeconds * 1000
     for (const ws of workspaces) {
+      // Panes on a direct SSH target use that machine's own login: nothing to move them to.
+      if (await this.sshTargetOfWorkspace(ws.id)) continue
       let agents: any[]
       try {
         agents = (await this.deps.host.call('agents.list', { workspaceId: ws.id })).agents
       } catch {
         continue
       }
+      const wsServer = parseServer(ws.hostId) ?? (await this.serverOfWorkspace(ws.id))
+      const wsView = wsServer === this.server ? view : await this.accountsFor(wsServer)
       for (const row of agents) {
         const agent = providerOf(row.agent)
         if (!agent || !row.terminalId || !due.includes(agent)) continue
         if (row.state !== 'waiting' && row.state !== 'done') continue
         if (now - (row.stateStartedAt ?? now) < idleMs) continue
         if (this.inflight.has(row.terminalId) || this.state.waiting.some((w) => w.terminalId === row.terminalId)) continue
-        const seat = this.seatOf(row.terminalId, agent, view)
+        const seat = this.seatOf(row.terminalId, agent, wsView)
         if (!seat) continue
-        const chain = buildChain(view.seats, agent, config)
+        const chain = buildChain(wsView.seats, agent, config)
         const over = config.autoSwitchOnThreshold && overThreshold(seat, config, now)
         if (!over && !preferredOver(chain, seat.key, this.state.health, config, now)) continue
         const pane: PaneInfo = { terminalId: row.terminalId, workspaceId: ws.id, agent }
         if (row.agent !== agent) pane.agentId = row.agent
         if (row.sessionId) pane.sessionId = row.sessionId
         if (row.title) pane.title = row.title
+        if (wsServer) pane.server = wsServer
         this.inflight.add(row.terminalId)
         try {
           const { lines } = await this.deps.host.call('terminal.read', { terminalId: row.terminalId, maxLines: 80 })
@@ -880,7 +1171,8 @@ export class Rotator {
         return
       }
       const config = await this.deps.config()
-      const view = await this.accounts(true)
+      const server = w.server ?? (await this.serverOfWorkspace(w.workspaceId))
+      const view = await this.accountsFor(server, true)
       const now = this.deps.now()
       const chain = buildChain(view.seats, w.agent, config)
       const target = pickNext(chain, undefined, this.state.health, config, now)
@@ -892,6 +1184,7 @@ export class Rotator {
       const pane: PaneInfo = { terminalId: w.terminalId, workspaceId: w.workspaceId, agent: w.agent }
       if (w.sessionId) pane.sessionId = w.sessionId
       if (w.agentId) pane.agentId = w.agentId
+      if (server) pane.server = server
       const from = view.seats.find((s) => s.key === w.fromSeat)
       let lines: string[] = []
       try {
@@ -907,16 +1200,17 @@ export class Rotator {
 
   async selectSeat(seatKey: string): Promise<string> {
     const view = await this.accounts(true)
+    const server = this.server
     const seat = view.seats.find((s) => s.key === seatKey)
     if (!seat) throw Object.assign(new Error(`Unknown account ${seatKey}`), { code: 'invalid_params' })
     return this.withLock(seat.provider, async () => {
       const from = view.active[seat.provider]
-      if (from !== seat.key) await this.deps.cli.select(seat.provider, seat.accountId)
+      if (from !== seat.key) await this.selectOn(seat.provider, seat.accountId, server)
       this.record({ provider: seat.provider, reason: 'manual', result: 'selected', ...(from ? { from } : {}), to: seat.key })
       await this.save()
-      await this.accounts(true)
+      await this.accountsFor(server, true)
       this.publishNow()
-      return `${seat.provider}: new launches use ${seat.label}`
+      return `${PROVIDER_NAME[seat.provider]}: new launches use ${seat.label}`
     })
   }
 
@@ -926,8 +1220,70 @@ export class Rotator {
     const chain = buildChain(view.seats, provider, config)
     const strategy = config.strategy === 'manual' ? 'drain' : config.strategy
     const next = pickNext(chain, view.active[provider], this.state.health, { ...config, strategy }, this.deps.now())
-    if (!next) return `${provider}: no other healthy account`
+    if (!next) return `${PROVIDER_NAME[provider]}: no other healthy account`
     return this.selectSeat(next.key)
+  }
+
+  /** The panel's *Manual switch*: select the chosen account of its service for new launches and
+   *  move the current terminal's pane over if it runs this service and is between turns. The
+   *  worker then turns the service's automatic hand-off off, so the rotator never undoes a
+   *  choice the user made by hand; the panel says so and offers the toggle. A limited account
+   *  is refused. Returns what happened and whether anything was switched. */
+  async forceTo(seatKey: string): Promise<{ message: string; switched: boolean; provider: Provider }> {
+    const config = await this.deps.config()
+    const view = await this.accounts(true)
+    const seat = view.seats.find((s) => s.key === seatKey)
+    if (!seat) throw Object.assign(new Error(`Unknown account ${seatKey}`), { code: 'invalid_params' })
+    const provider = seat.provider
+    const now = this.deps.now()
+    const health = this.state.health[seat.key]
+    if (health?.cooldownUntil && health.cooldownUntil > now) {
+      return { message: `${PROVIDER_NAME[provider]}: ${seat.label} is limited until ${new Date(health.cooldownUntil).toLocaleTimeString()}; clear the cooldown first`, switched: false, provider }
+    }
+    if (view.active[provider] === seat.key) return { message: `${PROVIDER_NAME[provider]}: new launches already use ${seat.label}`, switched: false, provider }
+    const selected = await this.selectSeat(seat.key)
+    const pane = await this.currentPane(provider)
+    if (!pane) return { message: selected, switched: true, provider }
+    if (pane.sshHost) return { message: `${selected}; this pane runs on SSH target ${pane.sshHost} with that machine's own login and is left alone`, switched: true, provider }
+    if (pane.state !== 'waiting' && pane.state !== 'done') return { message: `${selected}; this pane keeps its account while it works`, switched: true, provider }
+    const moved = await this.withLock(provider, async () => {
+      const fresh = await this.accountsFor(pane.server)
+      const at = this.locate(pane.terminalId, provider, fresh)
+      const target = fresh.seats.find((s) => s.key === seat.key)
+      if (!target || at.seat?.key === target.key) return null
+      const { lines } = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 })
+      if (!(await this.advisoryOk(pane, at.seat, target, lines, fresh, config, this.deps.now()))) return null
+      const before = this.state.history.length
+      await this.moveTo(pane, at.seat, target, 'manual', [...lines], undefined, fresh, config)
+      return this.state.history.length > before ? this.state.history.at(-1) : null
+    })
+    if (moved && (moved.result === 'resumed' || moved.result === 'handoff')) return { message: `${selected}; this pane moved (${moved.result})`, switched: true, provider }
+    return { message: `${selected}; this pane keeps its account until it is relaunched`, switched: true, provider }
+  }
+
+  /** The agent in the current terminal tab of the focused workspace, if it runs `provider`. */
+  private async currentPane(provider: Provider): Promise<(PaneInfo & { state: string }) | null> {
+    try {
+      const server = await this.currentServer()
+      const [{ agents }, context, active] = await Promise.all([
+        this.deps.host.call('agents.list'),
+        this.deps.host.call('workspace.readContext'),
+        this.activeTerminalsOn(server)
+      ])
+      if (!context?.workspaceId) return null
+      const row = agents.find((a: any) => providerOf(a.agent) === provider && a.terminalId && active.includes(a.terminalId))
+      if (!row) return null
+      const pane: PaneInfo & { state: string } = { terminalId: row.terminalId, workspaceId: context.workspaceId, agent: provider, state: row.state }
+      if (row.agent !== provider) pane.agentId = row.agent
+      if (row.sessionId) pane.sessionId = row.sessionId
+      if (row.title) pane.title = row.title
+      if (server) pane.server = server
+      const sshHost = await this.sshTargetOfWorkspace(context.workspaceId)
+      if (sshHost) pane.sshHost = sshHost
+      return pane
+    } catch {
+      return null
+    }
   }
 
   async swapFocused(): Promise<string> {
@@ -937,15 +1293,20 @@ export class Rotator {
       agents.find((a: any) => providerOf(a.agent) && (a.state === 'waiting' || a.state === 'done')) ??
       agents.find((a: any) => providerOf(a.agent))
     if (!row || !context?.workspaceId) return 'No agent in the focused workspace'
+    const sshHost = await this.sshTargetOfWorkspace(context.workspaceId)
+    if (sshHost) return `${providerOf(row.agent)}: this pane runs on SSH target ${sshHost}; Orca manages no accounts there`
+    const server = await this.serverOfWorkspace(context.workspaceId)
     const pane: PaneInfo = { terminalId: row.terminalId, workspaceId: context.workspaceId, agent: providerOf(row.agent)! }
     if (row.agent !== pane.agent) pane.agentId = row.agent
     if (row.sessionId) pane.sessionId = row.sessionId
+    if (server) pane.server = server
     const { lines } = await this.deps.host.call('terminal.read', { terminalId: row.terminalId, maxLines: 80 })
     const before = this.state.history.length
     await this.swap(pane, 'manual', lines)
     const last = this.state.history.length > before ? this.state.history.at(-1) : undefined
     if (!last) return `${pane.agent}: nothing to do`
-    const label = (key?: string) => this.view?.seats.find((s) => s.key === key)?.label ?? key ?? '?'
+    const view = this.views.get(server ?? 'local')?.view ?? this.view
+    const label = (key?: string) => view?.seats.find((s) => s.key === key)?.label ?? key ?? '?'
     if (last.result === 'resumed' || last.result === 'handoff' || last.result === 'selected') {
       return `${pane.agent}: moved to ${label(last.to)} (${last.result})`
     }
@@ -971,10 +1332,14 @@ export class Rotator {
   }
 
   snapshot(): Snapshot {
-    const view = this.view ?? { seats: [], active: {} }
+    const entry = this.views.get(this.server ?? 'local')
+    const view = entry?.view ?? this.view ?? { seats: [], active: {} }
+    const updatedAt = entry ? entry.at : this.viewAt
+    const error = entry ? entry.error : this.viewError
+    const now = this.deps.now()
     const snap: Snapshot = {
       paused: this.state.paused,
-      updatedAt: this.viewAt,
+      updatedAt,
       seats: view.seats.map((s) => {
         const h = this.state.health[s.key]
         return {
@@ -984,10 +1349,13 @@ export class Rotator {
         }
       }),
       waiting: this.state.waiting,
-      history: this.state.history.slice(-100),
+      history: this.state.history.filter((h) => h.at >= now - HISTORY_MAX_AGE_MS).slice(-100),
       services: { ...this.services }
     }
-    if (this.viewError) snap.error = this.viewError
+    if (this.focused) snap.focused = this.focused
+    if (this.server) snap.server = this.server
+    if (this.sshHost) snap.sshHost = this.sshHost
+    if (error) snap.error = error
     return snap
   }
 

@@ -1,9 +1,9 @@
 {
   "manifestVersion": 2,
-  "id": "account-rotator",
-  "name": "Account Rotator",
+  "id": "auto-handoff",
+  "name": "Auto Hand-off",
   "version": "0.2.0",
-  "description": "Pools Orca's managed agent accounts per service (Claude, Codex, Antigravity, OpenCode, Devin): on a rate limit or usage threshold it switches the pane to another account of the same service and resumes the session. To reach panes outside the focused workspace it also runs the orca CLI (account select, terminal close/send).",
+  "description": "Automatic account switching for Orca agents. Pools the managed accounts per provider (Claude, Codex, Antigravity, OpenCode, Devin): on a rate limit or usage threshold it hands the pane off to the next account of that provider and resumes the session, so the model and the context never change. To reach panes outside the focused workspace it also runs the orca CLI (account select, terminal close/send).",
   "author": {
     "name": "ngoohebi",
     "url": "https://github.com/ngoohebi"
@@ -20,7 +20,7 @@
     "panels": [
       {
         "id": "seats",
-        "title": "Account Rotator",
+        "title": "Auto Hand-off",
         "icon": "gauge",
         "entry": "src/panel.tsx",
         "ui": "components"
@@ -29,28 +29,39 @@
     "commands": [
       {
         "id": "rotator.next",
-        "title": "Account Rotator: Switch Claude to the next account"
+        "title": "Auto Hand-off: Switch Claude to the next account"
       },
       {
         "id": "rotator.nextCodex",
-        "title": "Account Rotator: Switch Codex to the next account"
+        "title": "Auto Hand-off: Switch Codex to the next account"
       },
       {
         "id": "rotator.swapThisPane",
-        "title": "Account Rotator: Move this workspace's agent to another account"
+        "title": "Auto Hand-off: Move this workspace's agent to another account"
       },
       {
         "id": "rotator.togglePause",
-        "title": "Account Rotator: Pause or resume automatic switching"
+        "title": "Auto Hand-off: Pause or resume automatic hand-off"
       },
       {
         "id": "rotator.refresh",
-        "title": "Account Rotator: Refresh usage"
+        "title": "Auto Hand-off: Refresh usage"
+      },
+      {
+        "id": "rotator.installStatusLine",
+        "title": "Auto Hand-off: Install the console status line in this workspace"
+      },
+      {
+        "id": "rotator.uninstallStatusLine",
+        "title": "Auto Hand-off: Remove the console status line from this workspace"
       }
     ],
     "events": [
       {
         "on": "agent.status.changed"
+      },
+      {
+        "on": "workspace.changed"
       }
     ],
     "hooks": [
@@ -62,44 +73,44 @@
     "statusBarItems": [
       {
         "id": "seat",
-        "text": "Account Rotator",
+        "text": "Auto Hand-off",
         "icon": "gauge",
-        "tooltip": "Account Rotator",
+        "tooltip": "Auto Hand-off",
         "command": "rotator.next"
       }
     ],
     "settings": [
       {
         "key": "service_claude",
-        "title": "Auto-switch Claude accounts",
+        "title": "Auto hand-off Claude accounts",
         "type": "boolean",
         "default": true,
         "description": "Off: Claude panes are never switched or resumed automatically (manual switching still works)."
       },
       {
         "key": "service_codex",
-        "title": "Auto-switch Codex accounts",
+        "title": "Auto hand-off Codex accounts",
         "type": "boolean",
         "default": true,
         "description": "Off: Codex panes are never switched or resumed automatically (manual switching still works)."
       },
       {
         "key": "service_antigravity",
-        "title": "Auto-switch Antigravity accounts",
+        "title": "Auto hand-off Antigravity accounts",
         "type": "boolean",
         "default": true,
         "description": "Off: Antigravity panes are never switched or resumed automatically (manual switching still works)."
       },
       {
         "key": "service_opencode",
-        "title": "Auto-switch OpenCode accounts",
+        "title": "Auto hand-off OpenCode accounts",
         "type": "boolean",
         "default": true,
         "description": "Off: OpenCode panes are never switched or resumed automatically (manual switching still works)."
       },
       {
         "key": "service_devin",
-        "title": "Auto-switch Devin accounts",
+        "title": "Auto hand-off Devin accounts",
         "type": "boolean",
         "default": true,
         "description": "Off: Devin panes are never switched or resumed automatically (manual switching still works)."
@@ -157,7 +168,7 @@
         "title": "Never switch to",
         "type": "string",
         "default": "",
-        "description": "Comma-separated accounts that automatic switching never picks (emails, seat keys, or provider:*). Picking them from the panel still works."
+        "description": "Comma-separated accounts that automatic hand-off never picks (emails, seat keys, or provider:*). Picking them from the panel still works."
       },
       {
         "key": "auto_switch_on_rate_limit",
@@ -268,6 +279,22 @@
         "type": "string",
         "default": "",
         "description": "Empty = detect (ORCA_CLI_COMMAND, the app bundle, then orca)."
+      },
+      {
+        "key": "console_statusline_format",
+        "title": "Console status line header",
+        "type": "string",
+        "default": "",
+        "description": "Optional line above the account rows of the console status line; empty = rows only. Placeholders: {model}, {ctxbar} context-left gauge, {ctx} context left %, {5h} and {7d} this pane's % left, {reset} time until the 5-hour window resets, {best} the best-model window's name. Example: {model} │ ctx {ctxbar} │ 5h reset {reset} │ best={best}"
+      },
+      {
+        "key": "console_statusline_bar_width",
+        "title": "Console status line bar width",
+        "type": "integer",
+        "default": 8,
+        "minimum": 4,
+        "maximum": 30,
+        "description": "Cells per gauge. 8 keeps a row with three gauges and a cooldown inside 80 columns."
       }
     ]
   },

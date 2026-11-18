@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Account Rotator for Orca</title>
-<meta name="description" content="An Orca plugin that pools your managed agent accounts per service. On a rate limit or usage threshold it switches the pane to the next Claude, Codex, Antigravity, OpenCode or Devin account and resumes the session.">
-<meta property="og:title" content="Account Rotator for Orca">
-<meta property="og:description" content="Rate limit hit? The session moves to your next account of the same service and carries on. Claude, Codex, Antigravity, OpenCode and Devin.">
+<title>Auto Hand-off for Orca: automatic account switching within the same provider</title>
+<meta name="description" content="Automatic account switching for Orca agents. When a Claude, Codex, Antigravity, OpenCode or Devin account hits a limit, Auto Hand-off moves the session to your next account and keeps working. Claude stays Claude, Codex stays Codex: a session always keeps its provider.">
+<meta property="og:title" content="Auto Hand-off for Orca: automatic account switching within the same provider">
+<meta property="og:description" content="Hit a rate limit? Auto-switch to your next account and keep working, on the same provider with the same context. Claude, Codex, Antigravity, OpenCode and Devin.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://ngoohebi.github.io/orca-account-rotator/">
 <meta name="theme-color" content="#0f1115">
@@ -201,7 +201,7 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <a class="brand" href="#top">
       <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="var(--accent)"/><path d="M9 19a7 7 0 1 1 14 0" stroke="var(--accent-fg)" stroke-width="3" fill="none" stroke-linecap="round"/><path d="M16 19l5-6" stroke="var(--accent-fg)" stroke-width="3" stroke-linecap="round"/></svg>
-      Account Rotator <small>Orca plugin</small>
+      Auto Hand-off <small>Orca plugin</small>
     </a>
     <ul>
       <li><a href="#how">How it works</a></li>
@@ -227,8 +227,8 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <div>
       <div class="eyebrow">For Orca · Claude, Codex, Antigravity, OpenCode, Devin</div>
-      <h1>Hit a rate limit? <span>The session moves on.</span></h1>
-      <p class="lede">Account Rotator runs the accounts Orca manages as one pool per service. When an agent pane prints a limit, the plugin cools that account down, selects the next healthy one, and resumes the same session there, with the first message already typed.</p>
+      <h1>Hit a rate limit? <span>Auto-switch to your next account.</span></h1>
+      <p class="lede">Automatic account switching for Orca. Claude to Claude, Codex to Codex: a session always keeps its provider, so the model and the context never change. Auto Hand-off runs the accounts Orca manages as one pool per service. When an agent pane prints a limit, the plugin cools that account down, selects the next healthy one, and resumes the same session there, with the first message already typed.</p>
       <div class="badges">
         <span class="badge">v<b>0.2.0</b></span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
@@ -243,14 +243,14 @@ footer a{color:var(--fg-2)}
       <div class="cmd"><span class="dollar">$</span><span class="c">orca plugin install ngoohebi/orca-account-rotator</span><button class="copy" data-copy="orca plugin install ngoohebi/orca-account-rotator">Copy</button></div>
     </div>
 
-    <div class="panel" aria-label="The Account Rotator panel">
-      <div class="ph">Account Rotator <span>⟳ Refresh</span></div>
-      <div class="row"><span>Automatic switching</span><span class="toggle"></span></div>
+    <div class="panel" aria-label="The Auto Hand-off panel">
+      <div class="ph">Auto Hand-off <span>⟳ Refresh</span></div>
+      <div class="row"><span>Automatic hand-off</span><span class="toggle"></span></div>
       <div class="tabs"><b>Accounts</b><span>History (13)</span></div>
       <div class="card">
         <h4>claude</h4>
         <div class="sub">3 account(s)</div>
-        <div class="row"><span>Auto-switch claude accounts</span><span class="toggle"></span></div>
+        <div class="row"><span>Auto hand-off claude accounts</span><span class="toggle"></span></div>
         <div class="acct">
           <div class="row"><span>you@example.com</span><span class="pill on">active</span></div>
           <div class="meter">5h 25%</div><div class="bar"><i style="width:25%"></i></div>
@@ -272,7 +272,7 @@ footer a{color:var(--fg-2)}
       <div class="card">
         <h4>codex</h4>
         <div class="sub">2 account(s)</div>
-        <div class="row"><span>Auto-switch codex accounts</span><span class="toggle"></span></div>
+        <div class="row"><span>Auto hand-off codex accounts</span><span class="toggle"></span></div>
         <div class="acct">
           <div class="row"><span>you@example.com</span><span class="pill on">active</span></div>
           <div class="meter">5h 84%</div><div class="bar"><i class="w" style="width:84%"></i></div>
@@ -307,7 +307,7 @@ footer a{color:var(--fg-2)}
         <div class="dim">❯</div>
       </div>
       <div class="term">
-        <div class="t">Account Rotator, moments later</div>
+        <div class="t">Auto Hand-off, moments later</div>
         <div><span class="k">cooldown</span>  you@example.com <span class="dim">until 15:00</span></div>
         <div><span class="k">select  </span>  orca account select work@example.com</div>
         <div><span class="k">close   </span>  pane 3</div>
@@ -407,7 +407,7 @@ footer a{color:var(--fg-2)}
       </div>
       <div class="tile">
         <h3>Commands</h3>
-        <p>Switch Claude or Codex to the next account. Move this workspace's agent to another account. Pause or resume automatic switching. Refresh usage. Install or remove the console status line.</p>
+        <p>Switch Claude or Codex to the next account. Move this workspace's agent to another account. Pause or resume automatic hand-off. Refresh usage. Install or remove the console status line.</p>
       </div>
       <div class="tile">
         <h3>Console status line for Claude panes</h3>
@@ -425,7 +425,7 @@ footer a{color:var(--fg-2)}
     <div class="sec-head">
       <div class="eyebrow">Settings</div>
       <h2>Every knob, straight from the manifest</h2>
-      <p class="lede">Settings → Plugins → Account Rotator. Every cux key is here, plus the chain, exclusions, switch-back guards and the console status line format.</p>
+      <p class="lede">Settings → Plugins → Auto Hand-off. Every cux key is here, plus the chain, exclusions, switch-back guards and the console status line format.</p>
     </div>
     <div class="tscroll">
     <table class="tbl">
@@ -433,8 +433,8 @@ footer a{color:var(--fg-2)}
       <tbody>
 <tr><td><code>strategy</code><div class="st">Strategy</div></td><td>drain</td><td>drain, balanced, priority, soonest-reset or manual. See <a href="#strategies">Strategies</a>.</td></tr>
 <tr><td><code>chain</code><div class="st">Account chain</div></td><td><em>empty</em></td><td>Comma-separated order of accounts within each service: emails, seat keys (claude:&lt;id&gt;, codex:system) or provider:*. Example: me@example.com, claude:*. Empty = Orca's order. Switching never leaves the agent's own service.</td></tr>
-<tr><td><code>exclude</code><div class="st">Never switch to</div></td><td><em>empty</em></td><td>Comma-separated accounts that automatic switching never picks (emails, seat keys, or provider:*). Picking them from the panel still works.</td></tr>
-<tr><td><code>service_claude</code><div class="st">Auto-switch Claude accounts</div></td><td>on</td><td>Off: Claude panes are never switched or resumed automatically (manual switching still works). The same switch exists for <code>service_codex</code>, <code>service_antigravity</code>, <code>service_opencode</code> and <code>service_devin</code>.</td></tr>
+<tr><td><code>exclude</code><div class="st">Never switch to</div></td><td><em>empty</em></td><td>Comma-separated accounts that automatic hand-off never picks (emails, seat keys, or provider:*). Picking them from the panel still works.</td></tr>
+<tr><td><code>service_claude</code><div class="st">Auto hand-off Claude accounts</div></td><td>on</td><td>Off: Claude panes are never switched or resumed automatically (manual switching still works). The same switch exists for <code>service_codex</code>, <code>service_antigravity</code>, <code>service_opencode</code> and <code>service_devin</code>.</td></tr>
 <tr><td><code>switch_back</code><div class="st">Switch back when a higher-priority account resets</div></td><td>on</td><td>drain and priority only: once an account earlier in the chain is healthy again, new launches use it and sessions on lower accounts move back when they finish a turn (or sit idle).</td></tr>
 <tr><td><code>switch_cooldown_minutes</code><div class="st">Minimum minutes between automatic selection changes</div></td><td>5</td><td>Applies to threshold, switch-back and idle moves, so two accounts near the line never ping-pong. Rate limits and auth failures ignore it.</td></tr>
 <tr><td><code>min_headroom_gap</code><div class="st">Minimum headroom gap for a threshold move (%)</div></td><td>10</td><td>A threshold move needs a target with at least this many points more room than the current account (when both are known). An exhausted account may always leave.</td></tr>
@@ -512,7 +512,7 @@ footer a{color:var(--fg-2)}
       </li>
       <li>
         <div>
-          <p>Add a second account for the service in Orca, if you have not already. Optionally set <code>chain</code> in Settings → Plugins → Account Rotator to order your accounts. Done: the gauge appears in the status bar.</p>
+          <p>Add a second account for the service in Orca, if you have not already. Optionally set <code>chain</code> in Settings → Plugins → Auto Hand-off to order your accounts. Done: the gauge appears in the status bar.</p>
         </div>
       </li>
     </ol>
@@ -533,7 +533,7 @@ orca plugin dev request . rotator.debug</code></pre>
 
 <footer>
   <div class="wrap">
-    <span>Account Rotator · MIT license · by <a href="https://github.com/ngoohebi">ngoohebi</a></span>
+    <span>Auto Hand-off · MIT license · by <a href="https://github.com/ngoohebi">ngoohebi</a></span>
     <a href="https://github.com/ngoohebi/orca-account-rotator">Source on GitHub</a>
     <a href="https://github.com/ngoohebi/orca-account-rotator/issues">Issues</a>
     <span>Ideas borrowed with thanks from <a href="https://github.com/inulute/cux">cux</a>, cswap, tokenmaxx and the Orca community's rotation PRs.</span>

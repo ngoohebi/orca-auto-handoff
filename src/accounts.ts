@@ -96,7 +96,8 @@ export function parseAccounts(result: Json): AccountView {
     }
   }
 
-  // Antigravity: managed accounts only (no system default).
+  // Antigravity: managed accounts, plus the host's own login when no managed account is selected.
+  // Orca reports that login as `currentAccount` (often without an email) and polls its usage.
   {
     const block: Json = result?.antigravity ?? {}
     const accounts: Json[] = Array.isArray(block.accounts) ? block.accounts : []
@@ -112,6 +113,21 @@ export function parseAccounts(result: Json): AccountView {
         usage: isActive ? usageFrom(rl.antigravity) : { known: false }
       })
       if (isActive) active.antigravity = `antigravity:${a.id}`
+    }
+    const current: Json | undefined = block.currentAccount && typeof block.currentAccount === 'object' ? block.currentAccount : undefined
+    const hostLogin = !!current?.authMethod || rl.antigravity?.status === 'ok'
+    const currentEmail = lower(current?.email)
+    const duplicate = currentEmail && accounts.some((a) => lower(a.email) === currentEmail)
+    if (activeId === null && hostLogin && !duplicate) {
+      seats.push({
+        key: 'antigravity:system',
+        provider: 'antigravity',
+        accountId: 'system',
+        label: currentEmail ? `system (${currentEmail})` : 'system',
+        active: true,
+        usage: usageFrom(rl.antigravity)
+      })
+      active.antigravity = 'antigravity:system'
     }
   }
 

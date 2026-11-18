@@ -94,6 +94,8 @@ export type WaitingEntry = {
   sessionId?: string
   fromSeat?: string
   wakeAt: number
+  /** Remote Orca server (`environmentId` from `runtime:<environmentId>`) when the workspace is not on `local`. */
+  server?: string
 }
 
 export type Config = {
@@ -127,7 +129,7 @@ export type Config = {
   pollIntervalSeconds: number
   handoffMaxChars: number
   orcaCliPath: string
-  /** Automatic switching per service; a service that is off is never touched automatically. */
+  /** Automatic hand-off per service; a service that is off is never touched automatically. */
   services: Record<Provider, boolean>
 }
 
@@ -177,6 +179,8 @@ export type RotatorState = {
 }
 
 export const HISTORY_CAP = 1000
+/** Swap history older than this is dropped automatically. */
+export const HISTORY_MAX_AGE_MS = 7 * 86_400_000
 
 export function emptyState(): RotatorState {
   return {
@@ -201,5 +205,13 @@ export type Snapshot = {
   history: HistoryEntry[]
   /** Which services switch automatically. */
   services: Record<Provider, boolean>
+  /** The service of the agent the user is working with: the most recently active agent in the
+   *  focused workspace. The panel lists that service first. */
+  focused?: Provider
+  /** Remote Orca server (`environmentId`) when the focused project runs on another server. */
+  server?: string
+  /** SSH target when the focused project runs on a direct SSH host. Orca manages no accounts
+   *  there, so the seats shown do not apply to it and its panes are never switched. */
+  sshHost?: string
   error?: string
 }
