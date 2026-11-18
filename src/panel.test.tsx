@@ -38,7 +38,7 @@ test('shows every seat with usage, cooldown and history; switching asks the work
   const view = await mount(panel, { host })
   assert.ok(view.find({ text: 'one@example.test' }))
   assert.ok(view.find({ text: 'limited' }))
-  assert.ok(view.find({ text: /Usage unknown/ }))
+  assert.ok(view.find({ text: /Orca reports usage for this account only while it is in use|No usage reading yet/ }))
   await view.press({ text: 'Use for new claude launches' })
   assert.deepEqual(selected, ['claude:c1'])
   assert.ok(view.find({ text: /new launches use claude:c1/ }))

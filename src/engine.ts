@@ -2,6 +2,7 @@
 // Every side effect goes through Deps so tests run it with a fake host, CLI and clock.
 import { ADAPTERS, CHROME, classify, countCopies, hasDraft, parseModelFallback } from './adapters'
 import { parseAccounts, type AccountView } from './accounts'
+import { emptyUsageCache, loadedUsageCache, observe, resolve, type UsageCache } from './usage-cache'
 import { buildChain, earliestReset, enoughGap, isEligible, overThreshold, pickNext, preferredOver } from './selector'
 import {
   HISTORY_CAP,
@@ -44,6 +45,9 @@ export type Deps = {
   log(message: string): void
   notify(title: string, body: string): Promise<void>
   publish(snapshot: Snapshot): void
+  /** The persisted last-known usage cache (storage key `usage`). */
+  loadUsage(): Promise<unknown>
+  saveUsage(cache: UsageCache): Promise<void>
 }
 
 /** What the plugin knows about one agent pane. */
@@ -97,12 +101,56 @@ export class Rotator {
   /** The last few status events, for `rotator.debug`. */
   recentEvents: StatusEvent[] = []
 
-  constructor(private deps: Deps) {}
+  /** Last-known usage per account; see usage-cache.ts. */
+  private usage: UsageCache = emptyUsageCache()
+  /** When each provider's active account last changed, so a stale reading is not misattributed. */
+  private activeSince: Partial<Record<Provider, number>> = {}
+  /** One `orca account list` at a time: the timer, the panel and commands share it (~3 s). */
+  private listing: Promise<AccountView> | null = null
+  private followUp = 0
+  private disposed = false
+
+  constructor(private deps: Deps) {
+    // Every account switch the plugin makes goes through here: note it, and read usage again
+    // shortly after, because a switch is what makes Orca fetch its inactive accounts.
+    const select = deps.cli.select.bind(deps.cli)
+    this.deps = {
+      ...deps,
+      cli: {
+        ...deps.cli,
+        select: async (provider: Provider, accountId: string) => {
+          await select(provider, accountId)
+          this.activeSince[provider] = this.deps.now()
+          this.readAfterSwitch()
+        }
+      }
+    }
+  }
 
   async init(): Promise<void> {
     const saved = await this.deps.loadState()
     this.state = { ...emptyState(), ...(saved ?? {}) }
+    this.usage = loadedUsageCache(await this.deps.loadUsage().catch(() => null))
     await this.refreshServices(false)
+  }
+
+  /** Stops background follow-up reads (worker deactivation). */
+  dispose(): void {
+    this.disposed = true
+  }
+
+  /** Orca fetches inactive accounts right after a switch, at most once a minute: read at +8 s and
+   *  again after its throttle (+70 s). A newer switch supersedes the pending reads. */
+  private readAfterSwitch(): void {
+    const generation = ++this.followUp
+    void (async () => {
+      for (const wait of [8_000, 62_000]) {
+        await this.deps.sleep(wait)
+        if (this.disposed || generation !== this.followUp) return
+        await this.accounts(true)
+        this.publishNow()
+      }
+    })().catch((error) => this.deps.log(`usage read after switch failed: ${String((error as Error)?.message ?? error)}`))
   }
 
   async refreshServices(publish = true): Promise<void> {
@@ -131,16 +179,36 @@ export class Rotator {
     const config = await this.deps.config()
     const fresh = this.deps.now() - this.viewAt < config.pollIntervalSeconds * 1000
     if (this.view && fresh && !force) return this.view
+    if (this.listing) return this.listing
+    this.listing = this.readAccounts(config).finally(() => {
+      this.listing = null
+    })
+    return this.listing
+  }
+
+  private async readAccounts(config: Config): Promise<AccountView> {
     try {
-      this.view = parseAccounts(await this.deps.cli.listAccounts())
-      this.viewAt = this.deps.now()
+      const parsed = parseAccounts(await this.deps.cli.listAccounts())
+      const now = this.deps.now()
+      // A switch made outside the plugin (Orca's own switcher) also starts a new active period.
+      if (this.view) {
+        for (const [provider, key] of Object.entries(parsed.active) as [Provider, string][]) {
+          if (this.view.active[provider] && this.view.active[provider] !== key) this.activeSince[provider] = now
+        }
+      }
+      const changed = observe(this.usage, parsed.seats, now, this.activeSince)
+      const maxAgeMs = config.usageCacheMaxAgeHours * 3_600_000
+      for (const seat of parsed.seats) seat.usage = resolve(seat, this.usage, now, maxAgeMs, this.activeSince)
+      if (changed) await this.deps.saveUsage(this.usage).catch(() => undefined)
+      this.view = parsed
+      this.viewAt = now
       this.viewError = undefined
     } catch (error) {
       this.viewError = `orca account list failed: ${String((error as Error)?.message ?? error)}`
       this.deps.log(this.viewError)
       if (!this.view) this.view = { seats: [], active: {} }
     }
-    return this.view
+    return this.view!
   }
 
   /** The cached view without a CLI call; for hooks, which must answer within 2 s. */
@@ -411,7 +479,8 @@ export class Rotator {
    *  plenty of room, i.e. the limited pane must be on some other (older) account. */
   private plausiblyLimited(seat: Seat): boolean {
     const u = seat.usage
-    if (!u.known) return true
+    // Only Orca's live numbers can clear an account; remembered ones may be out of date.
+    if (!u.known || (u.source !== undefined && u.source !== 'live')) return true
     return Math.max(u.session?.usedPercent ?? 0, u.weekly?.usedPercent ?? 0, u.model?.usedPercent ?? 0) >= 90
   }
 

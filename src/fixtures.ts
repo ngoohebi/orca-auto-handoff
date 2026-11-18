@@ -58,7 +58,10 @@ export function accountList(options: {
   codexActive?: string | null
   codexUsage?: { session: number; weekly: number }
   inactiveCodex?: Record<string, number>
+  /** When Orca took the active readings (its `updatedAt`). */
+  updatedAt?: number
 } = {}): Record<string, any> {
+  const updatedAt = options.updatedAt ?? 1_000_000
   const claudeUsage = options.claudeUsage ?? { session: 7, weekly: 18 }
   const codexUsage = options.codexUsage ?? { session: 0, weekly: 0 }
   return {
@@ -90,14 +93,14 @@ export function accountList(options: {
         session: { usedPercent: claudeUsage.session, windowMinutes: 300, resetsAt: claudeUsage.sessionReset ?? 1_000_000 + 3_600_000 },
         weekly: { usedPercent: claudeUsage.weekly, windowMinutes: 10080, resetsAt: claudeUsage.weeklyReset ?? 1_000_000 + 86_400_000 },
         fableWeekly: { usedPercent: 19, windowMinutes: 10080, resetsAt: 1_000_000 + 86_400_000 },
-        updatedAt: 1_000_000
+        updatedAt
       },
       codex: {
         provider: 'codex',
         status: 'ok',
         session: { usedPercent: codexUsage.session, windowMinutes: 300, resetsAt: 1_000_000 + 3_600_000 },
         weekly: { usedPercent: codexUsage.weekly, windowMinutes: 10080, resetsAt: 1_000_000 + 86_400_000 },
-        updatedAt: 1_000_000
+        updatedAt
       },
       inactiveClaudeAccounts: [
         { accountId: 'c2', rateLimits: { provider: 'claude', status: 'error', session: null, weekly: null, error: 'Claude usage updates the next time Claude runs.' } }

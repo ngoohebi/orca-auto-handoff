@@ -170,6 +170,33 @@ These cux features are not in the plugin yet:
 Disable cux's own hooks (`cux uninstall-hooks`) before you enable this plugin, so the two don't
 both rotate.
 
+## Usage of accounts not in use
+
+Orca checks usage of the account *in use* about every 5 minutes, while its window is open. It
+fetches the other accounts only when its usage view opens or right after an account switch. An
+inactive Claude account whose sign-in token has expired reports nothing until Claude runs on it
+again; Orca deliberately does not refresh that token itself.
+
+So the plugin remembers the last reading Orca gave for every account (setting *Remember usage of
+accounts not in use*, default 7 days) and shows it with its age:
+
+- in the panel, "Last reading 2h ago";
+- in the status bar, `~` in front of the numbers.
+
+A window whose reset time has passed shows as 0 %, "reset since". These remembered numbers also
+count when the plugin chooses the next account, so an exhausted account that is not in use is no
+longer mistaken for a free one.
+
+When there is no reading at all, the panel says why, in Orca's terms: "Updates the next time this
+account runs", "Sign in to this account again in Orca", "Orca is rate limited", or Orca's own
+message.
+
+The plugin reads Orca's numbers every *Read usage from Orca every (seconds)*: default 60,
+range 15–3600. A change applies immediately. Concurrent refreshes share one `orca account list`
+call. After each switch the plugin makes, it reads again at about 8 and 70 seconds, because a
+switch is what makes Orca fetch the accounts not in use. The plugin never reads tokens or
+keychains and never triggers Orca's internal fetches.
+
 ## Permissions
 
 Orca asks you to approve the plugin's access. Beyond the host API, the worker runs the `orca` CLI
@@ -187,7 +214,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 46 tests: adapters (real captured banners), selector, worker end to end, panel
+orca plugin test . --json        # 67 tests: adapters (real captured banners), selector, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

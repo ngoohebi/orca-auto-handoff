@@ -11,12 +11,13 @@ function win(value: unknown): UsageWindow | undefined {
   return { usedPercent: v.usedPercent, resetsAt: typeof v.resetsAt === 'number' ? v.resetsAt : null }
 }
 
-function usageFrom(rl: unknown): SeatUsage {
-  if (!rl || typeof rl !== 'object') return { known: false }
+function usageFrom(rl: unknown, row?: Json): SeatUsage {
+  if (!rl || typeof rl !== 'object') return { known: false, source: 'unknown', reason: 'not-reported' }
   const r = rl as Json
   const session = win(r.session)
   const weekly = win(r.weekly)
-  const usage: SeatUsage = { known: r.status === 'ok' && !!(session || weekly) }
+  const known = r.status === 'ok' && !!(session || weekly)
+  const usage: SeatUsage = { known, source: known ? 'live' : 'unknown' }
   if (session) usage.session = session
   if (weekly) usage.weekly = weekly
   if (typeof r.updatedAt === 'number') usage.updatedAt = r.updatedAt
@@ -28,13 +29,32 @@ function usageFrom(rl: unknown): SeatUsage {
       usage.model = { ...w, name: m[1]! }
     }
   }
+  if (!known) {
+    // Why Orca has nothing: its own failure kind and message, never guessed.
+    const kind = r.usageMetadata?.failureKind
+    usage.reason =
+      row?.isFetching || r.status === 'fetching'
+        ? 'fetching'
+        : kind === 'stale-token'
+          ? 'stale-token'
+          : kind === 'rate-limited'
+            ? 'rate-limited'
+            : kind === 'missing-credentials'
+              ? 'sign-in'
+              : r.status === 'error'
+                ? 'error'
+                : 'not-reported'
+    if (typeof r.error === 'string' && r.error.trim()) usage.detail = r.error.replace(/\s+/g, ' ').trim().slice(0, 120)
+    const retryAt = r.retryAtMs ?? r.usageMetadata?.retryAtMs
+    if (typeof retryAt === 'number') usage.retryAt = retryAt
+  }
   return usage
 }
 
 function inactiveUsage(list: unknown, accountId: string): SeatUsage {
-  if (!Array.isArray(list)) return { known: false }
+  if (!Array.isArray(list)) return { known: false, source: 'unknown', reason: 'not-reported' }
   const row = list.find((r: Json) => r?.accountId === accountId)
-  return row ? usageFrom(row.rateLimits) : { known: false }
+  return row ? usageFrom(row.rateLimits, row) : { known: false, source: 'unknown', reason: 'not-reported' }
 }
 
 const lower = (s: unknown) => (typeof s === 'string' ? s.toLowerCase() : undefined)
@@ -79,7 +99,7 @@ export function parseAccounts(result: Json): AccountView {
         accountId: 'system',
         label: systemEmail ? `system (${systemEmail})` : 'system',
         active: activeId === null,
-        usage: activeId === null ? usageFrom(rl[provider]) : { known: false }
+        usage: activeId === null ? usageFrom(rl[provider]) : { known: false, source: 'unknown', reason: 'not-reported' }
       })
     }
     if (activeId) active[provider] = `${provider}:${activeId}`
@@ -109,7 +129,7 @@ export function parseAccounts(result: Json): AccountView {
         accountId: a.id,
         label: a.email ?? a.label ?? a.id,
         active: isActive,
-        usage: isActive ? usageFrom(rl.antigravity) : { known: false }
+        usage: isActive ? usageFrom(rl.antigravity) : { known: false, source: 'unknown', reason: 'not-reported' }
       })
       if (isActive) active.antigravity = `antigravity:${a.id}`
     }
@@ -128,7 +148,7 @@ export function parseAccounts(result: Json): AccountView {
         accountId: a.id,
         label: a.label ?? a.email ?? a.id,
         active: activeId === a.id,
-        usage: { known: false }
+        usage: { known: false, source: 'unknown', reason: 'no-usage-api' }
       })
     }
     seats.push({
@@ -137,7 +157,7 @@ export function parseAccounts(result: Json): AccountView {
       accountId: 'system',
       label: 'system',
       active: activeId === null,
-      usage: { known: false }
+      usage: { known: false, source: 'unknown', reason: 'no-usage-api' }
     })
     active[provider] = activeId ? `${provider}:${activeId}` : `${provider}:system`
   }

@@ -8,11 +8,29 @@ export function isProvider(value: unknown): value is Provider {
 }
 
 /** One usage window as Orca reports it (`rateLimits.<provider>.session|weekly`). */
-export type UsageWindow = { usedPercent: number; resetsAt: number | null }
+export type UsageWindow = {
+  usedPercent: number
+  resetsAt: number | null
+  /** A remembered window whose reset time has passed: shown as 0 %, "reset since". */
+  reset?: true
+}
+
+/** Why Orca has no live numbers for an account right now. */
+export type UsageReason = 'stale-token' | 'rate-limited' | 'sign-in' | 'fetching' | 'not-reported' | 'no-usage-api' | 'error'
 
 export type SeatUsage = {
-  /** False when Orca has no numbers for this seat (e.g. an inactive Claude account). */
+  /** True when the plugin has numbers to go by: Orca's live ones, or a recent remembered reading. */
   known: boolean
+  /** live: Orca reports it now; cached: the last reading Orca gave; projected: a cached reading with
+   *  a window reset since; unknown: nothing usable. */
+  source?: 'live' | 'cached' | 'projected' | 'unknown'
+  /** When the numbers were taken. */
+  asOf?: number
+  reason?: UsageReason
+  /** Orca's own message for the reason, shortened. */
+  detail?: string
+  /** When Orca retries a rate-limited fetch. */
+  retryAt?: number
   session?: UsageWindow
   weekly?: UsageWindow
   /** A model-specific weekly bucket (Claude `fableWeekly`, ...). */
@@ -125,6 +143,8 @@ export type Config = {
   modelFallback: string
   defaultCooldownMinutes: number
   pollIntervalSeconds: number
+  /** How long a remembered reading stays usable; 0 turns the cache off. */
+  usageCacheMaxAgeHours: number
   handoffMaxChars: number
   orcaCliPath: string
   /** Automatic switching per service; a service that is off is never touched automatically. */
@@ -155,6 +175,7 @@ export const DEFAULT_CONFIG: Config = {
   modelFallback: '',
   defaultCooldownMinutes: 60,
   pollIntervalSeconds: 60,
+  usageCacheMaxAgeHours: 168,
   handoffMaxChars: 6000,
   orcaCliPath: '',
   services: allServices(true)

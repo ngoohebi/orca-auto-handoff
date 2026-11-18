@@ -7,7 +7,15 @@ import { DEFAULT_CONFIG, PROVIDERS, type Config, type Provider, type RotatorStat
 import './protocol'
 
 const STATE_KEY = 'state'
-const TICK_MS = 30_000
+const USAGE_KEY = 'usage'
+
+/** The tick follows the usage read period but never runs slower than 30 s, so parked sessions and
+ *  cooldowns stay on time; the CLI is still called only once per read period. */
+export function tickMs(pollIntervalSeconds: number): number {
+  return Math.min(30, Math.max(15, pollIntervalSeconds)) * 1000
+}
+
+const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
 export async function readConfig(orca: Pick<OrcaWorkerApi, 'settings'>): Promise<Config> {
   const s = (await orca.settings.get().catch(() => ({}))) as Record<string, unknown>
@@ -35,7 +43,8 @@ export async function readConfig(orca: Pick<OrcaWorkerApi, 'settings'>): Promise
     chain: str('chain', d.chain),
     modelFallback: str('model_fallback', d.modelFallback),
     defaultCooldownMinutes: num('default_cooldown_minutes', d.defaultCooldownMinutes),
-    pollIntervalSeconds: num('poll_interval_seconds', d.pollIntervalSeconds),
+    pollIntervalSeconds: clamp(num('poll_interval_seconds', d.pollIntervalSeconds), 15, 3600),
+    usageCacheMaxAgeHours: clamp(num('usage_cache_max_age_hours', d.usageCacheMaxAgeHours), 0, 720),
     handoffMaxChars: num('handoff_max_chars', d.handoffMaxChars),
     orcaCliPath: str('orca_cli_path', d.orcaCliPath),
     services: Object.fromEntries(
@@ -47,6 +56,7 @@ export async function readConfig(orca: Pick<OrcaWorkerApi, 'settings'>): Promise
 /** `claude 2/3 · 7%·18% | codex 1/3 · 0%` — only providers with more than one seat. */
 export function statusText(snapshot: Snapshot): { text: string; tone: 'neutral' | 'warning' | 'danger'; tooltip: string } {
   const parts: string[] = []
+  const remembered: string[] = []
   let tone: 'neutral' | 'warning' | 'danger' = 'neutral'
   for (const provider of PROVIDERS) {
     const seats = snapshot.seats.filter((s) => s.provider === provider)
@@ -61,7 +71,12 @@ export function statusText(snapshot: Snapshot): { text: string; tone: 'neutral' 
       .filter((n): n is number => typeof n === 'number')
       .map((n) => `${Math.round(n)}%`)
       .join('·')
-    parts.push(`${provider} ${index + 1}/${seats.length}${pct ? ` · ${pct}` : ''}`)
+    // `~`: remembered numbers, not Orca's live ones (the age is in the tooltip).
+    const approx = seat && seat.usage.source !== undefined && seat.usage.source !== 'live' && pct ? '~' : ''
+    if (approx && seat?.usage.asOf) {
+      remembered.push(`${provider}: last reading ${new Date(seat.usage.asOf).toLocaleString()}`)
+    }
+    parts.push(`${provider} ${index + 1}/${seats.length}${pct ? ` · ${approx}${pct}` : ''}`)
     const worst = Math.max(seat?.usage.session?.usedPercent ?? 0, seat?.usage.weekly?.usedPercent ?? 0)
     if (worst >= 80 && tone === 'neutral') tone = 'warning'
   }
@@ -72,10 +87,11 @@ export function statusText(snapshot: Snapshot): { text: string; tone: 'neutral' 
     : snapshot.paused
       ? 'Automatic switching is paused'
       : 'Automatic account switching is on. Click to switch to the next account.'
-  return { text, tone, tooltip }
+  return { text, tone, tooltip: remembered.length ? `${tooltip}\n${remembered.join('\n')}` : tooltip }
 }
 
-let timer: ReturnType<typeof setInterval> | undefined
+let timer: ReturnType<typeof setTimeout> | undefined
+let active: Rotator | undefined
 
 export async function activateWith(
   orca: OrcaWorkerApi,
@@ -90,6 +106,8 @@ export async function activateWith(
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     loadState: async () => (await orca.storage.get(STATE_KEY)) as RotatorState | null,
     saveState: (state) => orca.storage.set(STATE_KEY, state as never),
+    loadUsage: () => orca.storage.get(USAGE_KEY),
+    saveUsage: (cache) => orca.storage.set(USAGE_KEY, cache as never),
     config: () => readConfig(orca),
     log: (message) => orca.log(message),
     notify: async (title, body) => {
@@ -108,6 +126,7 @@ export async function activateWith(
     ...overrides
   }
   const rotator = new Rotator(deps)
+  active = rotator
   await rotator.init()
   // Load accounts now so the launch hook (2 s budget, no CLI) can record seats from the start.
   void rotator.accounts().then(() => rotator.publishNow())
@@ -131,7 +150,7 @@ export async function activateWith(
   orca.commands.register('rotator.refresh', async () => {
     await rotator.accounts(true)
     rotator.publishNow()
-    return 'Usage refreshed'
+    return 'Usage read from Orca. Accounts not in use update when Orca fetches them (its usage view, or right after a switch).'
   })
 
   orca.panels.handle('rotator.snapshot', async ({ refresh }) => {
@@ -154,6 +173,8 @@ export async function activateWith(
   // Changing it in Orca's Settings takes effect at once too.
   orca.settings.onDidChange(() => {
     void rotator.refreshServices()
+    // A new usage read period applies at once.
+    if (options.tick !== false) void schedule()
   })
 
   orca.panels.handle('rotator.cancelWaiting', async ({ terminalId }) => {
@@ -174,11 +195,21 @@ export async function activateWith(
     return JSON.parse(JSON.stringify({ events: rotator.recentEvents, focused, workspaces }))
   })
 
+  // Self-rescheduling so a changed `poll_interval_seconds` takes effect without a restart.
+  let generation = 0
+  const schedule = async (): Promise<void> => {
+    const mine = ++generation
+    if (timer) clearTimeout(timer)
+    const period = tickMs((await readConfig(orca)).pollIntervalSeconds)
+    if (mine !== generation) return
+    timer = setTimeout(async () => {
+      await rotator.tick().catch((error) => orca.log(`tick failed: ${String(error?.message ?? error)}`))
+      if (mine === generation) void schedule()
+    }, period)
+  }
   if (options.tick !== false) {
-    const run = () =>
-      rotator.tick().catch((error) => orca.log(`tick failed: ${String(error?.message ?? error)}`))
-    void run()
-    timer = setInterval(run, TICK_MS)
+    void rotator.tick().catch((error) => orca.log(`tick failed: ${String(error?.message ?? error)}`))
+    void schedule()
   }
   return rotator
 }
@@ -188,6 +219,8 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
 }
 
 export function deactivate(): void {
-  if (timer) clearInterval(timer)
+  if (timer) clearTimeout(timer)
   timer = undefined
+  active?.dispose()
+  active = undefined
 }

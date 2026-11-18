@@ -50,6 +50,33 @@ export function setup(ctx: PanelContext): void {
   void load()
 }
 
+/** `5h 40%`, or `5h 0% · reset since` for a remembered window whose reset time has passed. */
+function windowLabel(name: string, w: { usedPercent: number; reset?: true } | undefined): string {
+  return `${name} ${pct(w?.usedPercent)}${w?.reset ? ' · reset since' : ''}`
+}
+
+/** Why Orca has no live numbers for this account, in plain words. */
+function reasonText(seat: { usage: Snapshot['seats'][number]['usage']; active: boolean }): string | undefined {
+  switch (seat.usage.reason) {
+    case 'stale-token':
+      return 'Updates the next time this account runs.'
+    case 'sign-in':
+      return 'Sign in to this account again in Orca.'
+    case 'rate-limited':
+      return 'Orca is rate limited; it retries shortly.'
+    case 'fetching':
+      return 'Orca is fetching usage.'
+    case 'no-usage-api':
+      return 'This service reports no usage; only limits switch it.'
+    case 'not-reported':
+      return seat.active ? 'Orca has not reported usage yet.' : 'Orca reports usage for this account only while it is in use.'
+    case 'error':
+      return seat.usage.detail ?? 'Orca could not read usage.'
+    default:
+      return undefined
+  }
+}
+
 function pct(n: number | undefined): string {
   return typeof n === 'number' ? `${Math.round(n)}%` : '–'
 }
@@ -71,15 +98,28 @@ function SeatCard({ seat, now }: { seat: SeatRow; now: number }) {
       </Row>
       {seat.usage.known ? (
         <Stack gap="xs">
-          <Progress label={`5h ${pct(seat.usage.session?.usedPercent)}`} value={seat.usage.session?.usedPercent ?? 0} />
-          <Progress label={`Week ${pct(seat.usage.weekly?.usedPercent)}`} value={seat.usage.weekly?.usedPercent ?? 0} />
+          <Progress label={windowLabel('5h', seat.usage.session)} value={seat.usage.session?.usedPercent ?? 0} />
+          <Progress label={windowLabel('Week', seat.usage.weekly)} value={seat.usage.weekly?.usedPercent ?? 0} />
           {seat.usage.model ? (
-            <Progress label={`${seat.usage.model.name} week ${pct(seat.usage.model.usedPercent)}`} value={seat.usage.model.usedPercent} />
+            <Progress label={windowLabel(`${seat.usage.model.name} week`, seat.usage.model)} value={seat.usage.model.usedPercent} />
+          ) : null}
+          {seat.usage.source === 'cached' || seat.usage.source === 'projected' ? (
+            <Row gap="xs" align="center">
+              <Text muted size="xs">
+                Last reading
+              </Text>
+              {seat.usage.asOf ? <RelativeTime at={seat.usage.asOf} muted /> : null}
+              {reasonText(seat) ? (
+                <Text muted size="xs">
+                  · {reasonText(seat)}
+                </Text>
+              ) : null}
+            </Row>
           ) : null}
         </Stack>
       ) : (
         <Text muted size="xs">
-          Usage unknown until this account runs.
+          {reasonText(seat) ?? 'No usage reading yet.'}
         </Text>
       )}
       {cooling ? (
@@ -114,6 +154,7 @@ function Accounts({ snap }: { snap: Snapshot }) {
   if (providers.length === 0) {
     return <EmptyState title="No accounts" description="Add accounts with orca account add, then refresh." icon="agent" />
   }
+  const notLive = snap.seats.some((s) => s.usage.source !== undefined && s.usage.source !== 'live' && s.usage.reason !== 'no-usage-api')
   return (
     <Stack gap="md">
       {providers.map((p) => {
@@ -141,6 +182,11 @@ function Accounts({ snap }: { snap: Snapshot }) {
         </Card>
         )
       })}
+      {notLive ? (
+        <Text muted size="xs">
+          Orca refreshes accounts that are not in use when its usage view is open or right after an account switch; until then the last reading is shown.
+        </Text>
+      ) : null}
     </Stack>
   )
 }

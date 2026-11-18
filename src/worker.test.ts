@@ -70,6 +70,8 @@ function world(options: {
     fx.accountList({
       claudeActive,
       codexActive,
+      // Orca stamps each reading when it takes it.
+      updatedAt: clock,
       // The given (or exhausted) numbers belong to the first active account; an account
       // switched to later has room.
       claudeUsage: claudeActive === 'c1' ? options.claudeUsage ?? { session: 100, weekly: 40 } : options.laterClaudeUsage ?? { session: 5, weekly: 5 },

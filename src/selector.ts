@@ -66,7 +66,10 @@ export function load(seat: Seat): number {
  * exhausted seat (100 %) may always leave.
  */
 export function enoughGap(from: Seat | undefined, to: Seat, config: Config): boolean {
-  if (!from || !from.usage.known || !to.usage.known) return true
+  // Only Orca's live numbers are compared: a remembered reading ("reset since", a few hours old)
+  // is good enough to rule a seat in or out, not to measure a few points of headroom.
+  const live = (s: Seat) => s.usage.known && (s.usage.source === undefined || s.usage.source === 'live')
+  if (!from || !live(from) || !live(to)) return true
   const worst = Math.max(from.usage.session?.usedPercent ?? 0, from.usage.weekly?.usedPercent ?? 0)
   if (worst >= 100) return true
   return load(from) - load(to) >= config.minHeadroomGap
