@@ -126,7 +126,7 @@ The table below lists every trigger. Rows that mention thresholds, strategies or
 | Rate-limit banner in the pane's latest output | Cooldown that seat until the parsed reset time (else Orca's `resetsAt`, else *Default cooldown*), switch, resume. The next account is one with known room if there is one, else one presumed reset, else one without numbers |
 | Banner with no reset time on an account without usage numbers | A *strike*: the cooldown is *Default cooldown* × 2 per strike (60, 120, 240 min …), at most 5 h. Strikes count for 24 h |
 | Model-specific cap (e.g. Claude Fable weekly) | Smart and Follow my order: an account known to have room for that model, then `/model <next>` from *Model fallback* in place, then an account not known to be full for that model, then wait. Custom: `/model <next>` first; switch accounts only when the list runs out. `/model` is never typed into a pane whose input box holds unsent text; you are told instead |
-| API error (529, overloaded, stream disconnected) | Type the first message again after a Fibonacci backoff (5 s … 120 s), up to *Maximum API error retries*. Only while the pane is still between turns, and never into an input box that holds unsent text; you are told instead |
+| API error (529, overloaded, stream disconnected) | Type the first message again after a Fibonacci backoff (5 s … 120 s), up to *Maximum API error retries*. Only while the pane is still between turns and the error is still its latest output (if you went on meanwhile, what the pane shows now is handled instead), and never into an input box that holds unsent text; you are told instead |
 | Auth failure | 12 h cooldown on that seat, switch |
 | A turn ends while the seat is over a threshold | Switch to an account with known room (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets. An account without numbers is taken only when the current one is known to be at 100 % and no known account is left |
 | Every seat limited | Park; wake when the earliest seat frees up (*Wait for reset*). Carry on in the parked pane yourself and the wait ends. Close the parked pane yourself and the wait is dropped when it comes due: the session is not resumed, and History notes it in one line (`closed`), without a notification |
@@ -193,7 +193,9 @@ text is sent or cleared (see the table above). The *Move this workspace's agent 
 account* command and the panel's *Switch to this account* leave such a pane alone as well, and say so; like every
 other move they also never close a pane that is in the middle of a turn. The plugin asks Orca for that text
 (`orca terminal read --json`, field `draft`) and also looks at the input line on screen; if Orca
-cannot be asked, the screen alone decides.
+cannot be asked, the screen alone decides. The same holds for the first message after a move: if
+you are already typing in the resumed pane, or have sent something there, it is not typed, and
+the notification says the session is left for you to continue.
 
 **Guards on advisory moves** (threshold, idle, switch-back; hard limits ignore these two, and so
 does a move you ask for yourself from the panel or the command):

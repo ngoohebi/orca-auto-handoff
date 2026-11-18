@@ -40,6 +40,8 @@ function world(options: {
   drafts?: Record<string, string>
   /** Called while the CLI lists the active terminals (live: a process that takes a moment). */
   onActiveTerminals?: () => Promise<void>
+  /** Called while the CLI lists the accounts (live: about 3 s). */
+  onListAccounts?: () => Promise<void>
 }) {
   let clock = 1_000_000
   let claudeActive: string | null = 'c1'
@@ -59,6 +61,7 @@ function world(options: {
   const cli: Cli = {
     async listAccounts() {
       cliCalls.push('list')
+      await options.onListAccounts?.()
       const result = accountListFor()
       return result
     },
@@ -3170,5 +3173,128 @@ test('per-pane memory: each map is capped, newest entries kept', async () => {
     assert.ok('t1' in map)
     assert.ok(!('old0' in map))
   }
+  await worker.deactivate()
+})
+
+// ---- The first message after a move, and the retry after an API error ---------------------------
+
+test('after a move: the first message is not typed over text typed in the resumed pane, nor into a turn started there', async () => {
+  // The user starts typing in the resumed pane before it is ready (Orca reports the text apart).
+  const typing = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    drafts: { t2: 'wait, first check the logs' }
+  })
+  let worker = await typing.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(typing.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(typing.typed, [])
+  assert.equal(typing.cliCalls.filter((c) => c.startsWith('send')).length, 0)
+  assert.equal(stored(typing).history.at(-1)?.result, 'resumed')
+  assert.equal(stored(typing).paneSeat.t2, 'claude:c2')
+  assert.match(lastNote(typing), /unsent text in its input box.*left for you to continue/)
+  await worker.deactivate()
+
+  // The same with the text on the screen itself.
+  const onScreen = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET], t2: ['⏺ Working on it.', ...DRAFT_BOX] },
+    state: { paneSeat: { t1: 'claude:c1' } }
+  })
+  worker = await onScreen.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(onScreen.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(onScreen.typed, [])
+  await worker.deactivate()
+
+  // The user sends a message in the resumed pane before it reports ready: it is in the middle of
+  // a turn for as long as the plugin waits.
+  const working = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    onSleep: () => {
+      const resumed = working.panes.find((p) => p.terminalId === 't2')
+      if (resumed) resumed.state = 'working'
+    }
+  })
+  worker = await working.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(working.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(working.typed, [])
+  assert.equal(stored(working).history.at(-1)?.result, 'resumed')
+  await worker.deactivate()
+})
+
+test('API error: no retry is typed once the error is no longer the latest output; what is there instead is handled', async () => {
+  // During the backoff the user went on and that turn finished without an error.
+  const tails: Record<string, string[]> = { t1: [...fx.CLAUDE_API_ERROR] }
+  const went = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails,
+    claudeUsage: { session: 20, weekly: 20 },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    onSleep: () => {
+      tails.t1 = [...fx.CLAUDE_API_ERROR, '❯ never mind, just list the files', '⏺ Here they are:', '  src/a.ts', '  src/b.ts', '  src/c.ts', '  src/d.ts', '  src/e.ts', ...EMPTY_BOX]
+    }
+  })
+  let worker = await went.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(went.typed, [])
+  assert.equal(went.cliCalls.filter((c) => c.startsWith('send')).length, 0)
+  assert.deepEqual(selects(went), [])
+  assert.equal(stored(went).history.filter((h) => h.result === 'retried').length, 0)
+  await worker.deactivate()
+
+  // During the backoff the user went on and that turn ended on a limit. Its status event came
+  // while the retry was still pending, so the limit is handled when the backoff is over.
+  const limitTails: Record<string, string[]> = { t1: [...fx.CLAUDE_API_ERROR] }
+  const limited = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: limitTails,
+    state: { paneSeat: { t1: 'claude:c1' } },
+    onSleep: () => {
+      if (limited.panes.some((p) => p.terminalId === 't1')) limitTails.t1 = [...fx.CLAUDE_API_ERROR, '❯ continue', ...fx.CLAUDE_LIMIT_NO_RESET]
+    }
+  })
+  worker = await limited.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(limited), ['select claude c2'])
+  assert.deepEqual(limited.typed, [{ terminalId: 't2', text: 'Go continue.' }])
+  assert.equal(stored(limited).history.at(-1)?.result, 'resumed')
+  await worker.deactivate()
+})
+
+test('new launches: a tick already under way when a move changes the selection does not change it again within the cooldown', async () => {
+  // c3 comes first in the user's order and Orca has no numbers for it; c2 is known to have room.
+  // A limit on c1 moves the session to c2. A tick that began just before had already decided to
+  // select c3 for new launches, and waits behind that move.
+  let armed = false
+  let tick: Promise<void> | undefined
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] },
+    inactiveClaude: { c2: { session: 5, weekly: 5 } },
+    settings: { chain: 'claude:c3, claude:c1, claude:c2', auto_swap_idle_after_seconds: 0 },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    onListAccounts: async () => {
+      if (!armed || tick) return
+      tick = w.rotator.tick()
+      await new Promise((resolve) => setTimeout(resolve, 30))
+    }
+  })
+  const worker = await w.mount()
+  armed = true
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  await tick
+  assert.ok(tick, 'the tick ran during the move')
+  // One selection change, so Orca offers to restart the running sessions once, not twice.
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(stored(w).history.filter((h) => h.result === 'selected').length, 0)
+  // After the cooldown the selection goes to the first account in the order, as before.
+  w.advance(5 * MIN + 1000)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2', 'select claude c3'])
   await worker.deactivate()
 })

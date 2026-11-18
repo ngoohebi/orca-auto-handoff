@@ -999,7 +999,7 @@ export class Rotator {
 
     switch (signal.kind) {
       case 'api_error':
-        return this.retryApiError(pane, config)
+        return this.retryApiError(pane, config, signal)
       case 'model_cap':
         // Smart order: an account known to have room in that model's bucket, then the fallback
         // model on this account, then an account not known to be full in that bucket, then wait
@@ -1016,7 +1016,7 @@ export class Rotator {
     }
   }
 
-  private async retryApiError(pane: PaneInfo, config: Config): Promise<void> {
+  private async retryApiError(pane: PaneInfo, config: Config, signal: Signal): Promise<void> {
     if (!config.retryOnApiError) return
     const attempt = this.state.apiRetries[pane.terminalId] ?? 0
     if (attempt >= config.maxApiRetries) {
@@ -1042,6 +1042,13 @@ export class Rotator {
     if (!screen) {
       this.deps.log(`${pane.agent} ${pane.terminalId}: unreadable, not retrying`)
       return
+    }
+    // The backoff can outlast a turn the user started: only an error that is still the latest
+    // output is retried. Status events of this pane were set aside meanwhile (`inflight`), so
+    // whatever it shows now (a limit, or nothing) is looked at here instead.
+    if (classify(pane.agent, screen.lines, this.deps.now())?.fingerprint !== signal.fingerprint) {
+      this.deps.log(`${pane.agent} ${pane.terminalId}: the API error is no longer its latest output, not retrying`)
+      return this.inspect(pane)
     }
     if (await this.unsent(pane.terminalId, pane.server, screen.lines)) return this.leftForDraft(pane, 'api_error', 'the API error was not retried')
     await this.type(pane.terminalId, config.autoMessage || 'continue', pane.server)
@@ -1585,16 +1592,26 @@ export class Rotator {
       if (reason !== 'manual') this.startProbation(target, config, this.deps.now())
       await this.save()
       this.publishNow()
+      // Why the first message was not typed into the resumed pane, if it was not.
+      let left: 'busy' | 'draft' | null = null
       if (canResume) {
         await this.waitReady(newTerminal, pane.workspaceId)
         await this.seedSeen(newTerminal, pane.agent, pane.sessionId)
-        if (config.autoMessage) await this.type(newTerminal, config.autoMessage, pane.server)
+        if (config.autoMessage) {
+          // The resumed pane takes a while to be ready, and the user can be in it already: typing
+          // would send their unsent text with the message, or land in a turn they started.
+          const resumed: PaneInfo = { ...pane, terminalId: newTerminal }
+          left = (await this.midTurn(resumed)) ? 'busy' : (await this.draftIn(resumed, [])) ? 'draft' : null
+          if (left) this.deps.log(`${pane.agent} ${newTerminal}: ${left === 'busy' ? 'in the middle of a turn' : 'unsent text in the input box'}, not typing the first message`)
+          else await this.type(newTerminal, config.autoMessage, pane.server)
+        }
       }
       // In Smart the notification gives the reason in words, and says that Orca's own restart
       // prompt (shown whenever the selected account changes) needs no action.
       const plain = reason !== 'manual' && this.looksAhead(config)
       const body = plain ? `${PROVIDER_NAME[pane.agent]}: ${whyLine}.` : `${pane.agent}: ${from?.label ?? 'account'} → ${target.label} (${reason}).`
-      await this.deps.notify('Auto Hand-off', `${body}${plain && reselected ? ` ${restartNote(config)}` : ''}`)
+      const untyped = left === 'draft' ? ' The session has unsent text in its input box, so it is left for you to continue.' : ''
+      await this.deps.notify('Auto Hand-off', `${body}${untyped}${plain && reselected ? ` ${restartNote(config)}` : ''}`)
     } catch (error) {
       const message = String((error as Error)?.message ?? error)
       this.deps.log(`swap failed: ${message}`)
@@ -1911,6 +1928,8 @@ export class Rotator {
       if (!(await this.launchPlan(provider, view, server, config, now))) continue
       await this.withLock(provider, async () => {
         if (!(await this.allowed(provider))) return
+        // A move this waited behind may have changed the selection a moment ago.
+        if (!this.canChangeSelection(provider, config, this.deps.now())) return
         const fresh = await this.accountsFor(server, true)
         const from = fresh.active[provider]
         if (this.probation(provider, this.deps.now())) return
