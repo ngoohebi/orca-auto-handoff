@@ -1,5 +1,5 @@
 import { assert, test } from 'orca/testing'
-import { classify, hasDraft, parseModelFallback, parseReset } from './adapters'
+import { classify, draftOf, hasDraft, isClaudeHint, parseModelFallback, parseReset } from './adapters'
 import * as fx from './fixtures'
 
 const NOW = new Date(2026, 10, 18, 10, 0, 0).getTime()
@@ -135,4 +135,15 @@ test('live: unsent text is seen with the console status line rows and the mode l
   assert.equal(hasDraft(['⏺ Done.', FRAME, '❯', FRAME, ...STATUS_ROWS, MODE_LINE]), false)
   // A sent prompt with a reply under it is still no draft.
   assert.equal(hasDraft(['❯ also update the docs', '⏺ Updated.', FRAME, '❯', FRAME, ...STATUS_ROWS, MODE_LINE]), false)
+})
+
+test('the unsent text itself is read from the box; Claude\u2019s fixed hint is known only by its exact wording', () => {
+  assert.equal(draftOf(['⏺ Done.', FRAME, '❯ also update the docs', FRAME, ...STATUS_ROWS, MODE_LINE]), 'also update the docs')
+  assert.equal(draftOf(['⏺ Done.', '╭────╮', '│ > fix the flaky test  │', '╰────╯']), 'fix the flaky test')
+  assert.equal(draftOf(['⏺ Done.', FRAME, '❯', FRAME, MODE_LINE]), null)
+  assert.equal(isClaudeHint('Press up to edit queued messages'), true)
+  assert.equal(isClaudeHint('  Press up to edit queued messages \n'), true)
+  for (const typed of ['Press up to edit queued messages.', 'press up to edit queued messages', 'Press up to edit queued messages now', 'Press up to edit', 'keep going', '']) {
+    assert.equal(isClaudeHint(typed), false, typed)
+  }
 })

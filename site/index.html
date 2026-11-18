@@ -344,7 +344,7 @@ footer a{color:var(--fg-2)}
     </div>
 
     <div class="grid g3" style="margin-top:28px">
-      <div class="tile"><h3>Guards on moves</h3><p>No automatic move closes a pane holding unsent text. At a hard limit, or when a parked session is due, you are told once and the move is carried out as soon as the text is sent or cleared. Threshold, idle and switch-back moves also need at least a 10 % headroom gap, and change a service's selection at most once per 5 minutes; hard limits ignore those two.</p></div>
+      <div class="tile"><h3>Guards on moves</h3><p>No automatic move closes a pane holding unsent text. At a hard limit, or when a parked session is due, you are told once and the move is carried out as soon as the text is sent or cleared. Threshold, idle and switch-back moves also need at least a 10 % headroom gap, and change a service's selection at most once per 5 minutes; hard limits ignore those two. Claude's grey prompt suggestion is reported like typed text, so it can still hold back an automatic early move; the panel's manual switch asks instead.</p></div>
       <div class="tile"><h3>Panes it did not start</h3><p>A restored pane has no recorded account. If it hits a limit while Orca shows plenty of room on the active account, the plugin cools nothing and simply resumes the session there.</p></div>
       <div class="tile"><h3>Off switches</h3><p>Detection is heuristic. One toggle pauses every service, each service has its own switch, and <code>exclude</code> keeps named accounts out of automatic rotation.</p></div>
     </div>
@@ -403,7 +403,7 @@ footer a{color:var(--fg-2)}
       </div>
       <div class="tile">
         <h3>Panel</h3>
-        <p>Gauge icon in the right sidebar. Each account with 5-hour, weekly and model bars, active and limited badges, a cooldown countdown, <em>Clear</em> and, on each standby account, <em>Switch to this account</em> (it asks first, then new sessions start on that account and the session in the current tab moves too if it is between turns with nothing unsent). Plus the automatic-switching toggle, parked sessions and the swap history.</p>
+        <p>Gauge icon in the right sidebar. Each account with 5-hour, weekly and model bars, active and limited badges, a cooldown countdown, <em>Clear</em> and, on each standby account, <em>Switch to this account</em> (it asks first, then new sessions start on that account and the session in the current tab moves too if it is between turns; when it shows unsent text, which includes Claude's grey prompt suggestion, the panel shows the text and asks once more before moving it). Plus the automatic-switching toggle, parked sessions and the swap history.</p>
       </div>
       <div class="tile">
         <h3>Commands</h3>
@@ -486,7 +486,7 @@ footer a{color:var(--fg-2)}
       <div class="tile">
         <h3>Outside the host API</h3>
         <ul class="check">
-          <li>Runs the <b>orca CLI</b>: <code>account select</code>, <code>account list</code>, <code>terminal close</code>, <code>terminal send</code>, <code>terminal read</code> (only to ask whether a pane holds unsent text), <code>terminal list</code> (only to see which terminal tab is in front). Always an argument list, never a shell.</li>
+          <li>Runs the <b>orca CLI</b>: <code>account select</code>, <code>account list</code>, <code>terminal close</code>, <code>terminal send</code>, <code>terminal read</code> (only to ask whether a pane holds unsent text; the panel shows that text when it asks before a manual switch), <code>terminal list</code> (only to see which terminal tab is in front). Always an argument list, never a shell.</li>
           <li>For a project on a paired Orca server: loads Orca's own runtime client from the app bundle to list and select that server's accounts, and to look up, read-only, which Orca a workspace runs on. These are Orca internals, not a published API</li>
           <li>Writes its status file and the status line script under <code>~/.orca/account-rotator/</code>, and, only when you install the console status line, that workspace's <code>.claude/settings.local.json</code></li>
           <li>Runs <b>git status</b> and <b>git diff --stat</b> for handoff prompts</li>

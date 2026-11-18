@@ -223,6 +223,96 @@ test('a standby offers "Switch to this account", asks first in plain words, and 
   assert.equal(view.valueOf({ label: 'Auto hand-off Claude' }), false)
 })
 
+test('"Yes, switch" on a session with unsent text asks once more, with the text; only "Move anyway" gives it up', async () => {
+  const LONG = `please also update the docs ${'and the changelog '.repeat(8)}`.trim()
+  const calls: unknown[] = []
+  let shown = { terminalId: 't1', text: 'keep going' }
+  let auto = true
+  const seats: Snapshot['seats'] = [
+    { key: 'claude:a', provider: 'claude', accountId: 'a', label: 'inuse@example.test', active: true, usage: { known: true, session: { usedPercent: 50, resetsAt: NOW + 3_600_000 } } },
+    { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'spare@example.test', active: false, usage: { known: true, session: { usedPercent: 5, resetsAt: NOW + 3_600_000 } } }
+  ]
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snapshot({ seats, services: { claude: auto, codex: true, antigravity: true, opencode: true, devin: true } }),
+      'rotator.consoleLine': () => ({ installed: false }),
+      'rotator.switchTo': (input) => {
+        calls.push(input)
+        // The worker moves only over exactly the text that was accepted.
+        if (input.acceptDraft !== true || input.draft?.text !== shown.text) return { message: 'Claude: this session shows unsent text; nothing was switched', draft: shown }
+        auto = false
+        return { message: 'Claude: new launches use spare@example.test; this pane moved (resumed)' }
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.press({ text: 'Switch to this account' })
+  await view.press({ text: 'Yes, switch' })
+  assert.deepEqual(calls, [{ seatKey: 'claude:b' }])
+  // The second confirmation, in the same block, with the text.
+  assert.ok(view.find({ text: 'This session shows unsent text: “keep going”.' }))
+  assert.ok(view.find({ text: 'Move it anyway? The text will be cleared.' }))
+  assert.ok(view.find({ text: 'Move anyway' }))
+  assert.ok(!view.find({ text: 'Yes, switch' }))
+  assert.ok(!view.find({ text: /nothing was switched/ }))
+  // Cancel does nothing: no further request, and the button is back.
+  await view.press({ text: 'Cancel' })
+  assert.equal(calls.length, 1)
+  assert.ok(!view.find({ text: /This session shows unsent text/ }))
+  assert.ok(view.find({ text: 'Switch to this account' }))
+  assert.equal(view.valueOf({ label: 'Auto hand-off Claude' }), true)
+  // Again; the text changes before "Move anyway": the worker asks again, the panel shows the new
+  // text (cut to 80 characters), and nothing has moved.
+  await view.press({ text: 'Switch to this account' })
+  await view.press({ text: 'Yes, switch' })
+  shown = { terminalId: 't1', text: LONG }
+  await view.press({ text: 'Move anyway' })
+  assert.deepEqual(calls.at(-1), { seatKey: 'claude:b', acceptDraft: true, draft: { terminalId: 't1', text: 'keep going' } })
+  assert.ok(view.find({ text: `This session shows unsent text: “${LONG.slice(0, 80)}…”.` }))
+  assert.ok(!view.find({ text: /this pane moved/ }))
+  // "Move anyway" sends the explicit acceptance with the whole text it showed.
+  await view.press({ text: 'Move anyway' })
+  assert.deepEqual(calls.at(-1), { seatKey: 'claude:b', acceptDraft: true, draft: { terminalId: 't1', text: LONG } })
+  assert.equal(calls.length, 4)
+  assert.ok(view.find({ text: /this pane moved \(resumed\)/ }))
+  assert.ok(!view.find({ text: /This session shows unsent text/ }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('the question about unsent text is dropped when the focus moves to a project on another server', async () => {
+  // A paired server lists other accounts under the same keys: an answer there would be about an
+  // account and a session the question never named.
+  const calls: unknown[] = []
+  const seats: Snapshot['seats'] = [
+    { key: 'claude:a', provider: 'claude', accountId: 'a', label: 'inuse@example.test', active: true, usage: { known: true, session: { usedPercent: 50, resetsAt: NOW + 3_600_000 } } },
+    { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'spare@example.test', active: false, usage: { known: true, session: { usedPercent: 5, resetsAt: NOW + 3_600_000 } } }
+  ]
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snapshot({ seats }),
+      'rotator.consoleLine': () => ({ installed: false }),
+      'rotator.switchTo': (input) => {
+        calls.push(input)
+        return { message: 'Claude: this session shows unsent text; nothing was switched', draft: { terminalId: 't1', text: 'keep going' } }
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.press({ text: 'Switch to this account' })
+  await view.press({ text: 'Yes, switch' })
+  assert.ok(view.find({ text: 'Move anyway' }))
+  await view.post('rotator.changed', snapshot({ server: 'ssh:studio', seats: seats.map((s) => ({ ...s, label: `remote-${s.label}` })) }))
+  assert.ok(!view.find({ text: 'Move anyway' }))
+  assert.ok(!view.find({ text: /This session shows unsent text/ }))
+  assert.ok(view.find({ text: 'Switch to this account' }))
+  // Back on this computer it is not there again either.
+  await view.post('rotator.changed', snapshot({ seats }))
+  assert.ok(!view.find({ text: 'Move anyway' }))
+  assert.equal(calls.length, 1)
+  await view.unmount()
+})
+
 test('a project on an SSH target: the panel says Orca manages no accounts there', async () => {
   const host = mockHost({
     requests: {

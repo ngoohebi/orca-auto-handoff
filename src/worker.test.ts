@@ -1419,29 +1419,175 @@ test('manual switch: the pane in the tab moves as the confirmation says, also wh
   }
 })
 
-test('manual switch: the pane still waits for the end of its turn and for unsent text, and the message says which', async () => {
-  // Unsent text, on screen or as Orca reports it apart from the screen: the account is selected,
-  // the pane is not closed.
+/** A Claude pane between turns on c1, in the current tab. */
+const idleInTab = (extra: Partial<Parameters<typeof world>[0]> = {}) =>
+  world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: ['⏺ Done.', '╭──────────────╮', '│ >', '╰──────────────╯'] },
+    claudeUsage: { session: 5, weekly: 5 },
+    activeTerminals: ['t1'],
+    state: { paneSeat: { t1: 'claude:c1' } },
+    ...extra
+  })
+
+test('manual switch: unsent text in the pane is asked about; without the answer nothing is switched, and the text comes back', async () => {
+  // Unsent text, on screen or as Orca reports it apart from the screen.
   for (const how of ['screen', 'orca'] as const) {
-    const w = world({
-      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
-      tails: { t1: how === 'screen' ? ['⏺ Done.', ...DRAFT_BOX] : ['⏺ Done.', ...EMPTY_BOX] },
-      claudeUsage: { session: 5, weekly: 5 },
-      activeTerminals: ['t1'],
-      state: { paneSeat: { t1: 'claude:c1' } },
-      ...(how === 'orca' ? { drafts: { t1: 'also update the docs' } } : {})
-    })
+    const w = idleInTab(how === 'screen' ? { tails: { t1: ['⏺ Done.', ...DRAFT_BOX] } } : { drafts: { t1: '  also update the docs ' } })
     const worker = await w.mount()
-    const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
-    assert.match(message, /new launches use two@example\.test; this pane has unsent text in its input box and keeps its account/, how)
-    assert.deepEqual(selects(w), ['select claude c2'], how)
+    const answer = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+    assert.deepEqual(answer.draft, { terminalId: 't1', text: 'also update the docs' }, how)
+    assert.match(answer.message, /nothing was switched/, how)
+    // Nothing changed: no account selected, the service still on, the pane as it was.
+    assert.deepEqual(selects(w), [], how)
+    assert.notEqual(w.host.data().settings.service_claude, false, how)
+    assert.equal((await worker.request('rotator.snapshot', {})).services.claude, true, how)
     assert.equal(w.host.callsOf('terminal.close').length, 0, how)
     assert.equal(w.host.callsOf('agent.resume').length, 0, how)
     assert.deepEqual(w.typed, [], how)
-    assert.equal(stored(w).paneSeat.t1, 'claude:c1', how)
+    assert.deepEqual(stored(w)?.history ?? [], [], how)
+    // `acceptDraft` alone, or anything but `true`, or the text without it, accepts nothing.
+    for (const input of [{ acceptDraft: true }, { acceptDraft: 'yes' as never, draft: answer.draft! }, { draft: answer.draft! }, { acceptDraft: true, draft: 'also update the docs' as never }]) {
+      const again = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', ...input })
+      assert.deepEqual(again.draft, answer.draft, `${how} ${JSON.stringify(input)}`)
+      assert.deepEqual(selects(w), [], how)
+      assert.equal(w.host.callsOf('terminal.close').length, 0, how)
+    }
     await worker.deactivate()
   }
+})
 
+test('manual switch: with the text accepted by the second confirmation the pane moves, and the service\u2019s hand-off goes off as before', async () => {
+  const w = idleInTab({ drafts: { t1: 'also update the docs' } })
+  const worker = await w.mount()
+  const asked = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+  const { message, draft } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', acceptDraft: true, draft: asked.draft! })
+  assert.equal(draft, undefined)
+  assert.match(message, /new launches use two@example\.test; this pane moved \(resumed\)/)
+  assert.match(message, /Automatic hand-off for Claude is now off/)
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.equal(stored(w).paneSeat.t2, 'claude:c2')
+  assert.equal(w.host.data().settings.service_claude, false)
+  await worker.deactivate()
+})
+
+test('manual switch: text that changed since it was shown, or another pane\u2019s, is asked about again, never moved over', async () => {
+  const drafts: Record<string, string> = { t1: 'also update the docs' }
+  const w = idleInTab({ drafts })
+  const worker = await w.mount()
+  const first = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+  // The user typed on before pressing *Move anyway*.
+  drafts.t1 = 'also update the docs and the changelog'
+  const second = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', acceptDraft: true, draft: first.draft! })
+  assert.deepEqual(second.draft, { terminalId: 't1', text: 'also update the docs and the changelog' })
+  assert.deepEqual(selects(w), [])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  // The same words accepted for another pane do not cover this one.
+  const other = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', acceptDraft: true, draft: { terminalId: 't9', text: drafts.t1 } })
+  assert.deepEqual(other.draft, second.draft)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  // Asked again and accepted as it is now: the pane moves.
+  const third = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', acceptDraft: true, draft: second.draft! })
+  assert.match(third.message, /this pane moved \(resumed\)/)
+  assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
+  await worker.deactivate()
+
+  // The text changes after the account was selected, just before the pane would be closed: the
+  // pane stays, and the message says so.
+  let reads = 0
+  const late: Record<string, string> = {}
+  Object.defineProperty(late, 't1', { enumerable: true, get: () => (reads++ === 0 ? 'also update the docs' : 'also update the docs, and then') })
+  const race = idleInTab({ drafts: late })
+  const worker2 = await race.mount()
+  const { message, draft } = await worker2.request('rotator.switchTo', { seatKey: 'claude:c2', acceptDraft: true, draft: { terminalId: 't1', text: 'also update the docs' } })
+  assert.equal(draft, undefined)
+  assert.match(message, /new launches use two@example\.test; this pane has unsent text in its input box and keeps its account/)
+  assert.deepEqual(selects(race), ['select claude c2'])
+  assert.equal(race.host.callsOf('terminal.close').length, 0)
+  assert.equal(race.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(race.typed, [])
+  await worker2.deactivate()
+})
+
+test('manual switch: accepting the text lifts no other guard: never in the middle of a turn, never onto a limited account', async () => {
+  const accepted = { acceptDraft: true, draft: { terminalId: 't1', text: 'also update the docs' } }
+  for (const busy of ['working', 'blocked'] as const) {
+    const w = idleInTab({ panes: [{ terminalId: 't1', agent: 'claude', state: busy, sessionId: 's1' }], drafts: { t1: 'also update the docs' } })
+    const worker = await w.mount()
+    const { message, draft } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', ...accepted })
+    assert.equal(draft, undefined, busy)
+    assert.match(message, /keeps its account while it works/, busy)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, busy)
+    assert.equal(w.host.callsOf('agent.resume').length, 0, busy)
+    assert.ok(w.panes.some((p) => p.terminalId === 't1'), busy)
+    await worker.deactivate()
+  }
+  // A turn that starts while the account is being selected (the pane was idle when asked).
+  const started = idleInTab({
+    drafts: { t1: 'also update the docs' },
+    onListAccounts: async () => {
+      if (selects(started).length > 0) started.panes[0]!.state = 'working'
+    }
+  })
+  let worker = await started.mount()
+  const late = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', ...accepted })
+  assert.match(late.message, /keeps its account while it works/)
+  assert.equal(started.host.callsOf('terminal.close').length, 0)
+  await worker.deactivate()
+  // A limited account is refused whatever was accepted.
+  const cooled = idleInTab({ drafts: { t1: 'also update the docs' } })
+  worker = await cooled.mount()
+  cooled.rotator.state.health['claude:c2'] = { cooldownUntil: cooled.rotator['deps'].now() + 3_600_000, reason: 'rate_limit' }
+  const refused = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', ...accepted })
+  assert.match(refused.message, /limited until/)
+  assert.deepEqual(selects(cooled), [])
+  assert.equal(cooled.host.callsOf('terminal.close').length, 0)
+  // Another service's account never takes the Claude pane.
+  const codex = await worker.request('rotator.switchTo', { seatKey: 'codex:x2', ...accepted })
+  assert.equal(codex.draft, undefined)
+  assert.equal(cooled.host.callsOf('terminal.close').length, 0)
+  await worker.deactivate()
+})
+
+test('Claude\u2019s own fixed hint in the input box is no unsent text; anything else, however close, is', async () => {
+  const HINT = 'Press up to edit queued messages'
+  // The manual switch moves the pane without asking, as Orca reports the hint or as the screen shows it.
+  for (const extra of [{ drafts: { t1: HINT } }, { drafts: { t1: `  ${HINT}\n` } }, { tails: { t1: ['⏺ Done.', '╭──────────────╮', `│ > ${HINT}`, '╰──────────────╯'] } }]) {
+    const w = idleInTab(extra)
+    const worker = await w.mount()
+    const { message, draft } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+    assert.equal(draft, undefined, JSON.stringify(extra))
+    assert.match(message, /this pane moved \(resumed\)/, JSON.stringify(extra))
+    await worker.deactivate()
+  }
+  // Text that only resembles the hint is the user's.
+  for (const text of [`${HINT}.`, HINT.toLowerCase(), `${HINT} please`, `ok. ${HINT}`, 'Press up to edit queued message', 'keep going']) {
+    const w = idleInTab({ drafts: { t1: text } })
+    const worker = await w.mount()
+    const { draft } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+    assert.deepEqual(draft, { terminalId: 't1', text }, text)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, text)
+    await worker.deactivate()
+  }
+  // Automatic moves: a limit closes a pane that shows only the hint, and holds for other text.
+  for (const [text, moves] of [[HINT, true], [`${HINT}?`, false], ['push it', false]] as const) {
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, '╭──────────────╮', '│ >', '╰──────────────╯'] },
+      state: { paneSeat: { t1: 'claude:c1' } },
+      drafts: { t1: text }
+    })
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    assert.equal(w.host.callsOf('terminal.close').length, moves ? 1 : 0, text)
+    assert.equal(!!stored(w).waiting[0]?.draftAt, !moves, text)
+    await worker.deactivate()
+  }
+})
+
+test('manual switch: a pane in the middle of a turn is left alone, also by the command that moves this workspace\u2019s agent', async () => {
   // In the middle of a turn (asking for permission counts): left alone, also by the command that
   // moves this workspace's agent.
   for (const busy of ['working', 'blocked'] as const) {

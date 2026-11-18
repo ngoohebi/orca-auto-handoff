@@ -315,17 +315,26 @@ export async function activateWith(
     const message = enabled ? await consoleLine.install() : await consoleLine.uninstall()
     return { ...(await consoleLine.status()), message }
   })
-  orca.panels.handle('rotator.switchTo', async ({ seatKey }) => {
+  orca.panels.handle('rotator.switchTo', async ({ seatKey, acceptDraft, draft: shown }) => {
     // A manual choice must not be undone by the rotator: automatic hand-off for the service
     // stops as soon as the account is selected (before any automatic move that waits behind the
     // switch can run), and the user turns it on again when they want rotation back.
     let turnedOff = false
-    const { message, switched, provider } = await rotator.forceTo(seatKey, async (chosen) => {
-      if (rotator.services[chosen] === false) return
-      await orca.settings.set(`service_${chosen}`, false)
-      await rotator.refreshServices(false)
-      turnedOff = true
-    })
+    // Unsent text is given up only by the panel's second confirmation, which names the text it
+    // showed: `acceptDraft` must be exactly `true`, and without the text nothing is accepted.
+    const accepted = acceptDraft === true && typeof shown?.terminalId === 'string' && typeof shown?.text === 'string' ? { terminalId: shown.terminalId, text: shown.text } : undefined
+    const { message, switched, provider, draft } = await rotator.forceTo(
+      seatKey,
+      async (chosen) => {
+        if (rotator.services[chosen] === false) return
+        await orca.settings.set(`service_${chosen}`, false)
+        await rotator.refreshServices(false)
+        turnedOff = true
+      },
+      accepted
+    )
+    // The pane shows unsent text: nothing was switched, the panel asks.
+    if (draft !== undefined) return { message, draft }
     if (!switched || !turnedOff) return { message }
     rotator.publishNow()
     const name = PROVIDER_NAME[provider]

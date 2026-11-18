@@ -197,10 +197,21 @@ without numbers, as long as it has no strikes.
 included: a pane whose input box holds unsent text is never closed. An advisory move is dropped
 and considered again at the next turn end or idle check; a limit move stays pending until the
 text is sent or cleared (see the table above). The *Move this workspace's agent to another
-account* command and the panel's *Switch to this account* leave such a pane alone as well, and say so; like every
-other move they also never close a pane that is in the middle of a turn. The plugin asks Orca for that text
-(`orca terminal read --json`, field `draft`) and also looks at the input line on screen; if Orca
-cannot be asked, the screen alone decides. The same holds for the first message after a move: if
+account* command leaves such a pane alone as well, and says so. The panel's *Switch to this
+account* asks instead: after *Yes, switch* it changes nothing and shows a second confirmation in
+the same block, "This session shows unsent text: “…”. Move it anyway? The text will be cleared.",
+with the text (the first 80 characters). *Cancel* leaves everything as it was: no account is
+selected and the session stays. Only *Move anyway* moves the session, and the text is lost with
+the closed pane. The answer covers only the session and the text that were shown: if the text
+changed meanwhile, the panel asks again with what is there now. No automatic move ever gives text up this
+way, and the answer lifts no other guard: like every other move, these never close a pane that
+is in the middle of a turn, and a limited account is still refused. The plugin asks Orca for
+that text (`orca terminal read --json`, field `draft`) and also looks at the input line on
+screen; if Orca cannot be asked, the screen alone decides. Orca reports Claude Code's own grey
+texts in the same field. A fixed hint is told apart by its exact wording and is not unsent text;
+the list holds one, "Press up to edit queued messages". Text that only resembles it is treated
+as yours. A grey prompt suggestion ("keep going") cannot be told from typing and counts as
+unsent text (see *Known limitations*). The same holds for the first message after a move: if
 you are already typing in the resumed pane, or have sent something there, it is not typed, and
 the notification says the session is left for you to continue. A first message that cannot be
 typed at all (the new pane is gone, or the CLI fails) is said the same way; the move itself
@@ -290,9 +301,10 @@ and these are ignored.
     from 80 % used, red from 90 %), and *Clear* on a cooldown;
   - on each standby account, *Switch to this account*, which asks first: new sessions of that
     service start on it, and the session in the current tab moves there too when it is between
-    turns and its input box holds no unsent text, whatever the headroom of the account you chose.
-    A pane that is working, or that holds unsent text, keeps its account, and the panel says
-    which; it is not moved later. This move is yours, so it also happens with *Running sessions*
+    turns, whatever the headroom of the account you chose. A pane that is working keeps its
+    account, and the panel says so; it is not moved later. When the session shows unsent text,
+    nothing is switched yet and the block asks once more, showing the text: *Cancel* changes
+    nothing, *Move anyway* moves the session and the text is cleared. This move is yours, so it also happens with *Running sessions*
     on `launches` or `auto_resume` off. Automatic hand-off for that service turns off as soon as the
     account is selected, so
     the plugin never undoes a choice you made by hand: no switch-back, no threshold or limit
@@ -408,7 +420,8 @@ regression tests:
 - **Unsent text (Orca 1.4.263):** `terminal.read` gives the rendered screen with the text typed in
   an agent's input box taken out (the box reads as empty); `orca terminal read --json` reports
   that text apart, as `draft`. The plugin therefore asks the CLI before every move or typed
-  message.
+  message. The same field carries Claude Code's grey prompt suggestion (seen live: "keep going",
+  "push it") and its fixed hints, with nothing that marks them as not typed.
 - **Console status line rows (Orca 1.4.263):** the screen read includes the rows the console status
   line prints under the input box. They are skipped like the rest of the footer, so they neither
   hide a banner above them nor an unsent line.
@@ -546,11 +559,20 @@ most are rare.
 
 - **Claude's greyed prompt suggestion counts as unsent text.** After a turn, Claude Code can show
   a suggested next prompt in grey in the input box. Orca (1.4.263) reports it to plugins the same
-  way as text you typed, so the plugin cannot tell the two apart and plays safe: an early, idle,
-  switch-back or expiring-quota move of that pane is skipped, and the move command and *Switch to
-  this account* say the pane "has unsent text" and leave it. A real limit is not affected as far
-  as known: Claude is not known to show a suggestion after a turn that failed on a limit. To get
-  those moves, turn *Prompt suggestions* off in Claude Code (`/config`).
+  way as text you typed, so the plugin cannot tell the two apart and plays safe. A suggestion
+  therefore still holds back automatic early moves: an early, idle, switch-back or
+  expiring-quota move of that pane is skipped, and the move command says the pane "has unsent
+  text" and leaves it. The panel's *Switch to this account* asks instead: it shows the text and
+  moves the session only after *Move anyway*. A real limit is not affected as far as known:
+  Claude is not known to show a suggestion after a turn that failed on a limit. To get the
+  automatic moves, turn *Prompt suggestions* off in Claude Code (`/config`).
+- **Only one fixed Claude hint is recognised.** "Press up to edit queued messages" is ignored as
+  unsent text, by its exact wording. Any other fixed line Claude Code shows in an empty input box
+  is treated as unsent text, like a suggestion, until its wording is added.
+- **With unsent text showing, the panel cannot select an account for new launches only.**
+  *Switch to this account* then either moves the session in the tab (*Move anyway*) or changes
+  nothing (*Cancel*). Change tabs, or use Orca's own account switcher, to select the account
+  without moving that session.
 - **Banner wordings are not all confirmed.** Only some limit messages were captured from the real
   CLIs; the others follow each CLI's known wording. If a CLI changes its message, that limit is
   not seen until the rules are updated. Many extra rows under the input box (for example a long
@@ -587,7 +609,8 @@ Orca asks you to approve the plugin's access. Beyond the host API, the worker ru
 `git diff --stat`. It always uses an argument list, never a shell. The CLI is used because the host
 API cannot select accounts, refuses to close or type into panes outside the focused workspace,
 does not say whether a pane's input box holds unsent text (`terminal read` does; only its `draft`
-field is used), and does not say which terminal tab is in front (`terminal list
+field is used, and that text is only shown to you in the panel's second confirmation, never
+stored or logged), and does not say which terminal tab is in front (`terminal list
 --include-visual-layouts` does; read-only, for the panel's *this terminal* mark and for the pane
 *Switch to this account* moves).
 

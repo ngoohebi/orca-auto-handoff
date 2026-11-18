@@ -159,14 +159,29 @@ const FOOTER = new RegExp(`^\\s*(╰|─{3,}|│\\s*$|←|⏵|\\? for shortcuts|
  * prompt looks the same but has a reply under it.
  */
 export function hasDraft(lines: readonly string[]): boolean {
+  return draftOf(lines) !== null
+}
+
+/** The unsent text `hasDraft` sees in the input box, or null when the box is empty. */
+export function draftOf(lines: readonly string[]): string | null {
   const content = lines.map((l) => l.replace(/\s+$/, '')).filter((l) => l.trim() !== '')
   const at = content.map((l) => /^\s*(│\s*)?(›|❯|>)(\s|$)/.test(l)).lastIndexOf(true)
-  if (at < 0 || !content.slice(at + 1).every((l) => FOOTER.test(l))) return false
+  if (at < 0 || !content.slice(at + 1).every((l) => FOOTER.test(l))) return null
   const text = content[at]!
     .replace(/^\s*(│\s*)?(›|❯|>)\s?/, '')
     .replace(/│\s*$/, '')
     .trim()
-  return text.length > 0 && !PLACEHOLDER.test(text)
+  return text.length > 0 && !PLACEHOLDER.test(text) ? text : null
+}
+
+/** Fixed lines Claude Code itself shows in an empty input box, which Orca reports as `draft`
+ *  like typed text (Orca 1.4.263). Only wordings seen as a whole draft belong here. */
+export const CLAUDE_HINTS: readonly string[] = ['Press up to edit queued messages']
+
+/** Is this draft one of Claude Code's own fixed hints, and so not text the user typed? The whole
+ *  text must be the hint (after trimming): typing that only contains or resembles one is a draft. */
+export function isClaudeHint(text: string): boolean {
+  return CLAUDE_HINTS.includes(text.trim())
 }
 
 export function normalise(line: string): string {

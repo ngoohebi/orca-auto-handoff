@@ -1,6 +1,6 @@
 // The rotator: reacts to agent status, classifies the terminal tail, and swaps seats.
 // Every side effect goes through Deps so tests run it with a fake host, CLI and clock.
-import { ADAPTERS, CHROME, classify, countCopies, hasDraft, parseModelFallback } from './adapters'
+import { ADAPTERS, CHROME, classify, countCopies, draftOf, isClaudeHint, parseModelFallback } from './adapters'
 import { parseAccounts, type AccountView } from './accounts'
 import { PROVIDER_NAME, displayLabels, whyMove } from './labels'
 import { parseLive } from './live-usage'
@@ -1743,13 +1743,22 @@ export class Rotator {
    *  `draft`. So Orca is asked, and the lines are looked at as well, for an Orca that leaves the
    *  text in them. When Orca cannot say, the lines alone decide. */
   private async unsent(terminalId: string, server: string | undefined, lines: readonly string[]): Promise<boolean> {
-    if (hasDraft(lines)) return true
+    return (await this.unsentText(terminalId, server, lines)) !== null
+  }
+
+  /** The unsent text in a pane's input box (trimmed), or null when there is none. Orca reports
+   *  Claude Code's grey prompt suggestion and its fixed hints as `draft` too, and nothing tells a
+   *  suggestion from typing, so it counts as unsent text; a fixed hint (`isClaudeHint`) is known
+   *  by its exact wording and is no text. */
+  private async unsentText(terminalId: string, server: string | undefined, lines: readonly string[]): Promise<string | null> {
+    const onScreen = draftOf(lines)
+    if (onScreen !== null && !isClaudeHint(onScreen)) return onScreen
     try {
       const text = await (server ? this.deps.cli.draft?.(terminalId, server) : this.deps.cli.draft?.(terminalId))
-      return typeof text === 'string' && text.trim() !== ''
+      return typeof text === 'string' && text.trim() !== '' && !isClaudeHint(text) ? text.trim() : null
     } catch (error) {
       this.deps.log(`could not ask Orca for unsent text in ${terminalId}: ${String((error as Error)?.message ?? error)}`)
-      return false
+      return null
     }
   }
 
@@ -2362,8 +2371,18 @@ export class Rotator {
    *  worker then turns the service's automatic hand-off off, so the rotator never undoes a
    *  choice the user made by hand; the panel says so and offers the toggle. A limited account
    *  is refused. Returns what happened and whether anything was switched. `chosen` runs as soon
-   *  as the account is selected, before any other move of that service can run. */
-  async forceTo(seatKey: string, chosen?: (provider: Provider) => Promise<void>): Promise<{ message: string; switched: boolean; provider: Provider }> {
+   *  as the account is selected, before any other move of that service can run.
+   *
+   *  A pane that would move but shows unsent text is not moved, and nothing is selected: the text
+   *  comes back as `draft`, with the pane it is in, and the panel asks. `acceptedDraft` is what
+   *  the user then agreed to lose (the panel's second confirmation, nothing else, passes it):
+   *  the pane moves only while it is that pane and its text is still exactly that; any other
+   *  text is asked about again. */
+  async forceTo(
+    seatKey: string,
+    chosen?: (provider: Provider) => Promise<void>,
+    acceptedDraft?: { terminalId: string; text: string }
+  ): Promise<{ message: string; switched: boolean; provider: Provider; draft?: { terminalId: string; text: string } }> {
     const config = await this.deps.config()
     const server = await this.focusedServer()
     const view = await this.accountsFor(server, true)
@@ -2376,6 +2395,19 @@ export class Rotator {
       return { message: `${PROVIDER_NAME[provider]}: ${seat.label} is limited until ${new Date(health.cooldownUntil).toLocaleTimeString()}; clear the cooldown first`, switched: false, provider }
     }
     if (view.active[provider] === seat.key) return { message: `${PROVIDER_NAME[provider]}: new launches already use ${seat.label}`, switched: false, provider }
+    const agreed = (terminalId: string, text: string) => !!acceptedDraft && acceptedDraft.terminalId === terminalId && acceptedDraft.text.trim() === text
+    // Before anything is selected: would the pane in the tab move, and does it show unsent text
+    // the user has not agreed to lose? Then the panel asks first, and nothing has changed yet.
+    const ahead = await this.currentPane(provider)
+    if (ahead && ahead.server === server && !ahead.sshHost && (ahead.state === 'waiting' || ahead.state === 'done') && this.locate(ahead.terminalId, provider, view).seat?.key !== seat.key) {
+      const screen = await this.deps.host.call('terminal.read', { terminalId: ahead.terminalId, maxLines: 80 }).catch(() => null)
+      // Unreadable: the pane is not moved at all (below), so there is nothing to ask.
+      const text = screen && !(await this.midTurn(ahead)) ? await this.unsentText(ahead.terminalId, ahead.server, screen.lines) : null
+      if (text !== null && !agreed(ahead.terminalId, text)) {
+        this.deps.log(`${provider} ${ahead.terminalId}: unsent text in the input box, asking before moving it`)
+        return { message: `${PROVIDER_NAME[provider]}: this session shows unsent text; nothing was switched`, switched: false, provider, draft: { terminalId: ahead.terminalId, text } }
+      }
+    }
     const selected = await this.selectSeatOn(server, seat.key, chosen)
     const pane = await this.currentPane(provider)
     // The focus moved to a project on another server meanwhile: the pane in front now runs on
@@ -2396,9 +2428,20 @@ export class Rotator {
       if (!screen) return null
       // The user chose this account, so the guards of a move that is only advice (the headroom
       // gap, the selection cooldown, probation) do not apply. What protects the session does:
-      // never in the middle of a turn, never over unsent text.
-      const unsafe = await this.unsafeToMove(pane, screen.lines)
-      if (unsafe) return unsafe
+      // never in the middle of a turn, and never over unsent text, unless it is exactly the text
+      // the user was shown and agreed to lose. Text that came or changed since (the pane as it
+      // is now, the last thing looked at before it is closed) is theirs: the pane stays.
+      if (await this.midTurn(pane)) {
+        this.deps.log(`${pane.agent} ${pane.terminalId}: in the middle of a turn, not moving it`)
+        return 'busy'
+      }
+      const again = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
+      const text = await this.unsentText(pane.terminalId, pane.server, again?.lines ?? screen.lines)
+      if (text !== null && !agreed(pane.terminalId, text)) {
+        this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not moving it`)
+        return 'draft'
+      }
+      if (text !== null) this.deps.log(`${pane.agent} ${pane.terminalId}: moving it over the unsent text the user agreed to lose`)
       const before = this.state.history.length
       // "Running sessions: new launches only" (and the legacy `auto_resume` off) say what the
       // plugin does by itself; this move was asked for, and the confirmation said it happens.

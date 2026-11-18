@@ -34,7 +34,7 @@ import {
   type Tone
 } from 'orca'
 import { minLeft, percentLeft, PROVIDER_NAME, runwayWords, seatOrder } from './labels'
-import type { ConsoleLineState, Snapshot } from './protocol'
+import type { ConsoleLineState, Snapshot, UnsentDraft } from './protocol'
 import { PROVIDERS, type Provider } from './types'
 
 /** The Auto-switch mode as the panel names it. */
@@ -48,6 +48,46 @@ const tab = atom('tab', 'accounts', { persist: 'plugin' })
 const consoleLine = atom<ConsoleLineState | null>(null)
 /** The standby account whose *Switch to this account* is waiting for confirmation. */
 const confirming = atom<string | null>(null)
+/** *Yes, switch* found unsent text in the session that would move: the account it was for and the
+ *  text, shown in a second confirmation. Only its *Move anyway* gives the text up. */
+const draftAsk = atom<{ seatKey: string; draft: UnsentDraft } | null>(null)
+/** Takes a new snapshot. A project on another server lists other accounts under the same keys,
+ *  and has another session in front: a question about unsent text asked before is dropped. */
+function show(next: Snapshot): void {
+  if ((next.server ?? '') !== (read(snapshot)?.server ?? '')) set(draftAsk, null)
+  set(snapshot, next)
+}
+
+/** How much of the unsent text the second confirmation shows. */
+const DRAFT_SHOWN = 80
+
+/** The unsent text on one line, cut to what fits the confirmation. */
+function shownDraft(text: string): string {
+  const line = text.replace(/\s+/g, ' ').trim()
+  return line.length > DRAFT_SHOWN ? `${line.slice(0, DRAFT_SHOWN)}…` : line
+}
+
+/** Asks the worker to switch. When the session that would move shows unsent text nothing is
+ *  switched and the second confirmation opens instead; `accepted` is the text its *Move anyway*
+ *  gives up, and nothing else passes it. */
+function switchTo(seatKey: string, accepted?: UnsentDraft): Promise<void> {
+  let asked = false
+  return act(
+    `switch:${seatKey}`,
+    async () => {
+      const result = await plugin.request('rotator.switchTo', accepted ? { seatKey, acceptDraft: true, draft: accepted } : { seatKey }, { timeoutMs: SWITCH_TIMEOUT_MS })
+      if (!result.draft) return result.message
+      // Nothing changed yet (also when the text changed since it was shown): ask.
+      asked = true
+      set(draftAsk, { seatKey, draft: result.draft })
+      set(message, null)
+    },
+    // Nothing to read again when nothing was switched.
+    async () => {
+      if (!asked) await load()
+    }
+  )
+}
 
 /** The console line state; one retry, since the first request after a reload can race the
  *  worker's restart and the row would otherwise stay hidden until the next refresh. */
@@ -63,7 +103,7 @@ async function readConsoleLine(): Promise<ConsoleLineState | null> {
 }
 
 async function load(refresh = false): Promise<void> {
-  set(snapshot, await plugin.request('rotator.snapshot', { refresh }))
+  show(await plugin.request('rotator.snapshot', { refresh }))
   set(consoleLine, await readConsoleLine())
 }
 
@@ -111,7 +151,7 @@ const FOCUS_POLL_MS = 3_000
 const FOCUS_POLL_MAX_MS = 15_000
 
 export function setup(ctx: PanelContext): void {
-  ctx.subscriptions.push(plugin.on('rotator.changed', (payload) => set(snapshot, payload)))
+  ctx.subscriptions.push(plugin.on('rotator.changed', (payload) => show(payload)))
   // The Status line switch is per workspace: the worker says when the focused one changes.
   ctx.subscriptions.push(plugin.on('rotator.consoleLine', (payload) => set(consoleLine, payload)))
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -124,7 +164,7 @@ export function setup(ctx: PanelContext): void {
         const current = read(snapshot)
         if (!closed && current && current.focused !== focused) {
           moved = true
-          set(snapshot, { ...current, focused })
+          show({ ...current, focused })
         }
       } catch {
         // The worker may be restarting; ask again later.
@@ -343,7 +383,31 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
             then stops, so the plugin never undoes the choice; the block says so. */}
         {switchable && !seat.active && !cooling ? (
           <Box paddingY="xs">
-            {read(confirming) === seat.key ? (
+            {read(draftAsk)?.seatKey === seat.key ? (
+              <Box border="accent" radius="md" padding="sm" gap="sm">
+                <Text size="sm" weight="medium">{`This session shows unsent text: “${shownDraft(read(draftAsk)!.draft.text)}”.`}</Text>
+                <Text size="xs" muted>
+                  Move it anyway? The text will be cleared.
+                </Text>
+                <Row justify="end" gap="xs">
+                  <Button size="sm" variant="ghost" onPress={() => set(draftAsk, null)}>
+                    Cancel
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={read(busy) !== null}
+                    onPress={() => {
+                      const asked = read(draftAsk)
+                      set(draftAsk, null)
+                      if (asked) void switchTo(seat.key, asked.draft)
+                    }}
+                  >
+                    Move anyway
+                  </Button>
+                </Row>
+              </Box>
+            ) : read(confirming) === seat.key ? (
               <Box border="accent" radius="md" padding="sm" gap="sm">
                 <Text size="sm" weight="medium">{`Use ${seat.label} for ${name}?`}</Text>
                 <Text size="xs" muted>
@@ -365,11 +429,7 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
                     disabled={read(busy) !== null}
                     onPress={() => {
                       set(confirming, null)
-                      void act(
-                        `switch:${seat.key}`,
-                        async () => (await plugin.request('rotator.switchTo', { seatKey: seat.key }, { timeoutMs: SWITCH_TIMEOUT_MS })).message,
-                        () => load()
-                      )
+                      void switchTo(seat.key)
                     }}
                   >
                     Yes, switch
@@ -384,7 +444,11 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
                   icon="next"
                   tooltip={`Use this account for ${name} now, instead of waiting for auto hand-off`}
                   disabled={read(busy) !== null}
-                  onPress={() => set(confirming, seat.key)}
+                  onPress={() => {
+                    // One question at a time: an older one about unsent text is dropped.
+                    set(draftAsk, null)
+                    set(confirming, seat.key)
+                  }}
                 >
                   Switch to this account
                 </Button>
@@ -463,7 +527,7 @@ function ServiceSection({ provider, snap, now }: { provider: Provider; snap: Sna
               act(`service:${provider}`, async () => {
                 const { services } = await plugin.request('rotator.setService', { provider, enabled })
                 const current = read(snapshot)
-                if (current) set(snapshot, { ...current, services })
+                if (current) show({ ...current, services })
                 return `${PROVIDER_NAME[provider]}: automatic hand-off ${enabled ? 'on' : 'off'}`
               })
             }

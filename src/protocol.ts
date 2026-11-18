@@ -7,6 +7,9 @@ export type ConsoleLineState = { installed: boolean; workspace?: string; reason?
 
 export type { Snapshot }
 
+/** Unsent text a pane shows in its input box (trimmed), and the pane. */
+export type UnsentDraft = { terminalId: string; text: string }
+
 declare module 'orca' {
   interface PluginRequests {
     /** Seats, cooldowns, parked sessions and recent history. */
@@ -29,7 +32,12 @@ declare module 'orca' {
     /** The panel's *Manual switch*: select that account for its service, move the current
      *  terminal's pane when it runs that service and is between turns, and turn the service's
      *  automatic hand-off off so the choice is never undone; the panel offers the toggle. */
-    'rotator.switchTo': { input: { seatKey: string }; output: { message: string } }
+    /** When the pane that would move shows unsent text, nothing is switched and the text comes
+     *  back as `draft`, with the pane it is in: the panel asks, and only its *Move anyway* sends
+     *  the request again with `acceptDraft: true` and that same `draft`. The pane then moves only
+     *  while it is that pane and its text is still exactly that; other text comes back as
+     *  `draft` again. */
+    'rotator.switchTo': { input: { seatKey: string; acceptDraft?: boolean; draft?: UnsentDraft }; output: { message: string; draft?: UnsentDraft } }
     'rotator.cancelWaiting': { input: { terminalId: string }; output: { ok: true } }
     /** The one-time note about `custom` mode was read. */
     'rotator.dismissNotice': { input: Record<string, never>; output: { ok: true } }
