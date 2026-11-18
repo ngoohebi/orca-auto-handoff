@@ -33,6 +33,8 @@ function world(options: {
   activeTerminals?: string[]
   /** Called when the plugin waits (a backoff, a settle delay), with the wait in ms. */
   onSleep?: (ms: number) => void
+  /** While it returns true, Orca cannot list agents (`agents.list` fails). */
+  agentsListFails?: () => boolean
 }) {
   let clock = 1_000_000
   let claudeActive: string | null = 'c1'
@@ -102,7 +104,10 @@ function world(options: {
     settings: options.settings ?? {},
     storage: options.state ? { state: { paused: false, health: {}, paneSeat: {}, seen: {}, apiRetries: {}, modelStep: {}, waiting: [], history: [], ...options.state } as never } : {},
     results: {
-      'agents.list': () => ({ agents: panes.map((p) => ({ title: null, task: null, stateStartedAt: 1, sessionId: null, ...p })) }),
+      'agents.list': () => {
+        if (options.agentsListFails?.()) throw Object.assign(new Error('selector_not_found'), { code: 'action_failed' })
+        return { agents: panes.map((p) => ({ title: null, task: null, stateStartedAt: 1, sessionId: null, ...p })) }
+      },
       'terminal.read': ({ terminalId }: { terminalId: string }) => ({ lines: options.tails[terminalId] ?? [], truncated: false }),
       'terminal.close': ({ terminalId }: { terminalId: string }) => {
         const i = panes.findIndex((p) => p.terminalId === terminalId)
@@ -2660,5 +2665,195 @@ test('a parked session that is in the middle of a turn again (asking for permiss
   assert.deepEqual(selects(w), [])
   assert.deepEqual(w.typed, [])
   assert.equal(stored(w).waiting.length, 0)
+  await worker.deactivate()
+})
+
+const parkedWorld = (extra: { agentsListFails?: () => boolean } = {}) =>
+  world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] },
+    state: {
+      paneSeat: { t1: 'claude:c1' },
+      health: { 'claude:c2': { cooldownUntil: 1_000_000 + 10 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 20 * MIN } }
+    },
+    ...extra
+  })
+
+test('a parked pane the user closed is not resumed at wake time: the wait is dropped with one History line', async () => {
+  const w = parkedWorld()
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting.length, 1)
+  const said = w.host.callsOf('notifications.show').length
+  // The user closes the parked pane themselves.
+  w.panes.splice(0, 1)
+  w.advance(11 * MIN)
+  await w.rotator.tick()
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(w.host.callsOf('agent.launch').length, 0)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.deepEqual(selects(w), [])
+  assert.deepEqual(w.typed, [])
+  const state = stored(w)
+  assert.equal(state.waiting.length, 0)
+  const closed = state.history.filter((h) => h.result === 'closed')
+  assert.equal(closed.length, 1)
+  assert.equal(closed[0]!.terminalId, 't1')
+  assert.match(closed[0]!.why ?? '', /closed/)
+  assert.equal(state.paneSeat.t1, undefined)
+  // Quiet: nothing is said about it.
+  assert.equal(w.host.callsOf('notifications.show').length, said)
+  await worker.deactivate()
+})
+
+test('a pane that waits for unsent text and is then closed by the user is not resumed either', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, '❯ my half-typed prompt'] },
+    state: { paneSeat: { t1: 'claude:c1' } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting.length, 1)
+  assert.ok(stored(w).waiting[0]!.draftAt)
+  w.panes.splice(0, 1)
+  delete w.tails.t1
+  w.advance(MIN)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(stored(w).waiting.length, 0)
+  assert.equal(stored(w).history.at(-1)?.result, 'closed')
+  await worker.deactivate()
+})
+
+test('a parked pane that is still open is resumed at wake time; the close of that move is not taken for the user closing it', async () => {
+  const w = parkedWorld()
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting.length, 1)
+  w.advance(11 * MIN)
+  await w.rotator.tick()
+  // The plugin closed t1 itself and resumed the session in a new pane.
+  assert.equal(w.host.callsOf('terminal.close').length, 1)
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.ok(w.panes.every((p) => p.terminalId !== 't1'))
+  w.advance(MIN)
+  await w.rotator.tick()
+  const state = stored(w)
+  assert.equal(state.waiting.length, 0)
+  assert.equal(state.history.filter((h) => h.result === 'closed').length, 0)
+  assert.equal(state.history.filter((h) => h.result === 'resumed').length, 1)
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('a parked pane Orca cannot list right now keeps waiting: it is neither dropped nor resumed blind', async () => {
+  let fails = false
+  const w = parkedWorld({ agentsListFails: () => fails })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting.length, 1)
+  fails = true
+  w.advance(11 * MIN)
+  await w.rotator.tick()
+  assert.equal(stored(w).waiting.length, 1)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  fails = false
+  w.advance(MIN)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.equal(stored(w).waiting.length, 0)
+  await worker.deactivate()
+})
+
+test('per-pane memory: entries of panes that are gone are forgotten after a while; live and waiting panes keep theirs', async () => {
+  const banner = { fingerprint: 'claude|rate_limit|x', occurrences: 1 }
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'working', sessionId: 's1' }],
+    tails: { t1: ['⏺ Working.'] },
+    claudeUsage: { session: 10, weekly: 10 },
+    state: {
+      paneSeat: { t1: 'claude:c1', gone1: 'claude:c2', gone2: 'claude:c1', parked: 'claude:c1' },
+      seen: { t1: banner, gone1: banner, 'session:old': banner },
+      apiRetries: { t1: 1, gone1: 2 },
+      modelStep: { t1: 1, gone2: 1 },
+      // A wait that is not due: its pane is the wake's business, not this clean-up's.
+      waiting: [{ terminalId: 'parked', workspaceId: 'w1', agent: 'codex', wakeAt: 1_000_000 + 600 * MIN, hold: 'short' }]
+    }
+  })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  // Looked at no more than every 10 minutes, and nothing goes before 30 minutes of absence.
+  for (let i = 0; i < 5; i++) {
+    w.advance(5 * MIN)
+    await w.rotator.tick()
+  }
+  assert.equal(w.rotator.state.paneSeat.gone1, 'claude:c2')
+  assert.equal(w.rotator.state.apiRetries.gone1, 2)
+  w.advance(5 * MIN)
+  await w.rotator.tick()
+  const state = stored(w)
+  assert.deepEqual(state.paneSeat, { t1: 'claude:c1', parked: 'claude:c1' })
+  assert.deepEqual(Object.keys(state.seen).sort(), ['session:old', 't1'])
+  assert.deepEqual(state.apiRetries, { t1: 1 })
+  assert.deepEqual(state.modelStep, { t1: 1 })
+  await worker.deactivate()
+})
+
+test('per-pane memory: nothing is forgotten while Orca cannot list the panes, and a pane seen again starts over', async () => {
+  let fails = true
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'working', sessionId: 's1' }],
+    tails: { t1: ['⏺ Working.'] },
+    claudeUsage: { session: 10, weekly: 10 },
+    state: { paneSeat: { t1: 'claude:c1', t9: 'claude:c2' } },
+    agentsListFails: () => fails
+  })
+  const worker = await w.mount()
+  for (let i = 0; i < 5; i++) {
+    await w.rotator.tick()
+    w.advance(10 * MIN)
+  }
+  assert.deepEqual(w.rotator.state.paneSeat, { t1: 'claude:c1', t9: 'claude:c2' })
+  fails = false
+  // Missing for 20 minutes, then listed again (a pane Orca restored): the count starts over.
+  for (let i = 0; i < 3; i++) {
+    await w.rotator.tick()
+    w.advance(10 * MIN)
+  }
+  w.panes.push({ terminalId: 't9', agent: 'claude', state: 'working' })
+  await w.rotator.tick()
+  w.panes.pop()
+  for (let i = 0; i < 3; i++) {
+    w.advance(10 * MIN)
+    await w.rotator.tick()
+  }
+  assert.equal(w.rotator.state.paneSeat.t9, 'claude:c2')
+  w.advance(10 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(w.rotator.state.paneSeat, { t1: 'claude:c1' })
+  await worker.deactivate()
+})
+
+test('per-pane memory: each map is capped, newest entries kept', async () => {
+  const many = Object.fromEntries(Array.from({ length: 620 }, (_, i) => [`old${i}`, 'claude:c2']))
+  const counts = Object.fromEntries(Array.from({ length: 620 }, (_, i) => [`old${i}`, 1]))
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'working' }],
+    tails: {},
+    claudeUsage: { session: 10, weekly: 10 },
+    state: { paneSeat: { ...many, t1: 'claude:c1' }, apiRetries: { ...counts, t1: 2 }, modelStep: { ...counts, t1: 3 } }
+  })
+  const worker = await w.mount()
+  await w.rotator.setPaused(true)
+  const state = stored(w)
+  for (const map of [state.paneSeat, state.apiRetries, state.modelStep]) {
+    assert.equal(Object.keys(map).length, 500)
+    assert.ok('t1' in map)
+    assert.ok(!('old0' in map))
+  }
   await worker.deactivate()
 })

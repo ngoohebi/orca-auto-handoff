@@ -233,7 +233,7 @@ footer a{color:var(--fg-2)}
         <span class="badge">v<b>0.2.0</b></span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
         <span class="badge"><b>MIT</b> license</span>
-        <span class="badge"><b>199</b> tests, real captured banners</span>
+        <span class="badge"><b>206</b> tests, real captured banners</span>
         <span class="badge">Never switches <b>across services</b></span>
       </div>
       <div class="cta">
@@ -335,7 +335,7 @@ footer a{color:var(--fg-2)}
         <tr><td>API error (529, overloaded, stream disconnected)</td><td>Type the first message again after a Fibonacci backoff from 5 s to 120 s, up to the retry limit. Only while the pane is still between turns, and never into an input box that holds unsent text.</td></tr>
         <tr><td>Auth failure</td><td>12-hour cooldown on that account, then switch.</td></tr>
         <tr><td>A turn ends while the account is over a threshold</td><td>Switch. The account left behind stays out of rotation until its window resets. Smart, the default, also leaves an account shortly before it runs out (about 10 minutes ahead at the current pace), between turns or when the session is idle. In custom mode thresholds default to 100 %, so this is reactive only.</td></tr>
-        <tr><td>Every account of the service limited</td><td>Park the session and wake it when the earliest account frees up. Carry on in the parked pane yourself and the wait ends.</td></tr>
+        <tr><td>Every account of the service limited</td><td>Park the session and wake it when the earliest account frees up. Carry on in the parked pane yourself and the wait ends. Close it yourself and the session is not resumed.</td></tr>
         <tr><td>A higher-priority account is healthy again</td><td><b>Switch back.</b> New launches use it, and sessions on lower accounts move back when they finish a turn or sit idle.</td></tr>
         <tr><td>A session idles on an over-threshold account</td><td>Move it after <em>Move idle sessions after</em> seconds, 900 by default.</td></tr>
         <tr><td><code>orca account select</code> fails for an account</td><td>Skip that account for 10 minutes and take the next.</td></tr>
@@ -523,7 +523,7 @@ footer a{color:var(--fg-2)}
     <div class="note"><b>Coming from cux?</b> Run <code>cux uninstall-hooks</code> first so the two don't both rotate. Every cux setting key has the same name here. Per-directory project bindings and <code>cux attach</code> are not migrated yet.</div>
     <details>
       <summary>Working on the plugin itself</summary>
-      <pre style="margin-top:12px"><code>orca plugin test . --json        # 199 tests: adapters, selector, usage, status line, worker end to end, panel
+      <pre style="margin-top:12px"><code>orca plugin test . --json        # 206 tests: adapters, selector, usage, status line, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker
 npx -p typescript tsc -p .       # type-check
 orca plugin validate . --json

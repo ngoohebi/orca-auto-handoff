@@ -129,7 +129,7 @@ The table below lists every trigger. Rows that mention thresholds, strategies or
 | API error (529, overloaded, stream disconnected) | Type the first message again after a Fibonacci backoff (5 s … 120 s), up to *Maximum API error retries*. Only while the pane is still between turns, and never into an input box that holds unsent text; you are told instead |
 | Auth failure | 12 h cooldown on that seat, switch |
 | A turn ends while the seat is over a threshold | Switch to an account with known room (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets. An account without numbers is taken only when the current one is known to be at 100 % and no known account is left |
-| Every seat limited | Park; wake when the earliest seat frees up (*Wait for reset*). Carry on in the parked pane yourself and the wait ends |
+| Every seat limited | Park; wake when the earliest seat frees up (*Wait for reset*). Carry on in the parked pane yourself and the wait ends. Close the parked pane yourself and the wait is dropped when it comes due: the session is not resumed, and History notes it in one line (`closed`), without a notification |
 | A limit, or the wake of a parked session, finds unsent text in the pane's input box | The pane is not closed. The limited account is still set aside, History notes the wait once, and you are told once: "Claude hit its limit on *account*. Send or clear the text you were typing and the session moves to *target*." The plugin looks again at every status event and timer tick and carries out the move once the text is gone; the panel lists the session under *Waiting*, where *Cancel* drops the move. Send the text instead and that turn is handled like any other |
 | A higher-priority account is healthy again | **Switch back:** select it for new launches; sessions on lower accounts move back when they finish a turn or sit idle. Running sessions move only to an account that is known or presumed reset |
 | A session idles on an over-threshold account | Move it after *Move idle sessions after* seconds (900 by default; 0 = off), under the same rule as a threshold move |
@@ -271,6 +271,9 @@ and these are ignored.
   - under an account's bars, "About 8 min left at this pace" when its last readings show a pace
     (see [Pace of use](#pace-of-use)); amber at 30 minutes or less, red at 10;
   - swap history: the last 7 days, older entries are cleaned up automatically (at most 1,000 kept).
+    What the plugin remembers per pane (its account, handled banners, retry counts) is dropped
+    once Orca has not listed the pane for 30 minutes, checked at most every 10 minutes while the
+    focused project is on this computer, and each such list keeps at most 500 entries.
     Each move, wait and selection change says why in one line, for example "work is over its
     usage threshold (used 97 % of 5h, 40 % of the week); moved to personal (used 12 % of 5h)".
 - **Commands:** switch Claude or Codex to the next account, move this workspace's agent to
@@ -515,7 +518,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 199 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 206 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

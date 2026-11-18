@@ -138,6 +138,12 @@ const STRIKE_SETTLE_MS = 60_000
 const FIVE_HOURS_MS = 5 * 3_600_000
 /** A model's bucket counts as having room with at least this many points left. */
 const MODEL_ROOM_LEFT = 10
+/** What is remembered per pane is looked over at most this often… */
+const PANE_PRUNE_EVERY_MS = 10 * 60_000
+/** …and a pane's entries go once Orca has not listed the pane for this long. */
+const PANE_GONE_MS = 30 * 60_000
+/** The most entries each per-pane map keeps. */
+const PANE_MAP_CAP = 500
 
 /** Said with every automatic change of the selected account: Orca then shows its own prompt
  *  offering to restart the running sessions, which the user can ignore. */
@@ -248,6 +254,15 @@ export class Rotator {
   private listings = new Map<string, Promise<AccountView>>()
   private followUp = 0
   private disposed = false
+  /** Moves (and anything else under a provider's lock) running or queued right now. */
+  private locked = 0
+  /** Panes the plugin itself is closing or moving right now. */
+  private moving = new Set<string>()
+  /** Panes on a remote Orca server: this computer's listing may not carry them. */
+  private remotePanes = new Set<string>()
+  /** Since when a remembered pane has been missing from `agents.list` (see `prunePanes`). */
+  private absentSince = new Map<string, number>()
+  private panesPrunedAt = 0
 
   constructor(private deps: Deps) {
     // Every account switch the plugin makes goes through here: note it, and read usage again
@@ -327,6 +342,10 @@ export class Rotator {
     const seenKeys = Object.keys(this.state.seen)
     if (seenKeys.length > 500) {
       for (const k of seenKeys.slice(0, seenKeys.length - 500)) delete this.state.seen[k]
+    }
+    for (const map of [this.state.paneSeat, this.state.apiRetries, this.state.modelStep] as Record<string, unknown>[]) {
+      const keys = Object.keys(map)
+      for (const k of keys.slice(0, Math.max(0, keys.length - PANE_MAP_CAP))) delete map[k]
     }
     await this.deps.saveState(this.state)
   }
@@ -774,6 +793,8 @@ export class Rotator {
     const provider = providerOf(agent)
     if (!provider || !terminalId) return
     const hostServer = parseServer(hostFromWorkspaceIdentity(workspaceId))
+    if (hostServer) this.remotePanes.add(terminalId)
+    this.absentSince.delete(terminalId)
     const view = (hostServer ? this.views.get(hostServer)?.view : undefined) ?? this.cachedView()
     if (!view) return
     const key = view.active[provider]
@@ -860,7 +881,10 @@ export class Rotator {
       const title = row.title ?? event.title
       if (title) pane.title = title
       const server = await this.serverOfWorkspace(workspaceId, event.workspaceListId)
-      if (server) pane.server = server
+      if (server) {
+        pane.server = server
+        this.remotePanes.add(pane.terminalId)
+      }
       const sshHost = await this.sshTargetOfWorkspace(workspaceId)
       if (sshHost) pane.sshHost = sshHost
       return pane
@@ -1150,7 +1174,10 @@ export class Rotator {
 
   private async withLock<T>(provider: Provider, fn: () => Promise<T>): Promise<T> {
     const prev = this.locks.get(provider) ?? Promise.resolve()
-    const run = prev.then(fn, fn)
+    this.locked++
+    const run = prev.then(fn, fn).finally(() => {
+      this.locked--
+    })
     this.locks.set(provider, run.catch(() => undefined))
     return run
   }
@@ -1457,6 +1484,7 @@ export class Rotator {
       await this.holdForDraft(pane, from, target, reason, signal?.model, view)
       return
     }
+    this.moving.add(pane.terminalId)
     try {
       if (view.active[target.provider] !== target.key) {
         await this.selectOn(target.provider, target.accountId, pane.server)
@@ -1506,6 +1534,8 @@ export class Rotator {
       this.forget(pane.terminalId)
       if (carried && canResume && !pane.sessionId) this.state.seen[newTerminal] = { ...carried }
       this.state.paneSeat[newTerminal] = target.key
+      this.absentSince.delete(newTerminal)
+      if (pane.server) this.remotePanes.add(newTerminal)
       this.state.waiting = this.state.waiting.filter((w) => w.terminalId !== pane.terminalId)
       this.record({
         provider: pane.agent,
@@ -1545,6 +1575,8 @@ export class Rotator {
       await this.save()
       await this.deps.notify('Auto Hand-off', `Swap to ${target.label} failed: ${message}`)
       this.publishNow()
+    } finally {
+      this.moving.delete(pane.terminalId)
     }
   }
 
@@ -1750,8 +1782,58 @@ export class Rotator {
       await this.reselectForLaunches(config)
       await this.sweepIdle(config)
     }
+    await this.prunePanes()
     await this.refreshFocus()
     this.publishNow()
+  }
+
+  /** Forgets what is remembered per pane (`paneSeat`, `seen` by terminal, `apiRetries`,
+   *  `modelStep`) for panes Orca has not listed for PANE_GONE_MS. Looked at on the tick, at most
+   *  every PANE_PRUNE_EVERY_MS, only while the focused project is on this computer, and never
+   *  while a move runs. Banners remembered per session (`session:<id>`) stay: a session can come
+   *  back in a new pane. Passive, so it also runs while paused. */
+  private async prunePanes(): Promise<void> {
+    const now = this.deps.now()
+    if (this.server || this.locked > 0 || now - this.panesPrunedAt < PANE_PRUNE_EVERY_MS) return
+    this.panesPrunedAt = now
+    const live = new Set<string>()
+    try {
+      const { workspaces, truncated } = await this.deps.host.call('workspace.list')
+      // An incomplete list cannot show that a pane is gone.
+      if (truncated) return
+      for (const ws of workspaces as { id: string }[]) {
+        const { agents } = await this.deps.host.call('agents.list', { workspaceId: ws.id })
+        for (const row of agents) if (row.terminalId) live.add(row.terminalId)
+      }
+    } catch {
+      // Orca could not say which panes exist: nothing is forgotten this time.
+      return
+    }
+    // A move may have started while the panes were listed.
+    if (this.locked > 0 || this.moving.size > 0) return
+    const s = this.state
+    const known = new Set([
+      ...Object.keys(s.paneSeat),
+      ...Object.keys(s.seen).filter((k) => !k.startsWith('session:')),
+      ...Object.keys(s.apiRetries),
+      ...Object.keys(s.modelStep)
+    ])
+    for (const id of [...this.absentSince.keys()]) if (!known.has(id)) this.absentSince.delete(id)
+    let changed = false
+    for (const id of known) {
+      if (live.has(id) || this.inflight.has(id) || this.remotePanes.has(id) || s.waiting.some((w) => w.terminalId === id)) {
+        this.absentSince.delete(id)
+        continue
+      }
+      const since = this.absentSince.get(id)
+      if (since === undefined) this.absentSince.set(id, now)
+      else if (now - since >= PANE_GONE_MS) {
+        this.forget(id)
+        this.absentSince.delete(id)
+        changed = true
+      }
+    }
+    if (changed) await this.save()
   }
 
   /**
@@ -1937,7 +2019,8 @@ export class Rotator {
       if (!this.state.waiting.includes(w)) return
       if (!(await this.allowed(w.agent))) return
       // The user went on in the parked pane, or the session already runs elsewhere: stop waiting.
-      const { agents } = await this.deps.host.call('agents.list', { workspaceId: w.workspaceId }).catch(() => ({ agents: [] as any[] }))
+      const listing = await this.deps.host.call('agents.list', { workspaceId: w.workspaceId }).catch(() => null)
+      const agents: any[] = listing?.agents ?? []
       const busy = agents.some(
         (a: any) =>
           // Anything but between turns: `blocked` (a permission question) is mid-turn too.
@@ -1947,6 +2030,19 @@ export class Rotator {
       if (busy) {
         this.state.waiting = this.state.waiting.filter((x) => x.terminalId !== w.terminalId)
         await this.save()
+        this.publishNow()
+        return
+      }
+      // The parked pane is gone and the plugin did not close it (its own moves hold this lock and
+      // end the wait themselves): the user closed it. Resuming would bring back what they closed.
+      if (!this.moving.has(w.terminalId) && !agents.some((a: any) => a.terminalId === w.terminalId)) {
+        // Orca could not list the workspace: look again at the next tick, unless it is gone too.
+        if (!listing && !(await this.workspaceGone(w))) return
+        this.state.waiting = this.state.waiting.filter((x) => x.terminalId !== w.terminalId)
+        this.forget(w.terminalId)
+        this.record({ provider: w.agent, terminalId: w.terminalId, reason: w.reason ?? 'reset', result: 'closed', ...(w.fromSeat ? { from: w.fromSeat } : {}), detail: 'pane closed', why: 'the waiting pane was closed, so its session is not resumed' })
+        await this.save()
+        this.deps.log(`${w.agent} ${w.terminalId}: the waiting pane was closed, not resuming its session`)
         this.publishNow()
         return
       }
@@ -2015,6 +2111,22 @@ export class Rotator {
       const why = reason === 'model_cap' && w.model ? this.why(reason, from, target, view, { model: w.model }) : undefined
       await this.moveTo(pane, from, target, reason, lines, undefined, view, config, why)
     })
+  }
+
+  /** True when Orca lists this computer's workspaces and the waiting entry's is not among them. */
+  private async workspaceGone(w: WaitingEntry): Promise<boolean> {
+    if (w.server) return false
+    try {
+      const { workspaces } = await this.deps.host.call('workspace.list')
+      if (!Array.isArray(workspaces)) return false
+      // Events name a workspace as `<repo>::<path>`; a row may carry another form of the id.
+      const sep = w.workspaceId.indexOf('::')
+      const repoId = sep > 0 ? w.workspaceId.slice(0, sep) : undefined
+      const path = sep > 0 ? w.workspaceId.slice(sep + 2) : undefined
+      return !workspaces.some((ws: any) => ws.id === w.workspaceId || (!!repoId && ws.projectId === repoId && ws.path === path))
+    } catch {
+      return false
+    }
   }
 
   // ---- commands ---------------------------------------------------------------------------

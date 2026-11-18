@@ -117,6 +117,8 @@ export type SwapResult =
   | 'waiting'
   | 'failed'
   | 'selected'
+  /** A waiting session whose pane the user closed: dropped, not resumed. */
+  | 'closed'
 
 export type HistoryEntry = {
   at: number
