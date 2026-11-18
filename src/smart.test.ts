@@ -1,8 +1,22 @@
 // The Smart strategy's pure parts: the state of an account, the order of targets, and the words.
 import { assert, test } from 'orca/testing'
-import { NO_CONTEXT, assess, candidateOf, expiring, explain, lastsLongEnough, projectedRunwayMs, rank, type Candidate, type SmartContext } from './smart'
+import {
+  NO_CONTEXT,
+  assess,
+  betterExpiring,
+  candidateOf,
+  expiring,
+  explain,
+  lastsLongEnough,
+  projectedRunwayMs,
+  rank,
+  shortWait,
+  shouldLeave,
+  type Candidate,
+  type SmartContext
+} from './smart'
 import { pickNext } from './selector'
-import { SMART_CONFIG, type Config, type Seat, type SeatHealth } from './types'
+import { DEFAULT_CONFIG, SMART_CONFIG, type Config, type Seat, type SeatHealth } from './types'
 import type { DailySample, Sample } from './usage-history'
 
 const T0 = 1_800_000_000_000
@@ -225,4 +239,61 @@ test('explain: one line with the reason, the levels and the reset when it is nea
   assert.equal(explain('out', out, { label: 'spare', usage: { known: false } }, T0, { selectionOnly: true }), 'work is used up (5h 100 %, week 30 %); new launches use spare (no usage numbers yet)')
   const cooling = { label: 'work', usage: seat('w', { s: 40, w: 30 }).usage, assessment: assess(seat('w', { s: 40, w: 30 }), { cooldownUntil: T0 + MIN }, [], cfg(), T0) }
   assert.match(explain('out', cooling, personal, T0), /^work is cooling down after a limit \(5h 40 %, week 30 %\); moved to personal/)
+})
+
+test('shouldLeave: at a limit or Low; the legacy settings leave exactly when over the threshold', () => {
+  const leave = (r: Reading, config: Config, samples: Sample[] = [], health?: SeatHealth) => shouldLeave(seat('a', r), health, samples, config, T0).leave
+  assert.equal(leave({ s: 100, w: 20 }, cfg()), true)
+  assert.equal(leave({ s: 97, w: 20 }, cfg()), true)
+  assert.equal(leave({ s: 92, w: 20 }, cfg(), rising([80, 84, 88, 92], T0)), true)
+  assert.equal(leave({ s: 60, w: 20 }, cfg()), false)
+  // A cooldown alone is no reason: the turn that just ended there shows the account works.
+  assert.equal(leave({ s: 60, w: 20 }, cfg(), [], { cooldownUntil: T0 + MIN }), false)
+  // "Only at a limit" / "New launches only": never, for a running session.
+  assert.equal(leave({ s: 100, w: 20 }, cfg({ autoSwitchOnThreshold: false })), false)
+  // Legacy (custom): the threshold, and nothing else, whatever the pace.
+  const legacy = DEFAULT_CONFIG
+  assert.equal(leave({ s: 99, w: 99 }, legacy, rising([87, 91, 95, 99], T0)), false)
+  assert.equal(leave({ s: 100, w: 20 }, legacy), true)
+  assert.equal(leave({ s: 20, w: 100 }, legacy), true)
+  assert.equal(leave({ s: 100, w: 20, sReset: T0 - 1 }, legacy), false)
+  assert.equal(leave({ s: 60, w: 20 }, { ...legacy, thresholdFiveHour: 50 }), true)
+  assert.equal(leave({ s: 60, w: 20 }, { ...legacy, thresholdFiveHour: 50, autoSwitchOnThreshold: false }), false)
+})
+
+test('shortWait: within 5 minutes; or sooner than a short-lived target would last', () => {
+  assert.equal(shortWait(T0 + 5 * MIN, null, cfg(), T0), T0 + 5 * MIN)
+  assert.equal(shortWait(T0 + 5 * MIN + 1, null, cfg(), T0), null)
+  // No reset time known, or one already past: move.
+  assert.equal(shortWait(null, null, cfg(), T0), null)
+  assert.equal(shortWait(T0 - 1, 10 * MIN, cfg(), T0), null)
+  // The target lasts 20 minutes (under three horizons) and the source is back in 15: wait.
+  assert.equal(shortWait(T0 + 15 * MIN, 20 * MIN, cfg(), T0), T0 + 15 * MIN)
+  // The source takes longer than the target lasts: moving at least buys that time.
+  assert.equal(shortWait(T0 + 25 * MIN, 20 * MIN, cfg(), T0), null)
+  // A target that lasts (three horizons or more) is always worth moving to.
+  assert.equal(shortWait(T0 + 15 * MIN, 30 * MIN, cfg(), T0), null)
+  assert.equal(shortWait(T0 + 60 * MIN, 3 * HOUR, cfg(), T0), null)
+})
+
+test('betterExpiring: only from an account that is fine, to one whose quota expires (sooner)', () => {
+  const steady = candidate(seat('steady', { s: 20, w: 30 }))
+  const leaving = candidate(seat('leaving', { s: 10, w: 40, wReset: T0 + 20 * HOUR }))
+  const sooner = candidate(seat('sooner', { s: 10, w: 40, wReset: T0 + 10 * HOUR }))
+  assert.equal(betterExpiring(steady, [leaving], cfg())?.seat.accountId, 'leaving')
+  assert.equal(betterExpiring(steady, [leaving, sooner], cfg())?.seat.accountId, 'sooner')
+  // Already on expiring quota: only a sooner one is better.
+  assert.equal(betterExpiring(leaving, [steady], cfg()), null)
+  assert.equal(betterExpiring(leaving, [sooner], cfg())?.seat.accountId, 'sooner')
+  assert.equal(betterExpiring(sooner, [leaving], cfg()), null)
+  // Never to an account that is unknown, Low, set aside, or would not last.
+  assert.equal(betterExpiring(steady, [{ ...leaving, tier: 'B+' }], cfg()), null)
+  assert.equal(betterExpiring(steady, [candidate(seat('low', { s: 98, w: 40, wReset: T0 + 20 * HOUR }))], cfg()), null)
+  assert.equal(betterExpiring(steady, [{ ...leaving, avoided: true }], cfg()), null)
+  assert.equal(betterExpiring(steady, [{ ...leaving, projectedMs: 10 * MIN }], cfg()), null)
+  // A Low or Out account has its own rules.
+  assert.equal(betterExpiring(candidate(seat('low', { s: 98, w: 30 })), [leaving], cfg()), null)
+  // With an order set, never to an account further down it.
+  assert.equal(betterExpiring({ ...steady, chainIndex: 0 }, [{ ...leaving, chainIndex: 1 }], cfg()), null)
+  assert.equal(betterExpiring({ ...steady, chainIndex: 1 }, [{ ...leaving, chainIndex: 0 }], cfg())?.seat.accountId, 'leaving')
 })

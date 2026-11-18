@@ -35,13 +35,93 @@ a direct SSH target (host `ssh:<target>`) is different: its agents run with that
 login and Orca manages no accounts for it, so the plugin leaves those panes alone, notes a limit
 there in the history instead of switching, and the panel says so.
 
+## Smart (the default)
+
+Out of the box, Auto Hand-off runs in **Smart** mode. You do not have to set anything up.
+
+**What it does, in plain words**
+
+- **It looks ahead.** The plugin watches how fast each account is being used. When an account is
+  about to run out (about 10 minutes left at the current pace), it moves your session to another
+  account *before* the limit is hit, so a turn does not fail halfway.
+- **It only moves a session at a safe moment.** That is between two turns, or when the session
+  has been sitting idle for 15 minutes. It never interrupts a turn that is running, and it never
+  closes a session that has text typed in its input box but not sent yet.
+- **It moves one session at a time.** Only the session whose turn just ended moves. Your other
+  sessions follow when their own turn ends or when they are idle.
+- **It picks the account that will last.** The next account is one the plugin has numbers for,
+  with enough room to last at least half an hour at its pace (counting the sessions already
+  running on it). Among those it prefers your own order if you set one, then quota that is about
+  to expire, then the account whose week resets sooner, then the one with the most room.
+- **It uses quota before it expires.** If an account still has plenty of its weekly quota left
+  and that week ends within two days, idle sessions and new sessions go there first, because
+  unused quota is lost at the reset.
+- **It does not bounce back and forth.** An account it left because it was running low is not
+  used again until that account's 5-hour window has reset.
+- **It waits when waiting is cheaper.** A session that is moved has to re-read its whole
+  conversation on the new account. If the account it is on resets within 5 minutes, the session
+  simply waits and carries on there.
+- **It tells you why.** Every move has a one-line reason in the panel's History and in the
+  notification, for example: "work had about 8 min left at this pace (5h 94 %); moved to personal
+  (5h 12 %, weekly resets in 9 h)".
+- **It stays inside one service.** A Claude session only ever moves to another Claude account,
+  a Codex session to another Codex account.
+- **Off means off.** The *Automatic hand-off* toggle (pause) and the per-service switches stop
+  every automatic action.
+
+**The four settings**
+
+| Setting | Choices (default first) | What it means |
+|---|---|---|
+| **Auto-switch** (`mode`) | `auto`, `smart`, `my-order`, `manual`, `custom` | `smart`: as described above. `my-order`: follow your *Account order*, and go back to an earlier account when it is free again; it also leaves an account shortly before it runs out. `manual`: never switch by itself. `custom`: use the *Advanced* settings exactly as set (see below). `auto` picks for you: Smart, unless you changed the advanced settings in an earlier version |
+| **Switch early** (`switch_early`) | `just-before`, `earlier`, `at-limit` | How soon to leave an account that is running out: about 10 minutes before the limit; about 25 minutes before; or only once the limit is reached |
+| **Running sessions** (`running_sessions`) | `move`, `limit`, `launches` | `move`: sessions move between turns or when idle. `limit`: a session moves only when it actually hits a limit. `launches`: running sessions are never moved; only new sessions start on another account |
+| **When everything is used up** (`when_all_used`) | `wait`, `stop` | `wait`: the session waits for the first account to reset and resumes by itself. `stop`: it stops and you are told |
+
+When the pace of an account is not known yet (it needs a few minutes of readings), "about to run
+out" means 97 % of the 5-hour window or 99 % of the week (`earlier`: 90 % and 97 %).
+
+**Why Orca may ask you to restart sessions**
+
+Orca has one selected account per service, and new sessions start on it. Whenever that selection
+changes, Orca itself shows a prompt like "2 Claude sessions are still running on *work*.
+Restarting continues the conversation on *personal*. … [Restart 2 sessions]". Auto Hand-off cannot
+turn this prompt off, and it also appears when the plugin changes the selection.
+
+**You do not need to press Restart.** Your running sessions keep working on the account they are
+on, and the plugin moves each one by itself at a safe moment. Pressing Restart would stop busy
+sessions in the middle of their work. The plugin's own notification says why it changed the
+account, and it changes the selection alone (without moving a session) at most once every
+5 minutes, and only when a session is in the middle of a turn on an account that is running out,
+or when another account has quota about to expire.
+
+**Coming from an earlier version?** With *Auto-switch* on `auto`, your earlier settings decide:
+
+| Your earlier settings | Mode |
+|---|---|
+| Nothing changed | Smart |
+| An account order (`chain`) with strategy `drain` or `priority` | Follow my order |
+| Strategy `manual` | Manual |
+| Anything else changed (another strategy, switch-back off, a different cooldown or gap, …) | Custom: everything works exactly as before, and the panel says so once |
+
+A threshold below 100 % is kept as a hard cap in Smart and Follow my order, and selects
+*Switch early: earlier*.
+
+**Model limits.** When a session hits the limit of one model (for example the weekly Fable
+limit), Smart first looks for another account that is known to have room for that model. If there
+is none, it switches to the next model from *Model fallback* on the same account. If there is
+none of those either, the session waits until an account shows room for that model or the limit
+resets; it is not moved to an account whose room for that model is unknown.
+
 ## What it does
+
+The table below lists every trigger. Rows that mention thresholds, strategies or switch-back describe the *Advanced* settings, which apply as set in `custom` mode; Smart and Follow my order set them for you (see [Settings](#settings)).
 
 | Trigger | Action |
 |---|---|
 | Rate-limit banner in the pane's latest output | Cooldown that seat until the parsed reset time (else Orca's `resetsAt`, else *Default cooldown*), switch, resume. The next account is one with known room if there is one, else one presumed reset, else one without numbers |
 | Banner with no reset time on an account without usage numbers | A *strike*: the cooldown is *Default cooldown* × 2 per strike (60, 120, 240 min …), at most 5 h. Strikes count for 24 h |
-| Model-specific cap (e.g. Claude Fable weekly) | Type `/model <next>` from *Model fallback* in place; switch accounts only when the list runs out |
+| Model-specific cap (e.g. Claude Fable weekly) | Smart and Follow my order: an account known to have room for that model, then `/model <next>` from *Model fallback* in place, then wait. Custom: `/model <next>` first; switch accounts only when the list runs out |
 | API error (529, overloaded, stream disconnected) | Type the first message again after a Fibonacci backoff (5 s … 120 s), up to *Maximum API error retries* |
 | Auth failure | 12 h cooldown on that seat, switch |
 | A turn ends while the seat is over a threshold | Switch to an account with known room (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets. An account without numbers is taken only when the current one is known to be at 100 % and no known account is left |
@@ -80,7 +160,7 @@ For a service that is off, the plugin never closes, switches or resumes its pane
 sessions stay parked. Manual switching from the panel or the commands still works. The status bar
 shows it as `codex off`. The *Automatic hand-off* toggle at the top pauses every service at once.
 
-Strategies: **drain** (next account in chain order; the default), **balanced** (most room),
+Strategies (`custom` mode): **drain** (next account in chain order; the default there), **balanced** (most room),
 **priority** (always the first healthy account in the chain), **soonest-reset** (the account whose
 weekly window resets first, so expiring usage is spent first), **manual** (never automatic).
 A strategy orders accounts with the same amount of information; an account with known room always
@@ -106,6 +186,46 @@ without numbers, as long as it has no strikes.
 
 **Never switch to:** accounts listed in `exclude` (same tokens as `chain`) are kept out of
 automatic rotation and switch-back; picking them from the panel still works.
+
+## Settings
+
+**The four settings** (see [Smart](#smart-the-default)): *Auto-switch* (`mode`), *Switch early*
+(`switch_early`), *Running sessions* (`running_sessions`), *When everything is used up*
+(`when_all_used`).
+
+**Always apply**
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `service_claude`, `service_codex`, `service_antigravity`, `service_opencode`, `service_devin` | on | Automatic hand-off per service |
+| `chain` (*Account order*) | empty | Your own order of accounts. Empty = Orca's order |
+| `exclude` (*Never switch to*) | empty | Accounts automatic hand-off never picks |
+| `auto_message` | `Go continue.` | First message typed after a switch. Empty = resume silently |
+| `model_fallback` | empty | Models to try on the same account when one model's limit is hit, e.g. `claude=sonnet,haiku` |
+| `retry_on_api_error`, `max_api_retries` | on, 6 | Retry in place on API errors |
+| `default_cooldown_minutes` | 60 | Used when nothing says when a limit resets |
+| `poll_interval_seconds` | 60 | How often usage is read from Orca |
+| `usage_cache_max_age_hours` | 168 | How long the last reading of an account not in use is remembered |
+| `handoff_max_chars` | 6000 | Size limit of the handoff prompt |
+| `orca_cli_path` | empty | Empty = detect |
+| `console_statusline_format`, `console_statusline_bar_width` | empty, 8 | The console status line |
+
+**Advanced** (titles start with "Advanced:"). These are the settings of earlier versions. They are
+read **only when *Auto-switch* is `custom`**; in every other mode the four settings above decide
+and these are ignored.
+
+| Setting | Default | In Smart / Follow my order |
+|---|---|---|
+| `strategy` | `drain` | Smart ranks by itself; Follow my order uses `drain` (or `priority` if that was set) |
+| `switch_back` | on | Off in Smart, on in Follow my order |
+| `switch_cooldown_minutes` | 5 | 5 |
+| `min_headroom_gap` | 10 | 10 |
+| `auto_swap_idle_after_seconds` | 900 | 900, or off unless *Running sessions* is `move` |
+| `auto_switch_on_rate_limit` | on | on |
+| `auto_switch_on_threshold` | on | on only when *Running sessions* is `move` |
+| `thresholds_five_hour`, `thresholds_seven_day` | 100 | 100; with `auto`, a stored value below 100 stays as a hard cap |
+| `auto_resume` | on | on, unless *Running sessions* is `launches` |
+| `wait_for_reset` | on | *When everything is used up* |
 
 ## UI
 
@@ -305,7 +425,7 @@ From it the plugin works out a **rate** per window (the rise over the last 30 mi
 samples at least 3 minutes apart and a rise of a point) and a **runway**: how long until the first
 window is used up at that rate. A window that resets before it would run out does not count, and a
 reading more than 10 minutes old gives no runway. The panel shows it as "About N min left at this
-pace". This is observation only for now: nothing switches on the runway yet.
+pace". Smart and Follow my order act on it: see [Smart](#smart-the-default).
 
 When there is no reading at all, the panel says why, in Orca's terms: "Updates the next time this
 account runs", "Sign in to this account again in Orca", "Orca is rate limited", or Orca's own

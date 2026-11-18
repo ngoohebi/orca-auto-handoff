@@ -1734,3 +1734,411 @@ test('model cap, custom: the legacy order is unchanged (fallback model first, th
   assert.equal(stored(without).waiting.length, 0)
   await worker.deactivate()
 })
+
+// ---- Smart at work: leaving early, selection-only changes, short waits -------------------------
+
+const lastNote = (w: { host: { callsOf(method: string): any[] } }): string => w.host.callsOf('notifications.show').at(-1)?.body ?? ''
+
+/** A Claude pane on c1 between turns, with ordinary output; c2 is known to have room. */
+const calm = (claudeUsage: { session: number; weekly: number; sessionReset?: number; weeklyReset?: number }, extra: Partial<Parameters<typeof world>[0]> = {}) =>
+  world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_TALKING_ABOUT_LIMITS] },
+    claudeUsage,
+    inactiveClaude: { c2: { session: 5, weekly: 5 } },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    ...extra
+  })
+
+test('smart: a turn that ends on a Low account moves that session, and says why', async () => {
+  // No pace is known, so the level decides: 97 % of the 5-hour window.
+  const w = calm({ session: 97, weekly: 40 })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(w.host.callsOf('terminal.close').map((c: any) => c.terminalId), ['t1'])
+  assert.deepEqual(w.typed.at(-1), { terminalId: 't2', text: 'Go continue.' })
+  const state = stored(w)
+  assert.equal(state.paneSeat.t2, 'claude:c2')
+  assert.equal(state.history.at(-1)?.reason, 'threshold')
+  assert.equal(state.history.at(-1)?.why, 'one is nearly at the end of its 5h window (5h 97 %, week 40 %, weekly resets in 24 h); moved to two (5h 5 %, week 5 %, weekly resets in 24 h)')
+  // Not at a limit: the account is not cooled, only set aside until its window ends.
+  assert.equal(state.health['claude:c1'], undefined)
+  assert.equal(state.leftLow?.['claude:c1']?.until, 1_000_000 + 3_600_000)
+  // The notification gives the reason and says Orca's restart prompt needs no action.
+  assert.match(lastNote(w), /^Claude: one is nearly at the end of its 5h window/)
+  assert.match(lastNote(w), /Orca may now offer to restart your running sessions: you do not need to\./)
+  await worker.deactivate()
+
+  // 96 %: not Low, nothing happens.
+  const ok = calm({ session: 96, weekly: 40 })
+  const okWorker = await ok.mount()
+  await okWorker.emit('agent.status.changed', statusEvent('t1'))
+  await ok.rotator.tick()
+  assert.deepEqual(selects(ok), [])
+  await okWorker.deactivate()
+})
+
+test('smart: the pace decides before the level does (fake clock)', async () => {
+  const usage = { session: 80, weekly: 40 }
+  const w = calm(usage)
+  const worker = await w.mount()
+  // 1 point a minute: 84, 88 (12 minutes left: not yet), 92 (8 minutes left: Low).
+  for (const level of [84, 88]) {
+    w.advance(4 * MIN)
+    usage.session = level
+    w.touch('t1')
+    await w.rotator.tick()
+    await worker.emit('agent.status.changed', statusEvent('t1', 'done', level))
+    assert.deepEqual(selects(w), [], `at ${level} %`)
+  }
+  w.advance(4 * MIN)
+  usage.session = 92
+  w.touch('t1')
+  await w.rotator.tick()
+  assert.equal(w.rotator.snapshot().seats.find((s) => s.key === 'claude:c1')?.runwayMs, 8 * MIN)
+  // The tick alone moves nothing: the session is not idle long enough, and no turn has ended.
+  assert.deepEqual(selects(w), [])
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 92))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(stored(w).history.at(-1)?.why, 'one had about 8 min left at this pace (5h 92 %, week 40 %, weekly resets in 24 h); moved to two (5h 5 %, week 5 %, weekly resets in 24 h)')
+  await worker.deactivate()
+
+  // "Only at the limit": the same readings never move it.
+  const late = { session: 80, weekly: 40 }
+  const l = calm(late, { settings: { switch_early: 'at-limit' } })
+  const lw = await l.mount()
+  for (const level of [84, 88, 92, 99]) {
+    l.advance(4 * MIN)
+    late.session = level
+    await l.rotator.tick()
+    await lw.emit('agent.status.changed', statusEvent('t1', 'done', level))
+  }
+  assert.deepEqual(selects(l), [])
+  await lw.deactivate()
+})
+
+test('smart: never in the middle of a turn; only the account for new launches changes, once per cooldown', async () => {
+  const inactiveClaude: Record<string, { session: number; weekly: number }> = { c2: { session: 5, weekly: 5 }, c3: { session: 6, weekly: 6 } }
+  const later = { session: 5, weekly: 5 }
+  const w = world({
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'working', sessionId: 's1' },
+      { terminalId: 't5', agent: 'claude', state: 'working', sessionId: 's5' }
+    ],
+    tails: { t1: ['⏺ Working on it…'], t5: ['⏺ Working on it…'] },
+    claudeUsage: { session: 97, weekly: 40 },
+    laterClaudeUsage: later,
+    inactiveClaude,
+    state: { paneSeat: { t1: 'claude:c1', t5: 'claude:c2' } }
+  })
+  const worker = await w.mount()
+  // A status event of a working session is never acted on.
+  await worker.emit('agent.status.changed', { ...statusEvent('t1'), state: 'working', mainAgent: { state: 'working', stateStartedAt: 1 } } as never)
+  assert.deepEqual(selects(w), [])
+  // The tick changes the selection only: nothing is closed, resumed or typed.
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(w.typed, [])
+  let state = stored(w)
+  assert.deepEqual(state.history.at(-1), { ...state.history.at(-1), reason: 'threshold', result: 'selected', from: 'claude:c1', to: 'claude:c2' })
+  assert.match(state.history.at(-1)?.why ?? '', /^one is nearly at the end of its 5h window .*; new launches use two/)
+  assert.match(lastNote(w), /^Claude: one is nearly at the end of its 5h window .* Only new sessions start on two@example\.test\./)
+  assert.match(lastNote(w), /Orca may now offer to restart your running sessions: you do not need to\. They keep working on the account they are on/)
+  // c2 is running Low too (t5 works there) a minute later: within the cooldown nothing changes again.
+  later.session = 98
+  w.advance(1 * MIN + 1000)
+  await w.rotator.tick()
+  w.advance(2 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  // After the 5-minute cooldown it may: to c3, never back to c1, which was left as Low.
+  w.advance(3 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2', 'select claude c3'])
+  state = stored(w)
+  assert.equal(state.history.filter((h) => h.result === 'selected').length, 2)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.deepEqual(w.typed, [])
+  await worker.deactivate()
+})
+
+test('smart: a selection-only change needs a session in mid-turn on the selected account', async () => {
+  // The only session is between turns (and not idle for long): it will move itself at its next
+  // turn end, so the selection is left alone until then.
+  const w = calm({ session: 97, weekly: 40 }, { panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', stateStartedAt: 1_000_000 }] })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), [])
+  await worker.deactivate()
+})
+
+test('smart: unsent text in the input box blocks the move', async () => {
+  const w = calm({ session: 97, weekly: 40 })
+  w.tails.t1 = ['⏺ Done.', '╭──────────────╮', '│ > also update the docs', '╰──────────────╯']
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  // Idle for 20 minutes: the idle sweep leaves it alone too.
+  w.advance(20 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), [])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  // Sent: the next turn end moves it.
+  w.tails.t1 = ['❯ also update the docs', '⏺ Updated README.md.', '╭──────────────╮', '│ >', '╰──────────────╯']
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  await worker.deactivate()
+})
+
+test('smart: paused, or the service off, does nothing at all', async () => {
+  for (const off of ['paused', 'service'] as const) {
+    const w = world({
+      panes: [
+        { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
+        { terminalId: 't9', agent: 'claude', state: 'working', sessionId: 's9' }
+      ],
+      tails: { t1: [...fx.CLAUDE_TALKING_ABOUT_LIMITS], t9: ['⏺ Working on it…'] },
+      // Low, with a target that has weekly quota about to expire: every Smart trigger applies.
+      claudeUsage: { session: 98, weekly: 40, weeklyReset: 1_000_000 + 6 * 86_400_000 },
+      inactiveClaude: { c2: { session: 5, weekly: 5 } },
+      settings: off === 'service' ? { service_claude: false } : {},
+      state: { paneSeat: { t1: 'claude:c1', t9: 'claude:c1' } }
+    })
+    const worker = await w.mount()
+    if (off === 'paused') await worker.request('rotator.pause', { paused: true })
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    w.advance(20 * MIN)
+    await w.rotator.tick()
+    w.advance(20 * MIN)
+    await w.rotator.tick()
+    await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+    assert.deepEqual(selects(w), [], off)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, off)
+    assert.equal(w.host.callsOf('agent.resume').length, 0, off)
+    assert.deepEqual(w.typed, [], off)
+    const state = stored(w)
+    assert.equal(state.history.length, 0, off)
+    assert.deepEqual(state.leftLow ?? {}, {}, off)
+    assert.deepEqual(state.waiting, [], off)
+    await worker.deactivate()
+  }
+})
+
+test('smart: only the session whose turn ended moves; the others follow at their own turn end', async () => {
+  const w = calm({ session: 97, weekly: 40 }, {
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', stateStartedAt: 1_000_000 },
+      { terminalId: 't9', agent: 'claude', state: 'done', sessionId: 's9', stateStartedAt: 1_000_000 }
+    ],
+    tails: { t1: [...fx.CLAUDE_TALKING_ABOUT_LIMITS], t9: [...fx.CLAUDE_TALKING_ABOUT_LIMITS] },
+    state: { paneSeat: { t1: 'claude:c1', t9: 'claude:c1' } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(w.host.callsOf('terminal.close').map((c: any) => c.terminalId), ['t1'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await w.rotator.tick()
+  // t9 has not been touched: still on c1, still open.
+  assert.deepEqual(w.host.callsOf('terminal.close').map((c: any) => c.terminalId), ['t1'])
+  assert.equal(stored(w).paneSeat.t9, 'claude:c1')
+  assert.ok(w.panes.some((p) => p.terminalId === 't9'))
+  // Its own turn end moves it, onto the account already selected (no second selection change).
+  await worker.emit('agent.status.changed', statusEvent('t9', 'done', 2))
+  assert.deepEqual(w.host.callsOf('terminal.close').map((c: any) => c.terminalId), ['t1', 't9'])
+  assert.deepEqual(selects(w), ['select claude c2'])
+  await worker.deactivate()
+})
+
+test('smart: an account left as Low is not gone back to within its 5-hour window, unless a reading shows it reset', async () => {
+  const usage = { session: 80, weekly: 10 }
+  const later = { session: 5, weekly: 5 }
+  const inactiveClaude: Record<string, { session: number; weekly: number }> = { c2: { session: 5, weekly: 5 } }
+  const w = calm(usage, { laterClaudeUsage: later, inactiveClaude, settings: { exclude: 'claude:c3' } })
+  const worker = await w.mount()
+  // c1 fills at 1 point a minute and is left at 92 %, 8 minutes before its limit.
+  for (const level of [84, 88, 92]) {
+    w.advance(4 * MIN)
+    usage.session = level
+    await w.rotator.tick()
+  }
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(stored(w).leftLow?.['claude:c1']?.until, 1_000_000 + 3_600_000)
+  // c1 is no longer in use and stays at 92 %: by its numbers alone it would be a fine target again.
+  inactiveClaude.c1 = { session: 92, weekly: 10 }
+  delete inactiveClaude.c2
+  w.tails.t2 = [...fx.CLAUDE_TALKING_ABOUT_LIMITS]
+  // Half an hour on, c2 is used up. Its session may leave for any known account… but not c1.
+  w.advance(30 * MIN)
+  later.session = 100
+  await w.rotator.tick()
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
+  w.advance(6 * MIN)
+  await w.rotator.tick()
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 3))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.ok(stored(w).leftLow?.['claude:c1'])
+  // A reading taken since shows c1's window has started over: it is a target again.
+  inactiveClaude.c1 = { session: 3, weekly: 11 }
+  w.advance(2 * MIN)
+  await w.rotator.tick()
+  assert.equal(stored(w).leftLow?.['claude:c1'], undefined)
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 4))
+  assert.deepEqual(selects(w), ['select claude c2', 'select claude c1'])
+  assert.equal(w.host.callsOf('agent.resume').length, 2)
+  await worker.deactivate()
+})
+
+test('smart: short wait. An account that resets within 5 minutes is waited for, not left', async () => {
+  // A limit, c1's 5-hour window resets in 4 minutes, and c2 would be free to take the session.
+  const usage = { session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }
+  const w = calm(usage, { tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] } })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), [])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  let state = stored(w)
+  assert.deepEqual(state.waiting.map((x) => [x.terminalId, x.hold, x.wakeAt]), [['t1', 'short', 1_000_000 + 4 * MIN]])
+  assert.equal(state.history.at(-1)?.result, 'waiting')
+  assert.equal(state.history.at(-1)?.why, 'one resets in 4 min; waiting is cheaper than moving, which re-reads the whole conversation')
+  assert.match(lastNote(w), /^Claude: one resets in 4 min\. The session waits and continues there/)
+  // Another account having room does not end a short wait early.
+  w.advance(2 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), [])
+  assert.equal(stored(w).waiting.length, 1)
+  // The window has reset: the session continues where it is. Nothing is closed or resumed.
+  w.advance(2 * MIN + 1000)
+  usage.session = 0
+  usage.sessionReset = 1_000_000 + 5 * 3_600_000
+  await w.rotator.tick()
+  state = stored(w)
+  assert.equal(state.waiting.length, 0)
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Go continue.' }])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(selects(w), [])
+  assert.deepEqual(state.history.at(-1), { ...state.history.at(-1), reason: 'reset', result: 'retried', from: 'claude:c1', to: 'claude:c1', why: 'one has reset; the session continues there' })
+  await worker.deactivate()
+
+  // 6 minutes away is not short: the session moves as usual.
+  const far = calm({ session: 100, weekly: 40, sessionReset: 1_000_000 + 6 * MIN }, { tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] } })
+  const fw = await far.mount()
+  await fw.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(far), ['select claude c2'])
+  assert.equal(stored(far).waiting.length, 0)
+  await fw.deactivate()
+
+  // Low (not at a limit) and resetting in 4 minutes: the session simply stays.
+  const low = calm({ session: 98, weekly: 40, sessionReset: 1_000_000 + 4 * MIN })
+  const lw = await low.mount()
+  await lw.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(low), [])
+  assert.equal(stored(low).waiting.length, 0)
+  assert.equal(stored(low).history.length, 0)
+  await lw.deactivate()
+
+  // The legacy settings (custom) know no short wait.
+  const custom = calm({ session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }, { tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] }, settings: { mode: 'custom' } })
+  const cw = await custom.mount()
+  await cw.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(custom), ['select claude c2'])
+  await cw.deactivate()
+})
+
+test('smart: short wait when the best target would run out before the source is back', async () => {
+  // c1 is at its limit and back in 12 minutes. c2, the only other account, has filled by 2 points
+  // a minute and has 45 left: about 22 minutes, under three horizons, and c1 is back before that.
+  const usage = { session: 40, weekly: 40, sessionReset: 1_000_000 + 30 * MIN }
+  const inactiveClaude: Record<string, { session: number; weekly: number }> = { c2: { session: 19, weekly: 5 } }
+  const w = calm(usage, { tails: { t1: [...fx.CLAUDE_TALKING_ABOUT_LIMITS] }, inactiveClaude, settings: { exclude: 'claude:c3' } })
+  const worker = await w.mount()
+  for (const level of [31, 43, 55]) {
+    w.advance(4 * MIN)
+    inactiveClaude.c2 = { session: level, weekly: 5 }
+    await w.rotator.tick()
+  }
+  w.advance(6 * MIN)
+  usage.session = 100
+  w.tails.t1 = [...fx.CLAUDE_LIMIT_NO_RESET]
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), [])
+  assert.deepEqual(stored(w).waiting.map((x) => [x.hold, x.wakeAt]), [['short', 1_000_000 + 30 * MIN]])
+  await worker.deactivate()
+})
+
+test('smart: use it or lose it. An idle session, and new launches, go to weekly quota that would expire', async () => {
+  // c1 resets in 6 days; c2 has 95 % of its week left and resets in 24 h.
+  const w = calm({ session: 20, weekly: 30, weeklyReset: 1_000_000 + 6 * 86_400_000 })
+  const worker = await w.mount()
+  // A turn end is no reason for this move.
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  // The selection for new launches changes at the next tick; the session follows once idle (it has
+  // been since the fixture's start).
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  const state = stored(w)
+  assert.deepEqual(state.history.map((h) => [h.reason, h.result]), [['expiring', 'selected'], ['expiring', 'resumed']])
+  assert.equal(state.history[0]?.why, 'two has weekly quota that would expire unused (5h 5 %, week 5 %, weekly resets in 24 h); new launches use it')
+  assert.equal(state.history[1]?.why, 'idle session; two has weekly quota that would expire unused (5h 5 %, week 5 %, weekly resets in 24 h); moved there from one')
+  assert.equal(state.paneSeat.t2, 'claude:c2')
+  // Nothing moves back: c1 has nothing expiring.
+  w.tails.t2 = [...fx.CLAUDE_TALKING_ABOUT_LIMITS]
+  w.advance(30 * MIN)
+  await w.rotator.tick()
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  await worker.deactivate()
+
+  // Follow my order never does this: the order decides.
+  const ordered = calm({ session: 20, weekly: 30, weeklyReset: 1_000_000 + 6 * 86_400_000 }, { settings: { chain: 'claude:c1, claude:c2' } })
+  const ow = await ordered.mount()
+  await ordered.rotator.tick()
+  assert.deepEqual(selects(ordered), [])
+  await ow.deactivate()
+})
+
+test('smart: Running sessions. "Only at a limit" and "New launches only" leave a Low session where it is', async () => {
+  for (const running_sessions of ['limit', 'launches']) {
+    const w = calm({ session: 98, weekly: 40 }, { settings: { running_sessions } })
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    w.advance(20 * MIN)
+    await w.rotator.tick()
+    assert.deepEqual(selects(w), [], running_sessions)
+    // A real limit still acts: "limit" moves the session, "launches" only changes the account.
+    w.tails.t1 = [...fx.CLAUDE_SESSION_LIMIT]
+    await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+    assert.deepEqual(selects(w), ['select claude c2'], running_sessions)
+    assert.equal(w.host.callsOf('agent.resume').length, running_sessions === 'limit' ? 1 : 0, running_sessions)
+    await worker.deactivate()
+  }
+})
+
+test('my order: leaves a Low account early, and switch-back does not return to it within its window', async () => {
+  const later = { session: 5, weekly: 5 }
+  const inactiveClaude: Record<string, { session: number; weekly: number }> = { c2: { session: 5, weekly: 5 } }
+  const w = calm({ session: 97, weekly: 40 }, { laterClaudeUsage: later, inactiveClaude, settings: { chain: 'claude:c1, claude:c2, claude:c3' } })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  // c1 is first in the order and under 100 %: the legacy switch-back would return at once.
+  inactiveClaude.c1 = { session: 97, weekly: 40 }
+  delete inactiveClaude.c2
+  w.tails.t2 = [...fx.CLAUDE_TALKING_ABOUT_LIMITS]
+  w.advance(20 * MIN)
+  await w.rotator.tick()
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  // Its window resets: switch-back takes the session home.
+  w.advance(45 * MIN)
+  inactiveClaude.c1 = { session: 2, weekly: 40 }
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2', 'select claude c1'])
+  assert.equal(stored(w).history.at(-1)?.reason, 'switch_back')
+  await worker.deactivate()
+})
