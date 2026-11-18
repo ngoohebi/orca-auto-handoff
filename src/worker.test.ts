@@ -35,6 +35,9 @@ function world(options: {
   onSleep?: (ms: number) => void
   /** While it returns true, Orca cannot list agents (`agents.list` fails). */
   agentsListFails?: () => boolean
+  /** Unsent text Orca reports apart from the screen lines (`orca terminal read` → `draft`), by
+   *  terminal; read on every look, so a test can change it. `'!'` makes that read fail. */
+  drafts?: Record<string, string>
 }) {
   let clock = 1_000_000
   let claudeActive: string | null = 'c1'
@@ -68,6 +71,11 @@ function world(options: {
     },
     async activeTerminals() {
       return options.activeTerminals ?? []
+    },
+    async draft(terminalId) {
+      const text = options.drafts?.[terminalId]
+      if (text === '!') throw new Error('orca terminal read: runtime_unavailable')
+      return text
     },
     async sendText(terminalId, text) {
       cliCalls.push(`send ${terminalId}`)
@@ -2379,6 +2387,90 @@ test('smart: a short wait never types into a pane that holds unsent text', async
 })
 
 // ---- Unsent text: a limit, or the wake of a parked session, never closes such a pane ------------
+
+// Live (Orca 1.4.263): `terminal.read` leaves the text typed in an agent's input box out of its
+// lines (the box reads as empty) and `orca terminal read --json` reports it apart, as `draft`.
+const EMPTY_BOX = ['╭──────────────╮', '│ >', '╰──────────────╯']
+
+test('unsent text Orca reports apart from the screen: a limit does not close the pane, and moves once it is gone', async () => {
+  const drafts: Record<string, string> = { t1: 'also update the docs' }
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, ...EMPTY_BOX] },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    drafts
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(selects(w), [])
+  assert.deepEqual(w.typed, [])
+  assert.deepEqual(notes(w), ['Claude hit its limit on one. Send or clear the text you were typing and the session moves to two.'])
+  assert.ok(stored(w).waiting[0]?.draftAt)
+  // Cleared: the next look carries the move out.
+  delete drafts.t1
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
+  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }])
+  await worker.deactivate()
+})
+
+test('unsent text Orca reports apart from the screen: no early move, no retry and no model switch is typed over it', async () => {
+  // Smart, a turn that ends on a Low account: the session stays until the text is gone.
+  const drafts: Record<string, string> = { t1: 'also update the docs' }
+  const low = calm({ session: 97, weekly: 40 }, { drafts })
+  let worker = await low.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  low.advance(20 * MIN)
+  await low.rotator.tick()
+  assert.deepEqual(selects(low), [])
+  assert.equal(low.host.callsOf('terminal.close').length, 0)
+  delete drafts.t1
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.deepEqual(selects(low), ['select claude c2'])
+  await worker.deactivate()
+
+  // An API error is not retried into the box, and a fallback model is not typed into it.
+  for (const tail of [fx.CLAUDE_API_ERROR, fx.CLAUDE_MODEL_CAP]) {
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: [...tail, ...EMPTY_BOX] },
+      settings: { mode: 'custom', model_fallback: 'claude=sonnet' },
+      state: { paneSeat: { t1: 'claude:c1' } },
+      drafts: { t1: 'also update the docs' }
+    })
+    worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    assert.deepEqual(w.typed, [])
+    assert.deepEqual(selects(w), [])
+    assert.equal(stored(w).history.at(-1)?.detail, 'unsent text in the input box')
+    await worker.deactivate()
+  }
+
+  // The command that moves this workspace's agent refuses as well.
+  const cmd = calm({ session: 50, weekly: 40 }, { drafts: { t1: 'also update the docs' } })
+  worker = await cmd.mount()
+  assert.match(String(await worker.command('rotator.swapThisPane')), /unsent text/)
+  assert.equal(cmd.host.callsOf('terminal.close').length, 0)
+  await worker.deactivate()
+
+  // Orca cannot say (the read fails): the screen lines decide, as before.
+  const blind = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, ...EMPTY_BOX] },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    drafts: { t1: '!' }
+  })
+  worker = await blind.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(blind), ['select claude c2'])
+  await worker.deactivate()
+})
 
 const notes = (w: { host: { callsOf(method: string): any[] } }): string[] => w.host.callsOf('notifications.show').map((c: any) => c.body as string)
 

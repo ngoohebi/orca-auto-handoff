@@ -92,3 +92,39 @@ test('unsent text in the input box is a draft; placeholders and empty boxes are 
   assert.equal(hasDraft(['■ done', '› rerun the tests', '  gpt-5 · ~/repo']), true)
   assert.equal(hasDraft(['❯ Go continue.', '⏺ Working on it']), false)
 })
+
+// Live (Orca 1.4.263, Claude Code with the console status line installed): `terminal.read` gives the
+// rendered screen, and under the input box come the plugin's own account rows and Claude's mode line.
+const STATUS_ROWS = [
+  '  ▶ work          5h ███████░  78%  7d ████████  96%  fable ████████  94%',
+  '  · personal      5h ████████ 100%  7d ████████ 100%  fable ████████ 100%',
+  '  · side          5h ░░░░░░░░   0%  7d ██████░░  81%  fable ██████░░  81%  ⏸1h20m',
+  '  · fourth        5h ········  n/a  7d ········  n/a  model ········  n/a'
+]
+const MODE_LINE = '  ⏵⏵ bypass permissions on (shift+tab to cycle)'
+const FRAME = '─'.repeat(60)
+
+test('live: the console status line rows under the input box are not output printed after a banner', () => {
+  const screen = [
+    '⏺ I updated the parser and the tests pass.',
+    '  ⎿  5-hour limit reached ∙ resets 3pm',
+    '     /upgrade to increase your usage limit.',
+    `${FRAME} claude ─`,
+    '❯',
+    FRAME,
+    ...STATUS_ROWS,
+    MODE_LINE
+  ]
+  const s = classify('claude', screen, NOW)
+  assert.equal(s?.kind, 'rate_limit')
+  assert.equal(s?.linesAfter, 1)
+  // The rows are not a banner either, whatever they say.
+  assert.equal(classify('claude', ['⏺ Done.', FRAME, '❯', FRAME, ...STATUS_ROWS, MODE_LINE], NOW), null)
+})
+
+test('live: unsent text is seen with the console status line rows and the mode line under the input box', () => {
+  assert.equal(hasDraft(['⏺ Done.', FRAME, '❯ also update the docs', FRAME, ...STATUS_ROWS, MODE_LINE]), true)
+  assert.equal(hasDraft(['⏺ Done.', FRAME, '❯', FRAME, ...STATUS_ROWS, MODE_LINE]), false)
+  // A sent prompt with a reply under it is still no draft.
+  assert.equal(hasDraft(['❯ also update the docs', '⏺ Updated.', FRAME, '❯', FRAME, ...STATUS_ROWS, MODE_LINE]), false)
+})

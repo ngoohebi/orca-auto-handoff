@@ -215,6 +215,11 @@ export function nodeCli(getPath: () => Promise<string>): Cli {
       const result = await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'list', '--include-visual-layouts', ...envArgs(server)])
       return activeTerminalsIn(result)
     },
+    async draft(terminalId: string, server?: string) {
+      const result = await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'read', '--terminal', terminalId, '--limit', '1', ...envArgs(server)])
+      const text = result?.terminal?.draft
+      return typeof text === 'string' ? text : undefined
+    },
     async workspaceServer(workspaceId?: string) {
       return resolveWorkspaceHostFromCatalog(resolveOrcaCli(await getPath()), workspaceId)
     }

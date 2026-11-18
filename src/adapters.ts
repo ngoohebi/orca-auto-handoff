@@ -104,8 +104,12 @@ export const ADAPTERS: Record<Provider, Adapter> = {
   devin: generic('devin')
 }
 
+/** A row of the plugin's own console status line (statusline.ts): `▶ work  5h ███████░  78%  7d …`.
+ *  Claude prints one per account under the input box, so they are on every screen read. */
+const STATUS_ROW = '[▶·]\\s.*\\s5h\\s+[█░·]{2,}'
+
 /** Lines that are the agent's input box or footer, never a status message. */
-export const CHROME = /^\s*(›|❯|>|✻|⏵|◐|←|\? for shortcuts|─{6,}|╭|╰|│\s*>)/
+export const CHROME = new RegExp(`^\\s*(›|❯|>|✻|⏵|◐|←|\\? for shortcuts|─{6,}|╭|╰|│\\s*>|${STATUS_ROW})`)
 
 /** How many non-empty lines from the bottom count as "the latest output". */
 export const TAIL_WINDOW = 14
@@ -147,7 +151,7 @@ export function classify(provider: Provider, lines: readonly string[], now: numb
 /** Input-box placeholders the CLIs show when nothing is typed. */
 const PLACEHOLDER = /^(ask (codex|claude|antigravity|opencode|devin) (to do )?anything|try ["“]|type (a|your) (message|prompt)|what (can|should) i|send a message)/i
 /** What may follow the input box: its frame and the CLI footer, never a reply. */
-const FOOTER = /^\s*(╰|─{3,}|│\s*$|←|\? for shortcuts|\S[^\n]*·)/
+const FOOTER = new RegExp(`^\\s*(╰|─{3,}|│\\s*$|←|⏵|\\? for shortcuts|\\S[^\\n]*·|${STATUS_ROW})`)
 
 /**
  * Unsent text in the agent's input box (Orca issue #41488: an automatic restart threw away a

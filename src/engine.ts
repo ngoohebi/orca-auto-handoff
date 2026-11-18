@@ -70,6 +70,9 @@ export type Cli = {
   /** Resolves a workspace's host (`runtime:<env>` or `local`) from the desktop's paired-server
    *  catalog when local `workspace.list` / `project.list` does not carry the paired server's rows. */
   workspaceServer?(workspaceId?: string): Promise<string | undefined>
+  /** The text typed in a pane's input box and not sent, as Orca reports it (`draft` of `orca
+   *  terminal read --json`); undefined when there is none, or this Orca does not say. */
+  draft?(terminalId: string, server?: string): Promise<string | undefined>
 }
 
 export type Deps = {
@@ -1040,7 +1043,7 @@ export class Rotator {
       this.deps.log(`${pane.agent} ${pane.terminalId}: unreadable, not retrying`)
       return
     }
-    if (hasDraft(screen.lines)) return this.leftForDraft(pane, 'api_error', 'the API error was not retried')
+    if (await this.unsent(pane.terminalId, pane.server, screen.lines)) return this.leftForDraft(pane, 'api_error', 'the API error was not retried')
     await this.type(pane.terminalId, config.autoMessage || 'continue', pane.server)
     this.record({ provider: pane.agent, terminalId: pane.terminalId, reason: 'api_error', result: 'retried', detail: `attempt ${attempt + 1}` })
     await this.save()
@@ -1075,7 +1078,7 @@ export class Rotator {
     const step = this.state.modelStep[pane.terminalId] ?? 0
     if (!adapter.modelSwitch || step >= models.length) return false
     const model = models[step]!
-    if (hasDraft(lines)) {
+    if (await this.unsent(pane.terminalId, pane.server, lines)) {
       // `/model …` and the first message would both send the user's unsent text.
       await this.leftForDraft(pane, 'model_cap', `the model was not switched to ${model}`)
       return true
@@ -1377,7 +1380,7 @@ export class Rotator {
       return false
     }
     const screen = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
-    if (hasDraft(screen?.lines ?? lines)) {
+    if (await this.unsent(pane.terminalId, pane.server, screen?.lines ?? lines)) {
       this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not moving it`)
       return false
     }
@@ -1583,7 +1586,22 @@ export class Rotator {
   /** Unsent text in the pane's input box, as the pane is now (`lines` when it cannot be read). */
   private async draftIn(pane: PaneInfo, lines: readonly string[]): Promise<boolean> {
     const screen = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
-    return hasDraft(screen?.lines ?? lines)
+    return this.unsent(pane.terminalId, pane.server, screen?.lines ?? lines)
+  }
+
+  /** Is there unsent text in a pane's input box? Live (Orca 1.4.263): `terminal.read` leaves that
+   *  text out of its lines (the box reads as empty) and only `orca terminal read` reports it, as
+   *  `draft`. So Orca is asked, and the lines are looked at as well, for an Orca that leaves the
+   *  text in them. When Orca cannot say, the lines alone decide. */
+  private async unsent(terminalId: string, server: string | undefined, lines: readonly string[]): Promise<boolean> {
+    if (hasDraft(lines)) return true
+    try {
+      const text = await (server ? this.deps.cli.draft?.(terminalId, server) : this.deps.cli.draft?.(terminalId))
+      return typeof text === 'string' && text.trim() !== ''
+    } catch (error) {
+      this.deps.log(`could not ask Orca for unsent text in ${terminalId}: ${String((error as Error)?.message ?? error)}`)
+      return false
+    }
   }
 
   /** The pane holds unsent text, which closing it would throw away: it stays as it is, and the
@@ -2049,7 +2067,7 @@ export class Rotator {
       if (w.draftAt) {
         // The move waits for unsent text: nothing to do, and nothing new to say, while it is there.
         const screen = await this.deps.host.call('terminal.read', { terminalId: w.terminalId, maxLines: 80 }).catch(() => null)
-        if (screen && hasDraft(screen.lines)) return
+        if (screen && (await this.unsent(w.terminalId, w.server, screen.lines))) return
         delete w.draftAt
       }
       const config = await this.deps.config()
@@ -2063,7 +2081,7 @@ export class Rotator {
         this.state.waiting = this.state.waiting.filter((x) => x.terminalId !== w.terminalId)
         const label = displayLabels(view.seats, w.agent).get(source.key) ?? source.label
         const held = await this.deps.host.call('terminal.read', { terminalId: w.terminalId, maxLines: 80 }).catch(() => ({ lines: [] as string[] }))
-        if (hasDraft(held.lines)) {
+        if (await this.unsent(w.terminalId, server, held.lines)) {
           // Typing the first message would send the user's unsent text with it: leave the pane alone.
           await this.save()
           await this.deps.notify('Auto Hand-off', `${PROVIDER_NAME[w.agent]}: ${label} has reset. The session has unsent text in its input box, so it is left for you to continue.`)
@@ -2235,7 +2253,7 @@ export class Rotator {
     if (server) pane.server = server
     const { lines } = await this.deps.host.call('terminal.read', { terminalId: row.terminalId, maxLines: 80 })
     // Moving closes the pane, and with it whatever is typed in its input box.
-    if (hasDraft(lines)) return `${pane.agent}: this pane has unsent text in its input box; send or clear it first`
+    if (await this.unsent(pane.terminalId, pane.server, lines)) return `${pane.agent}: this pane has unsent text in its input box; send or clear it first`
     const before = this.state.history.length
     await this.swap(pane, 'manual', lines)
     const last = this.state.history.length > before ? this.state.history.at(-1) : undefined

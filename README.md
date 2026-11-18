@@ -141,7 +141,8 @@ Detection runs when a pane turns `done` or `waiting`. A banner only counts when 
 - it is among the last five meaningful lines, because an agent that stopped on a limit stops there;
 - it has the shape of a CLI status line: Claude `⎿` or unindented system lines, or the error
   markers other CLIs use (`■`, `⚠`, `error:`, …);
-- it is not an input line (`❯`, `›`, `>`), TUI frame or footer, or one of Claude's own `⏺` replies.
+- it is not an input line (`❯`, `›`, `>`), TUI frame or footer, a row of the plugin's own console
+  status line, or one of Claude's own `⏺` replies.
 
 An agent's reply that mentions rate limits is therefore not treated as a limit. Detection is
 heuristic, though; the `Automatic hand-off` toggle and the per-service switches are the off
@@ -163,7 +164,7 @@ limited pane stays as it is for you to resume.
 *Auto hand-off Claude/Codex/Antigravity/OpenCode/Devin accounts* in Settings. All are on by default.
 For a service that is off, the plugin never closes, switches or resumes its panes, and its parked
 sessions stay parked. Manual switching from the panel or the commands still works. The status bar
-shows it as `codex off`. The *Automatic hand-off* toggle at the top pauses every service at once.
+shows it as `Codex off`. The *Automatic hand-off* toggle at the top pauses every service at once.
 
 Strategies (`custom` mode): **drain** (next account in chain order; the default there), **balanced** (most room),
 **priority** (always the first healthy account in the chain), **soonest-reset** (the account whose
@@ -183,7 +184,9 @@ without numbers, as long as it has no strikes.
 included: a pane whose input box holds unsent text is never closed. An advisory move is dropped
 and considered again at the next turn end or idle check; a limit move stays pending until the
 text is sent or cleared (see the table above). The *Move this workspace's agent to another
-account* command refuses such a pane as well.
+account* command refuses such a pane as well. The plugin asks Orca for that text
+(`orca terminal read --json`, field `draft`) and also looks at the input line on screen; if Orca
+cannot be asked, the screen alone decides.
 
 **Guards on advisory moves** (threshold, idle, switch-back; hard limits ignore these two):
 
@@ -241,7 +244,7 @@ and these are ignored.
 
 ## UI
 
-- **Status bar:** `claude 2/3 · 7%·18% | codex 1/3 · 0%`. The tone turns to warning at 80 % and to
+- **Status bar:** `Claude 2/3 · 7%·18% | Codex 1/3 · 0%`. The tone turns to warning at 80 % and to
   danger while a session is parked. Click it to move Claude to the next account.
 - **Panel** (gauge icon, right sidebar), laid out after Orca's own style guide (quiet and
   monochrome, colour only for state):
@@ -310,7 +313,8 @@ Orca has none for that account). Green above 50 %, yellow from 50 down to 21, re
 bold red at 0; a window without numbers shows `········  n/a`. `▶` and a bold label mark the
 account this pane runs on (from `CLAUDE_CONFIG_DIR`; its 5h/7d come from the live numbers Claude
 just reported); every other account gets a dim `·`, because Claude trims leading spaces off a row.
-`⏸1h20m` at the end of a row is a cooldown. Rows keep Orca's account order so they never jump. The
+`⏸1h20m` at the end of a row is a cooldown. Rows are in the panel's order: the account in use
+first, then the usable ones by headroom. The
 name column shows the account email (or `system (email)` for the provider's own login); when every
 account of the service shares one domain the domain is dropped, otherwise the full address shows.
 The column is as wide as the longest name up to 15 characters; a longer name keeps its first 14
@@ -366,6 +370,13 @@ regression tests:
 - **Orca's restart prompt:** when the selected account changes, Orca itself may offer to restart
   other running Claude sessions on the new account (a "Review" toast). That is Orca's choice; the
   plugin only moves the pane that hit the limit.
+- **Unsent text (Orca 1.4.263):** `terminal.read` gives the rendered screen with the text typed in
+  an agent's input box taken out (the box reads as empty); `orca terminal read --json` reports
+  that text apart, as `draft`. The plugin therefore asks the CLI before every move or typed
+  message.
+- **Console status line rows (Orca 1.4.263):** the screen read includes the rows the console status
+  line prints under the input box. They are skipped like the rest of the footer, so they neither
+  hide a banner above them nor an unsent line.
 
 ## Not migrated from cux
 
@@ -443,7 +454,8 @@ reading more than 10 minutes old gives no runway. The panel shows it as "About N
 pace". Smart and Follow my order act on it: see [Smart](#smart-the-default).
 
 When there is no reading at all, the panel says why, in Orca's terms: "Updates the next time this
-account runs", "Sign in to this account again in Orca", "Orca is rate limited", or Orca's own
+account runs", "Sign in to this account again in Orca", "Usage check is throttled for now; the
+account itself may be fine", or Orca's own
 message.
 
 ### When there are no numbers
@@ -494,9 +506,11 @@ keychains and never triggers Orca's internal fetches.
 ## Permissions
 
 Orca asks you to approve the plugin's access. Beyond the host API, the worker runs the `orca` CLI
-(`account select`, `account list`, `terminal close`, `terminal send`) and `git status` and
+(`account select`, `account list`, `terminal close`, `terminal send`, `terminal read`) and `git status` and
 `git diff --stat`. It always uses an argument list, never a shell. The CLI is used because the host
-API cannot select accounts, and refuses to close or type into panes outside the focused workspace.
+API cannot select accounts, refuses to close or type into panes outside the focused workspace, and
+does not say whether a pane's input box holds unsent text (`terminal read` does; only its `draft`
+field is used).
 
 For a project on a paired Orca server the worker loads Orca's own runtime client from the app
 bundle (`app.asar.unpacked/out/cli/runtime/client.js`) and calls that server's `accounts.*` RPCs
@@ -518,7 +532,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 206 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 210 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json
