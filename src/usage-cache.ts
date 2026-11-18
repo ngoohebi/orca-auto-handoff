@@ -3,6 +3,7 @@
 // Claude account with an expired token reports nothing until it runs again. So the plugin keeps
 // the last reading Orca gave for every account (like cux's usage-cache.json) and shows it with its
 // age, treating windows whose reset time has passed as reset.
+import { LIVE_FRESH_MS, type LiveReading } from './live-usage'
 import type { Provider, Seat, SeatUsage, UsageWindow } from './types'
 
 export type CachedSeat = {
@@ -11,8 +12,10 @@ export type CachedSeat = {
   model?: UsageWindow & { name: string }
   /** When Orca took this reading (its `updatedAt`), or when the plugin first saw it. */
   asOf: number
-  /** The numbers and reset times, so a repeated cached row never looks fresh. */
+  /** Orca's last numbers and reset times, so a repeated cached row never looks fresh. */
   sig: string
+  /** Set when session and weekly come from a pane's status line (`observeLive`), not from Orca. */
+  origin?: 'pane'
 }
 
 export type UsageCache = { v: 1; seats: Record<string, CachedSeat> }
@@ -71,7 +74,17 @@ export function observe(
     const sig = signature(seat.usage)
     const prev = cache.seats[seat.key]
     if (prev && prev.sig === sig) continue
-    const entry: CachedSeat = { asOf: seat.usage.updatedAt ?? now, sig }
+    const asOf = seat.usage.updatedAt ?? now
+    if (prev?.origin === 'pane' && prev.asOf >= asOf) {
+      // A pane reported after Orca took this reading: its session and weekly stand. The model
+      // bucket only ever comes from Orca.
+      prev.sig = sig
+      if (seat.usage.model) prev.model = { ...strip(seat.usage.model)!, name: seat.usage.model.name }
+      else delete prev.model
+      changed = true
+      continue
+    }
+    const entry: CachedSeat = { asOf, sig }
     const session = strip(seat.usage.session)
     const weekly = strip(seat.usage.weekly)
     if (session) entry.session = session
@@ -83,9 +96,50 @@ export function observe(
   return changed
 }
 
+/** Two readings of one window: both give its reset time, at most a minute apart. */
+function sameWindow(a: UsageWindow, b: UsageWindow): boolean {
+  return a.resetsAt !== null && b.resetsAt !== null && Math.abs(a.resetsAt - b.resetsAt) <= 60_000
+}
+
+/** One window of a pane reading against what is remembered. Panes of one account each show the
+ *  limits of their own last answer from Claude, so an idle pane can report older numbers than a
+ *  busy one: within one window usage never goes down, and a pane that only knows a window that
+ *  has ended does not replace a current one. */
+function merged(prev: UsageWindow | undefined, next: UsageWindow | undefined, now: number): UsageWindow | undefined {
+  if (!next) return prev
+  if (!prev) return kept(next)
+  if (next.reset && prev.resetsAt !== null && prev.resetsAt > now) return prev
+  if (sameWindow(prev, next) && next.usedPercent < prev.usedPercent) return { usedPercent: prev.usedPercent, resetsAt: next.resetsAt }
+  return kept(next)
+}
+
+function kept(w: UsageWindow): UsageWindow {
+  return w.reset ? { usedPercent: w.usedPercent, resetsAt: w.resetsAt, reset: true } : { usedPercent: w.usedPercent, resetsAt: w.resetsAt }
+}
+
+/**
+ * Records a pane's own reading for a seat (live-usage.ts). It replaces session and weekly, keeps
+ * the model bucket (only Orca reports it) and marks the entry `origin: 'pane'`. A reading no newer
+ * than what is remembered is ignored. Returns whether the cache changed.
+ */
+export function observeLive(cache: UsageCache, seatKey: string, reading: LiveReading, now: number): boolean {
+  const prev = cache.seats[seatKey]
+  if (prev && reading.asOf <= prev.asOf) return false
+  const entry: CachedSeat = { asOf: reading.asOf, sig: prev?.sig ?? '', origin: 'pane' }
+  const session = merged(prev?.session, reading.session, now)
+  const weekly = merged(prev?.weekly, reading.weekly, now)
+  if (session) entry.session = session
+  if (weekly) entry.weekly = weekly
+  if (prev?.model) entry.model = prev.model
+  cache.seats[seatKey] = entry
+  return true
+}
+
 /** A cached window as it stands now: reset when its reset time has passed, gone when too old. */
 function project(w: UsageWindow | undefined, asOf: number, lengthMs: number, now: number): UsageWindow | undefined {
   if (!w) return undefined
+  // A pane reading taken after its window had ended (see `parseLive`).
+  if (w.reset && w.resetsAt === null) return now - asOf > lengthMs ? undefined : { usedPercent: 0, resetsAt: null, reset: true }
   if (w.resetsAt !== null && w.resetsAt <= now) return { usedPercent: 0, resetsAt: null, reset: true }
   if (w.resetsAt === null && now - asOf > lengthMs) return undefined
   return { usedPercent: w.usedPercent, resetsAt: w.resetsAt }
@@ -95,6 +149,10 @@ function project(w: UsageWindow | undefined, asOf: number, lengthMs: number, now
  * The usage the plugin should use for a seat: Orca's live numbers when it has them, else the last
  * reading (projected past resets), else unknown. Orca's current reason (stale token, rate limited,
  * …) is kept either way.
+ *
+ * A pane's own reading (`observeLive`) wins over Orca's when it is the newer of the two, and counts
+ * as live for 10 minutes. It belongs to the account whose pane wrote it, so the `activeSince` guard
+ * (which protects against Orca's active slot still holding the previous account) does not apply.
  */
 export function resolve(
   seat: Seat,
@@ -104,7 +162,9 @@ export function resolve(
   activeSince: Partial<Record<Provider, number>>
 ): SeatUsage {
   const current = seat.usage
-  if (isLive(seat, activeSince)) {
+  const cachedPane = cache.seats[seat.key]?.origin === 'pane' ? cache.seats[seat.key] : undefined
+  const orcaLive = isLive(seat, activeSince)
+  if (orcaLive && !(cachedPane && cachedPane.asOf > (current.updatedAt ?? Infinity))) {
     const live: SeatUsage = { ...current, known: true, source: 'live' }
     if (current.updatedAt !== undefined) live.asOf = current.updatedAt
     return live
@@ -114,13 +174,17 @@ export function resolve(
   if (current.detail) keep.detail = current.detail
   if (current.retryAt) keep.retryAt = current.retryAt
   const cached = cache.seats[seat.key]
-  if (!cached || maxAgeMs <= 0 || now - cached.asOf > maxAgeMs) {
+  const paneFresh = !!cachedPane && now - cachedPane.asOf <= LIVE_FRESH_MS
+  // Reaching here with Orca live means a newer pane reading stands in for Orca's own.
+  const upToDate = orcaLive || paneFresh
+  if (!cached || (!upToDate && (maxAgeMs <= 0 || now - cached.asOf > maxAgeMs))) {
     return { ...keep, known: false, source: 'unknown' }
   }
   const session = project(cached.session, cached.asOf, WINDOW_MS.session, now)
   const weekly = project(cached.weekly, cached.asOf, WINDOW_MS.weekly, now)
   const modelWin = project(cached.model, cached.asOf, WINDOW_MS.model, now)
-  const usage: SeatUsage = { ...keep, known: !!(session || weekly || modelWin), source: 'cached', asOf: cached.asOf }
+  const usage: SeatUsage = { ...keep, known: !!(session || weekly || modelWin), source: upToDate ? 'live' : 'cached', asOf: cached.asOf }
+  if (cached.origin === 'pane') usage.origin = 'pane'
   if (session) usage.session = session
   if (weekly) usage.weekly = weekly
   if (modelWin && cached.model) usage.model = { ...modelWin, name: cached.model.name }

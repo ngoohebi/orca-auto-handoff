@@ -72,9 +72,9 @@ export function accountList(options: {
   return {
     claude: {
       accounts: [
-        { id: 'c1', email: 'one@example.test', authMethod: 'subscription-oauth' },
-        { id: 'c2', email: 'two@example.test', authMethod: 'subscription-oauth' },
-        { id: 'c3', email: 'me@example.test', authMethod: 'subscription-oauth' }
+        { id: 'c1', email: 'one@example.test', authMethod: 'subscription-oauth', home: '/home/me/orca/claude-profiles/c1/home' },
+        { id: 'c2', email: 'two@example.test', authMethod: 'subscription-oauth', home: '/home/me/orca/claude-profiles/c2/home' },
+        { id: 'c3', email: 'me@example.test', authMethod: 'subscription-oauth', home: '/home/me/orca/claude-profiles/c3/home' }
       ],
       activeAccountId: options.claudeActive === undefined ? 'c1' : options.claudeActive,
       systemDefaultHome: '/home/me/.claude',

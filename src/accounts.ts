@@ -1,5 +1,6 @@
 // Turns `orca account list --json` (its `result`) into seats with usage. Orca already polls usage
 // for every managed account, so the plugin never touches tokens or keychains itself.
+import { liveKeyOfHome } from './live-usage'
 import type { Provider, Seat, SeatUsage, UsageWindow } from './types'
 
 type Json = Record<string, any>
@@ -81,14 +82,19 @@ export function parseAccounts(result: Json): AccountView {
 
     for (const a of accounts) {
       const isActive = activeId === a.id
-      seats.push({
+      const seat: Seat = {
         key: `${provider}:${a.id}`,
         provider,
         accountId: a.id,
         label: a.email ?? a.workspaceLabel ?? a.id,
         active: isActive,
         usage: isActive ? usageFrom(rl[provider]) : inactiveUsage(inactive, a.id)
-      })
+      }
+      // Claude panes report their own usage per profile (live-usage.ts). Only the profile id is
+      // taken from the account's home; the path stays out of seats, snapshots and storage.
+      const liveKey = provider === 'claude' ? liveKeyOfHome(a.home) : undefined
+      if (liveKey) seat.liveKeys = [liveKey]
+      seats.push(seat)
     }
     // The system login is a seat of its own unless it is the same person as a managed account.
     const duplicate = systemEmail && accounts.some((a) => lower(a.email) === systemEmail)
@@ -99,8 +105,14 @@ export function parseAccounts(result: Json): AccountView {
         accountId: 'system',
         label: systemEmail ? `system (${systemEmail})` : 'system',
         active: activeId === null,
-        usage: activeId === null ? usageFrom(rl[provider]) : { known: false, source: 'unknown', reason: 'not-reported' }
+        usage: activeId === null ? usageFrom(rl[provider]) : { known: false, source: 'unknown', reason: 'not-reported' },
+        ...(provider === 'claude' ? { liveKeys: ['system'] } : {})
       })
+    }
+    // A managed account that is the system login runs under both: its profile and Claude's own.
+    if (provider === 'claude' && hasSystem && duplicate) {
+      const twin = seats.find((s) => s.key === `claude:${accounts.find((a) => lower(a.email) === systemEmail)?.id}`)
+      if (twin) twin.liveKeys = [...(twin.liveKeys ?? []), 'system']
     }
     if (activeId) active[provider] = `${provider}:${activeId}`
     else if (hasSystem && !duplicate) active[provider] = `${provider}:system`

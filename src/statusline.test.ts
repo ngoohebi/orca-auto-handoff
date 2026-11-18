@@ -260,6 +260,184 @@ test('wrapper script: without jq the sed fallback reads the same fields', async 
   }
 })
 
+// ---- per-pane live usage (live-usage.ts) ------------------------------------------------------
+
+const liveFile = (home: string, key: string) => join(home, `.orca/account-rotator/live/claude-${key}.tsv`)
+const fs = () => import('node:fs')
+const FIVE_RESET = nowSec + 7200
+const WEEK_RESET = nowSec + 99999
+
+test('wrapper script: leaves the pane\'s own numbers in a live file for its profile, and for the system login', async () => {
+  const fx = fakeHome()
+  try {
+    const { existsSync, readFileSync, readdirSync } = await fs()
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    const base = { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin' }
+    const before = Math.floor(Date.now() / 1000)
+    const run = await sh(script, PAYLOAD, { ...base, CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/abc-123_x.y/home` })
+    assert.equal(run.code, 0, run.stderr)
+    const row = readFileSync(liveFile(fx.home, 'abc-123_x.y'), 'utf8')
+    assert.match(row, /^1\t\d+\t85\.2\t\d+\t19\.9\t\d+\n$/)
+    const [version, stamp, five, fiveReset, seven, sevenReset] = row.trim().split('\t')
+    assert.deepEqual([version, five, fiveReset, seven, sevenReset], ['1', '85.2', String(FIVE_RESET), '19.9', String(WEEK_RESET)])
+    assert.ok(Number(stamp) >= before && Number(stamp) <= before + 5, 'stamped with the time of writing')
+    // The file is numbers only: no path, name or model.
+    assert.ok(!row.includes(fx.home) && !/[A-Za-z]/.test(row))
+
+    // Claude's own login: no CLAUDE_CONFIG_DIR, or the default ~/.claude.
+    await sh(script, PAYLOAD, base)
+    assert.match(readFileSync(liveFile(fx.home, 'system'), 'utf8'), /^1\t\d+\t85\.2\t/)
+    rmSync(liveFile(fx.home, 'system'))
+    await sh(script, PAYLOAD, { ...base, CLAUDE_CONFIG_DIR: `${fx.home}/.claude` })
+    assert.ok(existsSync(liveFile(fx.home, 'system')))
+
+    // Only one window known: the other is "-".
+    rmSync(liveFile(fx.home, 'system'))
+    const onlyFive = JSON.stringify({ model: { display_name: 'Opus 4.1' }, rate_limits: { five_hour: { used_percentage: 12, resets_at: FIVE_RESET } } })
+    await sh(script, onlyFive, base)
+    assert.match(readFileSync(liveFile(fx.home, 'system'), 'utf8'), new RegExp(`^1\\t\\d+\\t12\\t${FIVE_RESET}\\t-\\t-\\n$`))
+    // No temp file is left behind.
+    assert.deepEqual(readdirSync(join(fx.home, '.orca/account-rotator/live')).sort(), ['claude-abc-123_x.y.tsv', 'claude-system.tsv'])
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('wrapper script: no live file for an unknown config dir, a background job, or a payload without limits', async () => {
+  const fx = fakeHome()
+  try {
+    const { existsSync } = await fs()
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    const base = { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin' }
+    const live = join(fx.home, '.orca/account-rotator/live')
+    const quiet = async (payload: string, env: Record<string, string>, why: string) => {
+      const run = await sh(script, payload, { ...base, ...env })
+      assert.equal(run.code, 0, run.stderr)
+      assert.ok(plain(run.stdout).startsWith('▶ this pane'), `${why}: the line still prints`)
+      assert.equal(existsSync(live), false, why)
+    }
+    await quiet(PAYLOAD, { CLAUDE_CONFIG_DIR: '/somewhere/else/.claude' }, 'a config dir that is no Orca profile')
+    await quiet(PAYLOAD, { CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/bad id!/home` }, 'a profile id with other characters')
+    await quiet(PAYLOAD, { CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/../home` }, 'a profile id that is a path step')
+    await quiet(PAYLOAD, { CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/bbb` }, 'a profile dir without a home under it')
+    await quiet(PAYLOAD, { CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/bbb/home`, CLAUDE_JOB_DIR: '/tmp/job' }, 'a background job')
+    await quiet(PAYLOAD, { CLAUDE_JOB_DIR: '/tmp/job' }, 'a background job on the system login')
+    const noLimits = JSON.stringify({ model: { display_name: 'Opus 4.1' }, context_window: { used_percentage: 40.5 } })
+    await quiet(noLimits, { CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/bbb/home` }, 'no rate limits in the payload')
+    await quiet(JSON.stringify({ rate_limits: { five_hour: { used_percentage: 'lots' }, seven_day: {} } }), {}, 'limits that are not numbers')
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('wrapper script: the jq and the sed path write the same live file', async () => {
+  const fx = fakeHome()
+  try {
+    const { existsSync, readFileSync, symlinkSync } = await fs()
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    const bin = join(fx.home, 'bin')
+    mkdirSync(bin)
+    for (const tool of ['sed', 'tr', 'date', 'cat', 'mkdir', 'mv']) {
+      const found = ['/usr/bin', '/bin'].map((d) => join(d, tool)).find((p) => existsSync(p))
+      assert.ok(found, `${tool} on this machine`)
+      symlinkSync(found!, join(bin, tool))
+    }
+    const values = (key: string) => readFileSync(liveFile(fx.home, key), 'utf8').trim().split('\t').filter((_, i) => i !== 1)
+    const viaSed = await sh(script, PAYLOAD, { HOME: fx.home, PATH: bin, CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/sed/home` })
+    assert.equal(viaSed.code, 0, viaSed.stderr)
+    assert.deepEqual(values('sed'), ['1', '85.2', String(FIVE_RESET), '19.9', String(WEEK_RESET)])
+    const hasJq = (process.env.PATH ?? '/usr/bin:/bin').split(':').some((d) => d && existsSync(join(d, 'jq')))
+    if (hasJq) {
+      await sh(script, PAYLOAD, { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/jq/home` })
+      assert.deepEqual(values('jq'), values('sed'))
+    }
+    // The sed path without mkdir and mv on the PATH: no file, and the line is unharmed.
+    rmSync(join(fx.home, '.orca/account-rotator/live'), { recursive: true, force: true })
+    rmSync(join(bin, 'mkdir'))
+    rmSync(join(bin, 'mv'))
+    const bare = await sh(script, PAYLOAD, { HOME: fx.home, PATH: bin, CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/sed/home` })
+    assert.equal(bare.code, 0, bare.stderr)
+    assert.equal(bare.stderr, '')
+    assert.ok(plain(bare.stdout).includes('5h █░░░░░░░  14%'))
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('wrapper script: a live dir that cannot be written still prints the line and feeds Orca\'s hook', async () => {
+  const fx = fakeHome()
+  try {
+    const { existsSync, readFileSync } = await fs()
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    // `live` is a file, so neither the directory nor anything in it can be made.
+    writeFileSync(join(fx.home, '.orca/account-rotator/live'), 'in the way\n')
+    const env = { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/bbb/home` }
+    const run = await sh(script, PAYLOAD, env)
+    assert.equal(run.code, 0, run.stderr)
+    assert.equal(run.stderr, '')
+    assert.deepEqual(plain(run.stdout).split('\n'), [
+      `▶ ${pad('this pane', 9)}  5h █░░░░░░░  14%  7d ██████░░  80%  model ········  n/a  no rotator status yet`,
+      ''
+    ])
+    assert.equal(readFileSync(join(fx.home, '.orca/account-rotator/live'), 'utf8'), 'in the way\n')
+    await new Promise((r) => setTimeout(r, 300))
+    assert.equal(readFileSync(fx.hookOut, 'utf8'), PAYLOAD)
+
+    // A read-only directory (skipped for root, who can write anywhere).
+    rmSync(join(fx.home, '.orca/account-rotator/live'))
+    mkdirSync(join(fx.home, '.orca/account-rotator/live'))
+    chmodSync(join(fx.home, '.orca/account-rotator/live'), 0o555)
+    const locked = await sh(script, PAYLOAD, env)
+    assert.equal(locked.code, 0, locked.stderr)
+    assert.equal(locked.stderr, '')
+    assert.ok(plain(locked.stdout).startsWith('▶ this pane'))
+    if (process.env.USER !== 'root') assert.equal(existsSync(liveFile(fx.home, 'bbb')), false)
+    chmodSync(join(fx.home, '.orca/account-rotator/live'), 0o755)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('wrapper script: unchanged numbers are rewritten at most once a minute, changed ones at once', async () => {
+  const fx = fakeHome()
+  try {
+    const { readFileSync } = await fs()
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    const env = { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/bbb/home` }
+    const file = liveFile(fx.home, 'bbb')
+    mkdirSync(join(fx.home, '.orca/account-rotator/live'))
+    const same = `85.2\t${FIVE_RESET}\t19.9\t${WEEK_RESET}`
+    const stampAfter = async (existing: string) => {
+      writeFileSync(file, existing)
+      const run = await sh(script, PAYLOAD, env)
+      assert.equal(run.code, 0, run.stderr)
+      return readFileSync(file, 'utf8')
+    }
+    const t = Math.floor(Date.now() / 1000)
+    // Same numbers, written 30 s ago: left alone.
+    assert.equal(await stampAfter(`1\t${t - 30}\t${same}\n`), `1\t${t - 30}\t${same}\n`)
+    // Same numbers, two minutes old: stamped again.
+    const again = await stampAfter(`1\t${t - 120}\t${same}\n`)
+    assert.ok(Number(again.split('\t')[1]) >= t, again)
+    assert.ok(again.endsWith(`\t${same}\n`))
+    // Other numbers, however recent: replaced.
+    const changed = await stampAfter(`1\t${t - 5}\t84\t${FIVE_RESET}\t19.9\t${WEEK_RESET}\n`)
+    assert.ok(Number(changed.split('\t')[1]) >= t && changed.endsWith(`\t${same}\n`), changed)
+    // A stamp from the future, another version, or junk never blocks a write.
+    for (const odd of [`1\t${t + 500}\t${same}\n`, `2\t${t - 5}\t${same}\n`, 'junk\n', '']) {
+      const fixed = await stampAfter(odd)
+      assert.ok(fixed.startsWith('1\t') && Number(fixed.split('\t')[1]) >= t && Number(fixed.split('\t')[1]) <= t + 5 && fixed.endsWith(`\t${same}\n`), JSON.stringify([odd, fixed]))
+    }
+    // Two runs in a row: the second leaves the first's file as it is.
+    const first = await stampAfter('')
+    await new Promise((r) => setTimeout(r, 1100))
+    await sh(script, PAYLOAD, env)
+    assert.equal(readFileSync(file, 'utf8'), first)
+  } finally {
+    fx.cleanup()
+  }
+})
+
 test('worker: install and uninstall edit the focused workspace, the status file follows the snapshot', async () => {
   const files = memoryFiles('/home/u')
   const host = mockHost({

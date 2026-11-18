@@ -4,6 +4,8 @@ import type { OrcaWorkerApi } from 'orca/worker'
 import { nodeCli } from './cli'
 import { Rotator, type Deps, type StatusEvent } from './engine'
 import { PROVIDER_NAME } from './labels'
+import { LIVE_KEY, liveFileName } from './live-usage'
+import { DATA_DIR, LIVE_DIR } from './statusline'
 import { ConsoleStatusLine, nodeFiles, memoryFiles, type Files } from './statusline-files'
 import { DEFAULT_CONFIG, PROVIDERS, type Config, type Provider, type RotatorState, type Snapshot } from './types'
 import './protocol'
@@ -103,7 +105,8 @@ export async function activateWith(
   options: { tick?: boolean; files?: Files } = {}
 ): Promise<Rotator> {
   let lastStatus = ''
-  const consoleLine = new ConsoleStatusLine(options.files ?? memoryFiles(), {
+  const files = options.files ?? memoryFiles()
+  const consoleLine = new ConsoleStatusLine(files, {
     host: orca.host as unknown as Deps['host'],
     settings: () => orca.settings.get().catch(() => ({})) as Promise<Record<string, unknown>>,
     log: (m) => orca.log(m),
@@ -118,6 +121,7 @@ export async function activateWith(
     saveState: (state) => orca.storage.set(STATE_KEY, state as never),
     loadUsage: () => orca.storage.get(USAGE_KEY),
     saveUsage: (cache) => orca.storage.set(USAGE_KEY, cache as never),
+    readLive: async (liveKey) => (LIVE_KEY.test(liveKey) ? files.read(`${files.home}/${DATA_DIR}/${LIVE_DIR}/${liveFileName(liveKey)}`) : null),
     config: () => readConfig(orca),
     log: (message) => orca.log(message),
     notify: async (title, body) => {

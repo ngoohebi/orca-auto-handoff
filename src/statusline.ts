@@ -15,6 +15,8 @@ export { displayLabels }
 export const DATA_DIR = '.orca/account-rotator'
 export const SCRIPT_NAME = 'claude-statusline.sh'
 export const STATUS_NAME = 'status.tsv'
+/** Where the wrapper leaves each account's latest numbers: `live/claude-<key>.tsv` (live-usage.ts). */
+export const LIVE_DIR = 'live'
 /** What `.claude/settings.local.json` runs; `$HOME` stays literal so the file is portable. */
 export const STATUSLINE_COMMAND = `/bin/sh "$HOME/${DATA_DIR}/${SCRIPT_NAME}"`
 /** The optional header line; empty = account rows only. */
@@ -139,7 +141,7 @@ if [ -x "$orca_hook" ]; then
 fi
 
 tab=$(printf '\t')
-model=- ctx=- five=- seven=- reset=-
+model=- ctx=- five=- seven=- reset=- wreset=-
 if command -v jq >/dev/null 2>&1; then
   fields=$(printf '%s' "$payload" | jq -r '[
       (.model.display_name // "-"),
@@ -149,13 +151,14 @@ if command -v jq >/dev/null 2>&1; then
         else "-" end)),
       (.rate_limits.five_hour.used_percentage // "-"),
       (.rate_limits.seven_day.used_percentage // "-"),
-      (.rate_limits.five_hour.resets_at // "-")
+      (.rate_limits.five_hour.resets_at // "-"),
+      (.rate_limits.seven_day.resets_at // "-")
     ] | map(tostring) | join("\t")' 2>/dev/null)
   if [ -n "$fields" ]; then
     oldifs=$IFS; IFS=$tab
     set -- $fields
     IFS=$oldifs
-    model=@{1:-"-"}; ctx=@{2:-"-"}; five=@{3:-"-"}; seven=@{4:-"-"}; reset=@{5:-"-"}
+    model=@{1:-"-"}; ctx=@{2:-"-"}; five=@{3:-"-"}; seven=@{4:-"-"}; reset=@{5:-"-"}; wreset=@{6:-"-"}
   fi
 else
   flat=$(printf '%s' "$payload" | tr -d '\n')
@@ -163,6 +166,7 @@ else
   five=$(printf '%s' "$flat" | sed -n 's/.*"five_hour":{[^}]*"used_percentage":\([0-9.]*\).*/\1/p'); five=@{five:-"-"}
   seven=$(printf '%s' "$flat" | sed -n 's/.*"seven_day":{[^}]*"used_percentage":\([0-9.]*\).*/\1/p'); seven=@{seven:-"-"}
   reset=$(printf '%s' "$flat" | sed -n 's/.*"five_hour":{[^}]*"resets_at":\([0-9]*\).*/\1/p'); reset=@{reset:-"-"}
+  wreset=$(printf '%s' "$flat" | sed -n 's/.*"seven_day":{[^}]*"resets_at":\([0-9]*\).*/\1/p'); wreset=@{wreset:-"-"}
   cw=@{flat#*\"context_window\":\{}
   if [ "$cw" != "$flat" ]; then
     size=$(printf '%s' "$cw" | sed -n 's/.*"context_window_size":\([0-9]*\).*/\1/p')
@@ -174,6 +178,42 @@ else
       ctx=$(( (@{a:-0} + @{b:-0} + @{c:-0}) * 100 / size ))
     fi
   fi
+fi
+
+now=$(date +%s 2>/dev/null || printf '%s' 0)
+
+# Leave this pane's own numbers for the plugin: Orca polls only the selected account, so this is
+# how an account that runs in a pane but is not selected stays known. One line, per account:
+#   1 <tab> written (epoch s) <tab> 5h used % <tab> 5h reset (epoch s) <tab> 7d used % <tab> 7d reset
+# The account is the profile in CLAUDE_CONFIG_DIR, or "system" for Claude's own login; any other
+# config dir is not an account Orca manages and writes nothing. Background jobs do not write.
+# Nothing here may fail the line: it runs in a subshell with errors dropped.
+live_key=
+case "@{CLAUDE_CONFIG_DIR:-}" in
+  ''|"@{HOME:-}/.claude"|"@{HOME:-}/.claude/") live_key=system ;;
+  */claude-profiles/*/*)
+    live_key=@{CLAUDE_CONFIG_DIR##*/claude-profiles/}; live_key=@{live_key%%/*}
+    case "$live_key" in ''|.|..|*[!A-Za-z0-9._-]*) live_key= ;; esac ;;
+esac
+# A plain number, or "-".
+num_of() { case "$1" in ''|.|*[!0-9.]*|*.*.*) printf '%s' '-' ;; *) printf '%s' "$1" ;; esac; }
+if [ -n "$live_key" ] && [ -n "@{HOME:-}" ] && [ -z "@{CLAUDE_JOB_DIR:-}" ] && [ "$now" -gt 0 ] 2>/dev/null; then
+  (
+    row="$(num_of "$five")$tab$(num_of "$reset")$tab$(num_of "$seven")$tab$(num_of "$wreset")"
+    case "$row" in -"$tab"*"$tab"-"$tab"*) exit 0 ;; esac
+    live="$dir/${LIVE_DIR}"
+    file="$live/claude-$live_key.tsv"
+    # Unchanged numbers are rewritten at most once a minute.
+    if [ -r "$file" ]; then
+      IFS="$tab" read -r v at a b c d <"$file" || :
+      if [ "$v" = 1 ] && [ "$a$tab$b$tab$c$tab$d" = "$row" ]; then
+        case "$at" in ''|*[!0-9]*) ;; *) [ $((now - at)) -ge 0 ] && [ $((now - at)) -lt 60 ] && exit 0 ;; esac
+      fi
+    fi
+    [ -d "$live" ] || mkdir -p "$live" || exit 0
+    tmp="$file.$$"
+    printf '1\t%s\t%s\n' "$now" "$row" >"$tmp" && mv -f "$tmp" "$file"
+  ) 2>/dev/null || :
 fi
 
 # Percent left from percent used, clamped to 0..100.
@@ -189,7 +229,6 @@ left_of() {
 five=$(left_of "$five"); seven=$(left_of "$seven")
 ctx=$(left_of "$ctx")
 
-now=$(date +%s 2>/dev/null || printf '%s' 0)
 # "1h20m" until an epoch second, or "" when past or unknown.
 until_text() {
   case "$1" in ''|-|null|0) return ;; esac

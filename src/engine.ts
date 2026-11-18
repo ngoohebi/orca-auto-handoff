@@ -3,7 +3,8 @@
 import { ADAPTERS, CHROME, classify, countCopies, hasDraft, parseModelFallback } from './adapters'
 import { parseAccounts, type AccountView } from './accounts'
 import { PROVIDER_NAME } from './labels'
-import { emptyUsageCache, loadedUsageCache, observe, resolve, type UsageCache } from './usage-cache'
+import { parseLive } from './live-usage'
+import { emptyUsageCache, loadedUsageCache, observe, observeLive, resolve, type UsageCache } from './usage-cache'
 import {
   blindCooldownMs,
   buildChain,
@@ -69,6 +70,9 @@ export type Deps = {
   /** The persisted last-known usage cache (storage key `usage`). */
   loadUsage(): Promise<unknown>
   saveUsage(cache: UsageCache): Promise<void>
+  /** The text of a pane's live usage file for this key (`live/claude-<key>.tsv`, written by the
+   *  console status line wrapper), or `null` when there is none. Read-only. */
+  readLive(liveKey: string): Promise<string | null>
 }
 
 /** What the plugin knows about one agent pane. */
@@ -431,7 +435,8 @@ export class Rotator {
             if (current.view.active[provider] && current.view.active[provider] !== seatKey) this.activeSince[provider] = now
           }
         }
-        const changed = observe(this.usage, parsed.seats, now, this.activeSince)
+        let changed = observe(this.usage, parsed.seats, now, this.activeSince)
+        if (await this.observePanes(parsed.seats, now)) changed = true
         const maxAgeMs = config.usageCacheMaxAgeHours * 3_600_000
         for (const seat of parsed.seats) seat.usage = resolve(seat, this.usage, now, maxAgeMs, this.activeSince)
         if (changed) await this.deps.saveUsage(this.usage).catch(() => undefined)
@@ -456,7 +461,25 @@ export class Rotator {
     return nextView
   }
 
-  /** A current reading (Orca's, or later a pane's: anything resolved as `live`) that is newer than
+  /** Takes in what Claude panes reported about their own accounts (live-usage.ts). Passive: it
+   *  only reads files, so it also runs while paused or with the service off. */
+  private async observePanes(seats: readonly Seat[], now: number): Promise<boolean> {
+    let changed = false
+    for (const seat of seats) {
+      if (!seat.liveKeys?.length) continue
+      const readings = []
+      for (const liveKey of seat.liveKeys) {
+        const reading = parseLive(await this.deps.readLive(liveKey).catch(() => null), now)
+        if (reading) readings.push(reading)
+      }
+      // Oldest first, so the newest stands and one window never goes down between them.
+      readings.sort((a, b) => a.asOf - b.asOf)
+      for (const reading of readings) if (observeLive(this.usage, seat.key, reading, now)) changed = true
+    }
+    return changed
+  }
+
+  /** A current reading (Orca's or a pane's: anything resolved as `live`) that is newer than
    *  the last strike and shows room clears the seat's strikes. Remembered numbers never do. */
   private clearStrikesByReading(seats: readonly Seat[], config: Config, now: number): boolean {
     let changed = false
@@ -871,8 +894,9 @@ export class Rotator {
    *  plenty of room, i.e. the limited pane must be on some other (older) account. */
   private plausiblyLimited(seat: Seat): boolean {
     const u = seat.usage
-    // Only Orca's live numbers can clear an account; remembered ones may be out of date.
-    if (!u.known || (u.source !== undefined && u.source !== 'live')) return true
+    // Only Orca's live numbers can clear an account; remembered ones may be out of date, and a
+    // pane's reading can come from a quieter pane of the same account.
+    if (!u.known || (u.source !== undefined && u.source !== 'live') || u.origin === 'pane') return true
     return Math.max(u.session?.usedPercent ?? 0, u.weekly?.usedPercent ?? 0, u.model?.usedPercent ?? 0) >= 90
   }
 
@@ -1562,8 +1586,9 @@ export class Rotator {
       updatedAt,
       seats: view.seats.map((s) => {
         const h = this.state.health[s.key]
+        const { liveKeys: _liveKeys, ...seat } = s
         return {
-          ...s,
+          ...seat,
           ...(h?.cooldownUntil ? { cooldownUntil: h.cooldownUntil } : {}),
           ...(h?.reason ? { cooldownReason: h.reason } : {})
         }

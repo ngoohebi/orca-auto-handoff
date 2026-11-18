@@ -184,7 +184,8 @@ ends with `⏸ switching paused` while automatic hand-off is off. *Console statu
 is the cells per gauge (8). The worker rewrites `~/.orca/account-rotator/status.tsv` whenever a
 seat changes and keeps the script at `~/.orca/account-rotator/claude-statusline.sh`; the line
 never runs the Orca CLI, so it stays well inside Claude's status line budget (about 40 ms with jq,
-which macOS ships; a sed fallback covers machines without it). *Remove the console status line
+which macOS ships; a sed fallback covers machines without it). It also leaves the pane's own usage
+numbers for the plugin (see [Usage of accounts not in use](#usage-of-accounts-not-in-use)). *Remove the console status line
 from this workspace* restores whatever `statusLine` the file had before, and deletes the file when
 the wrapper was all it held.
 
@@ -193,6 +194,7 @@ the wrapper was all it held.
 - **Claude:** resumes by session id. Every Orca Claude profile's `projects/` is a symlink to
   `~/.claude/projects`, so the transcript is visible from every account. Usage for an inactive
   account can be unknown until it runs; such an account is a last resort, not an equal choice.
+  With the console status line installed, every account that runs in a pane reports its own usage.
 - **Codex:** each Orca Codex account keeps its own `sessions/`, so a session may not exist on the
   next account. Codex moves by handoff until cross-account resume is verified. A Codex profile that
   routes to another backend (such as Ollama Cloud) reports billing limits as
@@ -267,6 +269,26 @@ A window whose reset time has passed shows as 0 %, "reset since". These remember
 count when the plugin chooses the next account, so an exhausted account that is not in use is no
 longer mistaken for a free one.
 
+**Numbers from the panes themselves.** Claude Code gives every pane's status line the limits of the
+account that pane runs on. With the [console status line](#console-status-line) installed, the
+wrapper leaves them in `~/.orca/account-rotator/live/claude-<profile id>.tsv` (`claude-system.tsv`
+for Claude's own login): one line with the time of writing, the 5-hour and 7-day percent used and
+their reset times. Numbers only: no name, email, path or token. The worker reads these files on
+every usage read, so a Claude account that runs in a pane but is not the selected one has current
+numbers too:
+
+- the newer of Orca's reading and the pane's is used; a pane reading at most 10 minutes old counts
+  as live, an older one as a remembered reading;
+- the model window (`fable`, …) still comes only from Orca;
+- several panes of one account each report the limits of their own last answer, so within one
+  window (the same reset time) usage never goes down, and a pane that only knows a window that has
+  ended does not undo the current one;
+- the wrapper writes at most once a minute while the numbers are unchanged, never for a background
+  job (`CLAUDE_JOB_DIR`) or a config dir that is no Orca profile, and a failed write never touches
+  the line;
+- reading is passive: it also happens while hand-off is paused or the service is off, and it
+  switches nothing by itself. Accounts on a paired Orca server are not covered.
+
 When there is no reading at all, the panel says why, in Orca's terms: "Updates the next time this
 account runs", "Sign in to this account again in Orca", "Orca is rate limited", or Orca's own
 message.
@@ -330,6 +352,9 @@ CLI's account commands only answer for this computer. Those modules are Orca int
 published API: an Orca update can break the server path, in which case the panel shows the error
 and this computer's accounts keep working.
 
+The worker writes `status.tsv` and the wrapper script under `~/.orca/account-rotator/` and reads
+the `live/` files the wrapper leaves there; the wrapper is the only writer of `live/`.
+
 A handoff prompt (for services that cannot resume by session id) includes up to 40 lines of the
 previous agent's output, so treat it like any pasted terminal output.
 
@@ -340,7 +365,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 76 tests: adapters (real captured banners), selector, worker end to end, panel
+orca plugin test . --json        # 131 tests: adapters (real captured banners), selector, usage cache, live usage, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

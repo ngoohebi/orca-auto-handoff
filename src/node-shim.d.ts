@@ -18,6 +18,8 @@ declare module 'node:fs' {
   export function chmodSync(path: string, mode: number): void
   export function mkdtempSync(prefix: string): string
   export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void
+  export function readdirSync(path: string): string[]
+  export function symlinkSync(target: string, path: string): void
 }
 declare module 'node:os' {
   export function homedir(): string

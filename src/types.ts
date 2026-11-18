@@ -26,6 +26,8 @@ export type SeatUsage = {
   source?: 'live' | 'cached' | 'projected' | 'unknown'
   /** When the numbers were taken. */
   asOf?: number
+  /** Set when the numbers come from a pane's status line (live-usage.ts), not from Orca. */
+  origin?: 'pane'
   reason?: UsageReason
   /** Orca's own message for the reason, shortened. */
   detail?: string
@@ -47,6 +49,10 @@ export type Seat = {
   label: string
   active: boolean
   usage: SeatUsage
+  /** Which per-pane live files describe this account (live-usage.ts): its Claude profile id,
+   *  `system` for Claude's own login, or both when a managed account is that same login. Local
+   *  Claude accounts only; never part of a snapshot. */
+  liveKeys?: string[]
 }
 
 export type SignalKind = 'rate_limit' | 'model_cap' | 'api_error' | 'auth'
