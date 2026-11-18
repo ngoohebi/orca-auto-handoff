@@ -309,8 +309,9 @@ on every service, but each service keeps its own chain.
 Orca points Claude Code's `statusLine` at its own hook, which feeds Orca's status bar and prints
 nothing, so a Claude pane in Orca shows no status line. *Auto Hand-off: Install the console
 status line in this workspace* writes a wrapper into the focused workspace's
-`.claude/settings.local.json` (project settings win over the user settings Orca manages). The
-wrapper still forwards every payload to Orca's hook, then prints one row per account of the pane's
+`.claude/settings.local.json` (project settings win over the user settings Orca manages). Only for
+a workspace on this computer: one on an SSH target or a paired Orca server is left alone, and the
+command and the panel switch say so. The wrapper still forwards every payload to Orca's hook, then prints one row per account of the pane's
 own service (a Claude pane lists the Claude accounts, never Codex):
 
 ```
@@ -544,7 +545,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 217 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 220 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

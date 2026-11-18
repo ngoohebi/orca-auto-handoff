@@ -132,9 +132,9 @@ test('settings.local.json: install keeps an earlier statusLine aside, uninstall 
 })
 
 type Run = { stdout: string; stderr: string; code: number }
-function sh(script: string, stdin: string, env: Record<string, string>): Promise<Run> {
+function sh(script: string, stdin: string, env: Record<string, string>, cwd?: string): Promise<Run> {
   return new Promise((resolve) => {
-    const child = execFile('/bin/sh', [script], { env, timeout: 5000, maxBuffer: 1 << 20 }, (error, stdout, stderr) =>
+    const child = execFile('/bin/sh', [script], { env, timeout: 5000, maxBuffer: 1 << 20, ...(cwd ? { cwd } : {}) }, (error, stdout, stderr) =>
       resolve({ stdout, stderr, code: error ? Number((error as { code?: number }).code ?? 1) : 0 })
     ) as { stdin: { end(text: string): void } }
     child.stdin.end(stdin)
@@ -364,6 +364,49 @@ test('wrapper script: the jq and the sed path write the same live file', async (
   }
 })
 
+test('wrapper script: a model name that is empty, a glob or holds a tab never shifts or changes the numbers', async () => {
+  const fx = fakeHome()
+  try {
+    const { readFileSync } = await fs()
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    // A working directory with files in it, as a pane has: `*` must not become their names.
+    const cwd = join(fx.home, 'project')
+    mkdirSync(cwd)
+    for (const name of ['a', 'b', 'c']) writeFileSync(join(cwd, name), '')
+    writeFileSync(join(fx.home, '.orca/account-rotator/status.tsv'), renderStatusFile(snapshot(Date.now()), '{model}|{5h}|{7d}', Date.now()))
+    const limits = { five_hour: { used_percentage: 85.2, resets_at: FIVE_RESET }, seven_day: { used_percentage: 19.9, resets_at: WEEK_RESET } }
+    const values = (key: string) => readFileSync(liveFile(fx.home, key), 'utf8').trim().split('\t').filter((_, i) => i !== 1)
+    const cases: [string, string, string][] = [['star', '*', '*'], ['empty', '', '-'], ['tab', 'Opus\t4.1', 'Opus\t4.1'], ['query', '?', '?']]
+    for (const [key, name, shown] of cases) {
+      const payload = JSON.stringify({ model: { display_name: name }, context_window: { used_percentage: 40.5 }, rate_limits: limits })
+      const run = await sh(script, payload, { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/${key}/home` }, cwd)
+      assert.equal(run.code, 0, run.stderr)
+      assert.deepEqual(values(key), ['1', '85.2', String(FIVE_RESET), '19.9', String(WEEK_RESET)], `model name ${JSON.stringify(name)}`)
+      assert.equal(plain(run.stdout).split('\n')[0], `${shown}|14|80`, `model name ${JSON.stringify(name)}`)
+    }
+    // Only the weekly window known and no model name: the weekly numbers stay the weekly numbers.
+    const weekOnly = JSON.stringify({ model: { display_name: '' }, rate_limits: { seven_day: limits.seven_day } })
+    await sh(script, weekOnly, { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/week/home` }, cwd)
+    assert.deepEqual(values('week'), ['1', '-', '-', '19.9', String(WEEK_RESET)])
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('wrapper script: a model name that holds a header placeholder is printed as it is, without looping', async () => {
+  const fx = fakeHome()
+  try {
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    writeFileSync(join(fx.home, '.orca/account-rotator/status.tsv'), renderStatusFile(snapshot(Date.now()), '{model} {5h} {model}', Date.now()))
+    const payload = JSON.stringify({ model: { display_name: 'a{model}b' }, rate_limits: { five_hour: { used_percentage: 85.2, resets_at: FIVE_RESET } } })
+    const run = await sh(script, payload, { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin' })
+    assert.equal(run.code, 0, 'the script ends')
+    assert.equal(plain(run.stdout).split('\n')[0], 'a{model}b 14 a{model}b')
+  } finally {
+    fx.cleanup()
+  }
+})
+
 test('wrapper script: a live dir that cannot be written still prints the line and feeds Orca\'s hook', async () => {
   const fx = fakeHome()
   try {
@@ -508,5 +551,68 @@ test('worker: install and uninstall edit the focused workspace, the status file 
     assert.equal(files.files.has('/repo/.claude/settings.local.json'), false)
   } finally {
     await worker.deactivate()
+  }
+})
+
+test('worker: the console status line is not installed for a workspace on another machine', async () => {
+  const mount = async (workspace: Record<string, unknown>, projects?: Record<string, unknown>[]) => {
+    const files = memoryFiles('/home/u')
+    const host = mockHost({
+      results: {
+        'agents.list': { agents: [] },
+        'workspace.list': { workspaces: [{ id: 'w1', kind: 'worktree', name: 'app', path: '/home/me/repo', branch: 'main', ...workspace }], truncated: false },
+        ...(projects ? { 'project.list': { projects, truncated: false } } : {}),
+        'workspace.readContext': { workspaceId: 'w1', branch: 'main', displayName: 'app', terminals: [] },
+        'statusBar.update': { ok: true }
+      }
+    })
+    const mod = {
+      default: async (orca: OrcaWorkerApi) => {
+        await activateWith(
+          orca,
+          {
+            cli: { listAccounts: async () => ({ claude: { accounts: [{ id: 'aaa', email: 'me@example.com' }], activeAccountId: 'aaa' }, rateLimits: {} }), select: async () => undefined, closeTerminal: async () => undefined, sendText: async () => undefined, git: async () => '' },
+            now: () => NOW,
+            sleep: async () => undefined
+          },
+          { tick: false, files }
+        )
+      }
+    }
+    return { files, worker: await mountWorker(mod, { host }) }
+  }
+  const settings = '/home/me/repo/.claude/settings.local.json'
+  const remote: [Record<string, unknown>, Record<string, unknown>[] | undefined][] = [
+    [{ hostId: 'ssh:build-box' }, undefined],
+    [{ hostId: 'runtime:remote-box' }, undefined],
+    // The row names no host: its project does.
+    [{ hostId: null, projectId: 'p1' }, [{ id: 'p1', name: 'app', kind: 'git', hostId: 'ssh:build-box', path: '/home/me/repo' }]]
+  ]
+  for (const [workspace, projects] of remote) {
+    const m = await mount(workspace, projects)
+    try {
+      // A local file at the same path belongs to another project: it is neither read nor changed.
+      m.files.files.set(settings, '{"permissions":{}}\n')
+      assert.match(String(await m.worker.command('rotator.installStatusLine')), /not on this computer/)
+      assert.equal(m.files.files.get(settings), '{"permissions":{}}\n')
+      m.files.files.set(settings, installIntoSettings(null).text)
+      assert.match(String(await m.worker.command('rotator.uninstallStatusLine')), /not on this computer/)
+      assert.ok(m.files.files.has(settings))
+      const state = await m.worker.request('rotator.consoleLine', {})
+      assert.equal(state.installed, false)
+      assert.match(state.reason ?? '', /not on this computer/)
+    } finally {
+      await m.worker.deactivate()
+    }
+  }
+  // A row without a host whose project is on this computer (or cannot be looked up) is local.
+  for (const projects of [[{ id: 'p1', name: 'app', kind: 'git', hostId: 'local', path: '/home/me/repo' }], undefined]) {
+    const m = await mount({ hostId: null, projectId: 'p1' }, projects)
+    try {
+      assert.match(String(await m.worker.command('rotator.installStatusLine')), /installed for app/)
+      assert.ok(m.files.files.has(settings))
+    } finally {
+      await m.worker.deactivate()
+    }
   }
 })

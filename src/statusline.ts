@@ -143,8 +143,9 @@ fi
 tab=$(printf '\t')
 model=- ctx=- five=- seven=- reset=- wreset=-
 if command -v jq >/dev/null 2>&1; then
+  # The model name goes last: it is the one field Claude does not make from numbers, and whatever
+  # it holds (nothing, a tab, a "*") must not shift or expand the fields before it.
   fields=$(printf '%s' "$payload" | jq -r '[
-      (.model.display_name // "-"),
       (.context_window.used_percentage // (
         if (.context_window.context_window_size // 0) > 0 and .context_window.current_usage then
           ((.context_window.current_usage.input_tokens // 0) + (.context_window.current_usage.cache_creation_input_tokens // 0) + (.context_window.current_usage.cache_read_input_tokens // 0)) * 100 / .context_window.context_window_size
@@ -152,13 +153,14 @@ if command -v jq >/dev/null 2>&1; then
       (.rate_limits.five_hour.used_percentage // "-"),
       (.rate_limits.seven_day.used_percentage // "-"),
       (.rate_limits.five_hour.resets_at // "-"),
-      (.rate_limits.seven_day.resets_at // "-")
+      (.rate_limits.seven_day.resets_at // "-"),
+      (.model.display_name // "-")
     ] | map(tostring) | join("\t")' 2>/dev/null)
   if [ -n "$fields" ]; then
-    oldifs=$IFS; IFS=$tab
-    set -- $fields
-    IFS=$oldifs
-    model=@{1:-"-"}; ctx=@{2:-"-"}; five=@{3:-"-"}; seven=@{4:-"-"}; reset=@{5:-"-"}; wreset=@{6:-"-"}
+    IFS="$tab" read -r ctx five seven reset wreset model <<EOF
+$fields
+EOF
+    model=@{model:-"-"}; ctx=@{ctx:-"-"}; five=@{five:-"-"}; seven=@{seven:-"-"}; reset=@{reset:-"-"}; wreset=@{wreset:-"-"}
   fi
 else
   flat=$(printf '%s' "$payload" | tr -d '\n')
@@ -327,10 +329,14 @@ fi
 
 # {placeholder} substitution in the header, every occurrence, no eval.
 line=$format
+# A value is put in as it is and never read again, so one that holds a placeholder cannot loop.
 subst() {
-  while case "$line" in *"$1"*) true ;; *) false ;; esac; do
-    line="@{line%%"$1"*}$2@{line#*"$1"}"
+  put=; rest=$line
+  while case "$rest" in *"$1"*) true ;; *) false ;; esac; do
+    put="$put@{rest%%"$1"*}$2"
+    rest=@{rest#*"$1"}
   done
+  line="$put$rest"
 }
 subst '{model}' "$model"
 subst '{ctxbar}' "$(bar "$ctx")"

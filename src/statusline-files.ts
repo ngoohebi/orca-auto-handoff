@@ -140,6 +140,14 @@ export class ConsoleStatusLine {
     const { workspaces } = await this.ctx.host.call('workspace.list')
     const ws = workspaces.find((w: { id: string }) => w.id === context.workspaceId)
     if (!ws?.path) return 'The focused workspace has no local path'
+    // A workspace on an SSH target or a paired Orca server has its path on that machine: the same
+    // path here is another folder, or none. The row names its host, or else its project does.
+    let hostId: unknown = ws.hostId
+    if ((typeof hostId !== 'string' || !hostId) && ws.projectId) {
+      const listed = await this.ctx.host.call('project.list').catch(() => null)
+      hostId = Array.isArray(listed?.projects) ? listed.projects.find((p: { id: string }) => p.id === ws.projectId)?.hostId : undefined
+    }
+    if (typeof hostId === 'string' && hostId && hostId !== 'local') return 'The focused workspace is not on this computer'
     return { file: `${ws.path}/.claude/settings.local.json`, name: ws.name }
   }
 
