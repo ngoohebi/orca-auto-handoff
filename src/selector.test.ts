@@ -144,6 +144,15 @@ test('headroom gap: a threshold move needs a clearly better seat; exhausted seat
   assert.equal(enoughGap(seat('a', 100, 85), { ...seat('b', 0, 0), usage: { known: false } }, cfg()), true)
   assert.equal(enoughGap({ ...seat('a', 0, 0), usage: { known: false } }, { ...seat('b', 0, 0), usage: { known: false } }, cfg()), false)
   assert.equal(enoughGap(seat('a', 0, 85), seat('b', 0, 80), cfg({ minHeadroomGap: 0 })), true)
+  // 5-hour use is halved: a seat at 97 % of its 5-hour window is not "clearly worse" than one at
+  // 45 % of its week. Left because it is about to run out (`low`), it counts as having no room,
+  // and the target only needs the gap as room of its own.
+  assert.equal(enoughGap(seat('a', 97, 30), seat('b', 5, 45), cfg()), false)
+  assert.equal(enoughGap(seat('a', 97, 30), seat('b', 5, 45), cfg(), true), true)
+  assert.equal(enoughGap(seat('a', 60, 30), seat('b', 5, 90), cfg(), true), true)
+  assert.equal(enoughGap(seat('a', 97, 30), seat('b', 5, 91), cfg(), true), false)
+  assert.equal(enoughGap(seat('a', 97, 30), seat('b', 95, 10), cfg(), true), false)
+  assert.equal(enoughGap(seat('a', 97, 30), { ...seat('b', 0, 0), usage: { known: false } }, cfg(), true), false)
 })
 
 test('activeTerminalsIn picks the active leaf of each workspace\u2019s active tab', () => {

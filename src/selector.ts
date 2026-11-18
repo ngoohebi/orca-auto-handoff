@@ -1,5 +1,5 @@
 // Which seat comes next: the chain, eligibility, strategies, switch-back, earliest reset.
-import { NO_CONTEXT, candidateOf, rank, type SmartContext, type Tier } from './smart'
+import { NO_CONTEXT, candidateOf, headroom, rank, type SmartContext, type Tier } from './smart'
 import { BLIND_COOLDOWN_CAP_MINUTES, STRIKE_TTL_MS, type Config, type Provider, type Seat, type SeatHealth } from './types'
 
 export type { Tier }
@@ -104,8 +104,13 @@ export function load(seat: Seat): number {
  * least `minHeadroomGap` points more room, so two seats near the line never ping-pong. An
  * exhausted seat (100 %) may always leave. A target without numbers is never "clearly better":
  * only a seat known to be at 100 % may move onto it.
+ *
+ * `low`: the seat is being left because it is about to run out (Smart, Follow my order). It then
+ * counts as having no room left, and the target needs the gap as room in its fullest window.
+ * `load` halves 5-hour use, so a seat at 97 % of its 5-hour window would otherwise fail the gap
+ * against any target with moderate weekly use, and never leave before the limit.
  */
-export function enoughGap(from: Seat | undefined, to: Seat, config: Config): boolean {
+export function enoughGap(from: Seat | undefined, to: Seat, config: Config, low = false): boolean {
   if (!from) return true
   const worst = from.usage.known ? Math.max(from.usage.session?.usedPercent ?? 0, from.usage.weekly?.usedPercent ?? 0) : 0
   if (!to.usage.known) return worst >= 100
@@ -114,6 +119,7 @@ export function enoughGap(from: Seat | undefined, to: Seat, config: Config): boo
   const live = (s: Seat) => s.usage.known && (s.usage.source === undefined || s.usage.source === 'live')
   if (!live(from) || !live(to)) return true
   if (worst >= 100) return true
+  if (low) return headroom(to) >= config.minHeadroomGap
   return load(from) - load(to) >= config.minHeadroomGap
 }
 

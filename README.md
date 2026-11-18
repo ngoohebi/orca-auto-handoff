@@ -110,8 +110,11 @@ A threshold below 100 % is kept as a hard cap in Smart and Follow my order, and 
 **Model limits.** When a session hits the limit of one model (for example the weekly Fable
 limit), Smart first looks for another account that is known to have room for that model. If there
 is none, it switches to the next model from *Model fallback* on the same account. If there is
-none of those either, the session waits until an account shows room for that model or the limit
-resets; it is not moved to an account whose room for that model is unknown.
+none of those either, it moves to the next account that is not known to be full for that model
+(Orca seldom reports that number for an account not in use, and the limit's own reset can be days
+away). An account that then shows the same limit is set aside in turn, so each is tried at most
+once. Only when every other account is known to be full for that model, or is cooling down, does
+the session wait, until one of them is free or the limit resets.
 
 ## What it does
 
@@ -121,7 +124,7 @@ The table below lists every trigger. Rows that mention thresholds, strategies or
 |---|---|
 | Rate-limit banner in the pane's latest output | Cooldown that seat until the parsed reset time (else Orca's `resetsAt`, else *Default cooldown*), switch, resume. The next account is one with known room if there is one, else one presumed reset, else one without numbers |
 | Banner with no reset time on an account without usage numbers | A *strike*: the cooldown is *Default cooldown* × 2 per strike (60, 120, 240 min …), at most 5 h. Strikes count for 24 h |
-| Model-specific cap (e.g. Claude Fable weekly) | Smart and Follow my order: an account known to have room for that model, then `/model <next>` from *Model fallback* in place, then wait. Custom: `/model <next>` first; switch accounts only when the list runs out |
+| Model-specific cap (e.g. Claude Fable weekly) | Smart and Follow my order: an account known to have room for that model, then `/model <next>` from *Model fallback* in place, then an account not known to be full for that model, then wait. Custom: `/model <next>` first; switch accounts only when the list runs out |
 | API error (529, overloaded, stream disconnected) | Type the first message again after a Fibonacci backoff (5 s … 120 s), up to *Maximum API error retries* |
 | Auth failure | 12 h cooldown on that seat, switch |
 | A turn ends while the seat is over a threshold | Switch to an account with known room (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets. An account without numbers is taken only when the current one is known to be at 100 % and no known account is left |
@@ -179,7 +182,9 @@ without numbers, as long as it has no strikes.
 - a pane whose input box holds unsent text is never closed (the move waits for the next turn end);
 - the target needs at least *Minimum headroom gap* (10 %) more room than the current account when
   both are known, and an exhausted account may always leave; a target without numbers never counts
-  as having more room;
+  as having more room. When Smart or Follow my order leaves an account because it is about to run
+  out, that account counts as having no room left: the target then needs at least that much room
+  (10 %) in its fullest window;
 - one provider's selection changes automatically at most once per *Minimum minutes between
   automatic selection changes* (5), so two accounts near the line never ping-pong. Moving a pane
   onto the account that is already selected is not a selection change.

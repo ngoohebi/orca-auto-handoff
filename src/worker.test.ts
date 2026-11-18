@@ -1663,8 +1663,24 @@ test('model cap, Smart: an account known to have room for that model comes befor
   await fw.deactivate()
 })
 
-test('model cap, Smart: with no known room and no fallback model the session waits for that bucket', async () => {
-  const inactiveClaude: Record<string, { session: number; weekly: number; fable?: number }> = { c2: { session: 5, weekly: 5 } }
+test('model cap, Smart: with no known room and no fallback model the next account not known to be full is tried', async () => {
+  // c2 is known and has room in general; nothing says its Fable bucket is full. Waiting for c1's
+  // bucket could take days, so the session moves there.
+  const unknown = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_MODEL_CAP },
+    inactiveClaude: { c2: { session: 5, weekly: 5 } }
+  })
+  const uw = await unknown.mount()
+  await uw.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(unknown), ['select claude c2'])
+  assert.equal(stored(unknown).waiting.length, 0)
+  assert.equal(stored(unknown).history.at(-1)?.reason, 'model_cap')
+  assert.equal(stored(unknown).history.at(-1)?.result, 'resumed')
+  await uw.deactivate()
+
+  // An account whose bucket for that model is known to be full is never tried: the session waits.
+  const inactiveClaude: Record<string, { session: number; weekly: number; fable?: number }> = { c2: { session: 5, weekly: 5, fable: 95 }, c3: { session: 5, weekly: 5, fable: 96 } }
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_MODEL_CAP },
@@ -1672,14 +1688,13 @@ test('model cap, Smart: with no known room and no fallback model the session wai
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
-  // c2 is known and has room in general, but nothing says its Fable bucket has: no move.
   assert.deepEqual(selects(w), [])
   assert.equal(w.host.callsOf('terminal.close').length, 0)
   let state = stored(w)
   assert.equal(state.waiting.length, 1)
   assert.equal(state.waiting[0]?.model, 'fable')
   assert.equal(state.history.at(-1)?.result, 'waiting')
-  assert.equal(state.history.at(-1)?.why, 'no other Claude account is known to have room for fable; waiting for its limit to reset')
+  assert.equal(state.history.at(-1)?.why, 'no other Claude account has room for fable; waiting for its limit to reset')
   // Other accounts having room in general does not end the wait.
   w.advance(2 * MIN)
   await w.rotator.tick()
@@ -1696,10 +1711,28 @@ test('model cap, Smart: with no known room and no fallback model the session wai
   assert.equal(state.history.at(-1)?.result, 'resumed')
   await worker.deactivate()
 
+  // Parked only because the other accounts were cooling down: once one is free again the session
+  // goes there, and does not sit out the capped bucket's reset.
+  const cooling = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_MODEL_CAP },
+    state: { health: { 'claude:c2': { cooldownUntil: 1_000_000 + 10 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 30 * MIN } } }
+  })
+  const cw = await cooling.mount()
+  await cw.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(cooling), [])
+  assert.equal(stored(cooling).waiting[0]?.model, 'fable')
+  cooling.advance(11 * MIN)
+  await cooling.rotator.tick()
+  assert.deepEqual(selects(cooling), ['select claude c2'])
+  assert.equal(stored(cooling).waiting.length, 0)
+  await cw.deactivate()
+
   // "When everything is used up: Stop" also stops this wait.
   const stop = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_MODEL_CAP },
+    inactiveClaude: { c2: { session: 5, weekly: 5, fable: 95 }, c3: { session: 5, weekly: 5, fable: 96 } },
     settings: { when_all_used: 'stop' }
   })
   const sw = await stop.mount()
@@ -2140,5 +2173,76 @@ test('my order: leaves a Low account early, and switch-back does not return to i
   await w.rotator.tick()
   assert.deepEqual(selects(w), ['select claude c2', 'select claude c1'])
   assert.equal(stored(w).history.at(-1)?.reason, 'switch_back')
+  await worker.deactivate()
+})
+
+test('smart: a Low account is left for a target with moderate weekly use (the headroom gap is not halved)', async () => {
+  // c1 is at 97 % of its 5-hour window; c2 has used 45 % of its week. The legacy comparison
+  // halves 5-hour use (48.5 against 45) and would keep the session on c1 until it hits the limit.
+  const w = calm({ session: 97, weekly: 30 }, { inactiveClaude: { c2: { session: 5, weekly: 45 } } })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(stored(w).history.at(-1)?.result, 'resumed')
+  await worker.deactivate()
+
+  // A target with under 10 points of room left is not worth an early move.
+  const tight = calm({ session: 97, weekly: 30 }, { inactiveClaude: { c2: { session: 5, weekly: 93 } }, settings: { exclude: 'claude:c3' } })
+  const tw = await tight.mount()
+  await tw.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(tight), [])
+  await tw.deactivate()
+
+  // The same comparison decides a selection-only change (a session is mid-turn on c1).
+  const busy = calm({ session: 97, weekly: 30 }, {
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'working', sessionId: 's1' }],
+    inactiveClaude: { c2: { session: 5, weekly: 45 } }
+  })
+  const bw = await busy.mount()
+  await busy.rotator.tick()
+  assert.deepEqual(selects(busy), ['select claude c2'])
+  assert.equal(busy.host.callsOf('terminal.close').length, 0)
+  await bw.deactivate()
+
+  // Custom keeps the legacy comparison.
+  const custom = calm({ session: 97, weekly: 30 }, { inactiveClaude: { c2: { session: 5, weekly: 45 } }, settings: { mode: 'custom', thresholds_five_hour: 95 } })
+  const cw = await custom.mount()
+  await cw.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(custom), [])
+  await cw.deactivate()
+})
+
+test('smart: a session is not moved when the fresh reading shows its account is no longer Low', async () => {
+  // The cached reading says 97 % of the 5-hour window; the window has reset since.
+  const usage = { session: 97, weekly: 50, sessionReset: 1_000_000 + 3_600_000 }
+  const w = calm(usage)
+  const worker = await w.mount()
+  usage.session = 2
+  usage.sessionReset = 1_000_000 + 5 * 3_600_000
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), [])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(stored(w).history.length, 0)
+  await worker.deactivate()
+})
+
+test('smart: a short wait never types into a pane that holds unsent text', async () => {
+  const usage = { session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }
+  const w = calm(usage, { tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] } })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting[0]?.hold, 'short')
+  // While waiting, the user starts typing in the parked pane and has not sent it.
+  w.tails.t1 = [...fx.CLAUDE_LIMIT_NO_RESET, '╭──────────────╮', '│ > also update the docs', '╰──────────────╯']
+  w.advance(4 * MIN + 1000)
+  usage.session = 0
+  usage.sessionReset = 1_000_000 + 5 * 3_600_000
+  await w.rotator.tick()
+  // The account is back, but the draft is the user's: nothing is typed, closed or resumed.
+  assert.deepEqual(w.typed, [])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(stored(w).waiting.length, 0)
+  assert.match(lastNote(w), /has reset.*unsent text/)
   await worker.deactivate()
 })

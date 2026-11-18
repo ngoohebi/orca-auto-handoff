@@ -453,13 +453,17 @@ export class Rotator {
     return changed
   }
 
-  /** The accounts known to have room in a model's own bucket (a model cap moves only there). */
-  private modelRoom(chain: readonly Seat[], model: string | undefined, now: number): Set<string> {
+  /** The accounts known to have room in a model's own bucket (where a model cap moves first).
+   *  `unknownToo`: also the accounts whose bucket for that model is not known, i.e. every account
+   *  not known to be full in it. */
+  private modelRoom(chain: readonly Seat[], model: string | undefined, now: number, unknownToo = false): Set<string> {
     const keys = new Set<string>()
     for (const seat of chain) {
       const bucket = seat.usage.known ? seat.usage.model : undefined
-      if (!bucket) continue
-      if (model && !bucket.name.toLowerCase().includes(model.toLowerCase())) continue
+      if (!bucket || (model && !bucket.name.toLowerCase().includes(model.toLowerCase()))) {
+        if (unknownToo) keys.add(seat.key)
+        continue
+      }
       const over = !bucket.reset && !(bucket.resetsAt !== null && bucket.resetsAt <= now) && bucket.usedPercent > 100 - MODEL_ROOM_LEFT
       if (!over) keys.add(seat.key)
     }
@@ -966,7 +970,8 @@ export class Rotator {
         return this.retryApiError(pane, config)
       case 'model_cap':
         // Smart order: an account known to have room in that model's bucket, then the fallback
-        // model on this account, then wait (`swap` parks when no account has known room).
+        // model on this account, then an account not known to be full in that bucket, then wait
+        // (`swap` parks when every other account is full in it or unavailable).
         if (this.looksAhead(config) && (await this.modelRoomElsewhere(pane, signal, config))) {
           return this.limitHit(pane, signal, config, lines, 'model_cap')
         }
@@ -1152,17 +1157,24 @@ export class Rotator {
       const healthyActive =
         preferActive && active && isEligible(active, this.state.health[active.key], config, now) ? active : null
       const context = ahead && config.strategy === 'smart' ? await this.smartContext(pane.agent, view, pane.server, now) : undefined
-      // A model cap (Smart): only an account known to have room in that model's bucket.
+      // The fresh reading may show the account is fine after all (its window reset since the
+      // cached one): then there is nothing to leave.
+      if (leave && !leave.leave) return
+      // A model cap (Smart): an account known to have room in that model's bucket.
       const only = ahead && reason === 'model_cap' ? this.modelRoom(chain, signal?.model, now) : undefined
-      const picked =
-        healthyActive ??
+      const pick = (restrict: ReadonlySet<string> | undefined) =>
         pickNext(chain, from?.key, this.state.health, config, now, {
           mode: reason === 'manual' ? 'manual' : advisory ? 'advisory' : 'hard',
           sourceExhausted: !!from && exhausted(from, now),
           ...(context ? { smart: context } : {}),
           ...(ahead && advisory ? { avoid: this.avoided(pane.agent, view, pane.server, config, now) } : {}),
-          ...(only ? { only } : {})
+          ...(restrict ? { only: restrict } : {})
         })
+      // Failing that (this point is reached only after the fallback models), an account not known
+      // to be full in that bucket: Orca seldom has the bucket of an account not in use, and the
+      // bucket's own reset can be days away. An account that then shows the same cap is cooled
+      // like this one, so the session never goes round.
+      const picked = healthyActive ?? pick(only) ?? (only ? pick(this.modelRoom(chain, signal?.model, now, true)) : null)
       // Only ever another account of the same service.
       const target = picked && picked.provider === pane.agent ? picked : null
       if (!target) {
@@ -1173,8 +1185,8 @@ export class Rotator {
           await this.park(pane, from, chain, config, reason, {
             model,
             ...(signal?.resetsAt ? { wakeAt: signal.resetsAt } : {}),
-            why: `no other ${PROVIDER_NAME[pane.agent]} account is known to have room for ${model}; waiting for its limit to reset`,
-            notify: `${PROVIDER_NAME[pane.agent]}: the ${model} limit was hit and no other account is known to have room for it.`
+            why: `no other ${PROVIDER_NAME[pane.agent]} account has room for ${model}; waiting for its limit to reset`,
+            notify: `${PROVIDER_NAME[pane.agent]}: the ${model} limit was hit and no other account has room for it.`
           })
           return
         }
@@ -1205,7 +1217,7 @@ export class Rotator {
           return
         }
       }
-      if (advisory && !(await this.advisoryOk(pane, from, target, lines, view, config, now))) return
+      if (advisory && !(await this.advisoryOk(pane, from, target, lines, view, config, now, low ? 'low' : 'gap'))) return
       const why = low && from ? this.explained('low', from, target, view, { idle: reason === 'idle', assessment: leave!.assessment }) : undefined
       if (low && from) this.markLeftLow(from, now)
       await this.moveTo(pane, from, target, reason, lines, signal, view, config, why)
@@ -1285,17 +1297,18 @@ export class Rotator {
     view: AccountView,
     config: Config,
     now: number,
-    /** `gap`: the target must have clearly more room. `switch-back`: a target without numbers is
-     *  judged by `preferredOver` instead. `expiring`: the target is known and already ranked
+    /** `gap`: the target must have clearly more room. `low`: the account being left is about to
+     *  run out, so the target needs that much room itself. `switch-back`: a target without numbers
+     *  is judged by `preferredOver` instead. `expiring`: the target is known and already ranked
      *  (smart.ts); headroom is not the point of that move. */
-    rule: 'gap' | 'switch-back' | 'expiring' = 'gap'
+    rule: 'gap' | 'low' | 'switch-back' | 'expiring' = 'gap'
   ): Promise<boolean> {
     if (hasDraft(lines)) {
       this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not moving it`)
       return false
     }
     const gapWaived = rule === 'expiring' || (rule === 'switch-back' && !target.usage.known)
-    if (!gapWaived && !enoughGap(from, target, config)) return false
+    if (!gapWaived && !enoughGap(from, target, config, rule === 'low')) return false
     // Moving onto the seat Orca already selected changes nothing for other panes; a selection
     // change is what must not flap.
     if (view.active[target.provider] !== target.key && !this.canChangeSelection(target.provider, config, now)) return false
@@ -1620,11 +1633,11 @@ export class Rotator {
         const wView = wServer === this.server ? view : await this.accountsFor(wServer)
         const chain = buildChain(wView.seats, w.agent, config)
         // A short wait ends at its time only; a wait for a model's bucket also ends once an
-        // account is known to have room in that bucket.
+        // account is free that is not known to be full in that bucket.
         const sooner = w.hold
           ? null
           : w.model
-            ? pickNext(chain, w.fromSeat, this.state.health, config, now, { only: this.modelRoom(chain, w.model, now) })
+            ? pickNext(chain, w.fromSeat, this.state.health, config, now, { only: this.modelRoom(chain, w.model, now, true) })
             : pickNext(chain, undefined, this.state.health, config, now)
         const ready = w.wakeAt <= now || sooner
         if (ready) await this.wake(w)
@@ -1722,7 +1735,7 @@ export class Rotator {
         ...(context ? { smart: context } : {})
       })
       if (!target || (!target.usage.known && strikesOf(this.state.health[target.key], now) > 0)) return null
-      if (!out && !enoughGap(selected, target, config)) return null
+      if (!out && !enoughGap(selected, target, config, true)) return null
       return {
         target,
         reason: 'threshold',
@@ -1839,6 +1852,14 @@ export class Rotator {
         // The short wait is over and the account is back: the session continues where it is.
         this.state.waiting = this.state.waiting.filter((x) => x.terminalId !== w.terminalId)
         const label = displayLabels(view.seats, w.agent).get(source.key) ?? source.label
+        const held = await this.deps.host.call('terminal.read', { terminalId: w.terminalId, maxLines: 80 }).catch(() => ({ lines: [] as string[] }))
+        if (hasDraft(held.lines)) {
+          // Typing the first message would send the user's unsent text with it: leave the pane alone.
+          await this.save()
+          await this.deps.notify('Auto Hand-off', `${PROVIDER_NAME[w.agent]}: ${label} has reset. The session has unsent text in its input box, so it is left for you to continue.`)
+          this.publishNow()
+          return
+        }
         this.record({ provider: w.agent, terminalId: w.terminalId, reason: 'reset', result: 'retried', from: source.key, to: source.key, why: `${label} has reset; the session continues there` })
         await this.save()
         if (config.autoMessage) await this.type(w.terminalId, config.autoMessage, server)
@@ -1846,8 +1867,9 @@ export class Rotator {
         this.publishNow()
         return
       }
-      // Before its time, a wait for a model's bucket ends only on an account with room in it.
-      const early = w.model && w.wakeAt > now ? { only: this.modelRoom(chain, w.model, now) } : {}
+      // Before its time, a wait for a model's bucket ends only on an account not known to be full
+      // in it.
+      const early = w.model && w.wakeAt > now ? { only: this.modelRoom(chain, w.model, now, true) } : {}
       const context = this.looksAhead(config) && config.strategy === 'smart' ? { smart: await this.smartContext(w.agent, view, server, now) } : {}
       const target = pickNext(chain, w.model && w.wakeAt > now ? w.fromSeat : undefined, this.state.health, config, now, { ...early, ...context })
       if (!target) {
