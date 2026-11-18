@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Account Rotator for Orca</title>
+<meta name="description" content="An Orca plugin that pools your managed agent accounts per service. On a rate limit or usage threshold it switches the pane to the next Claude, Codex, Antigravity, OpenCode or Devin account and resumes the session.">
+<meta property="og:title" content="Account Rotator for Orca">
+<meta property="og:description" content="Rate limit hit? The session moves to your next account of the same service and carries on. Claude, Codex, Antigravity, OpenCode and Devin.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://ngoohebi.github.io/orca-account-rotator/">
+<meta name="theme-color" content="#0f1115">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%2322c1b4'/%3E%3Cpath d='M9 19a7 7 0 1 1 14 0' stroke='%230f1115' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3Cpath d='M16 19l5-6' stroke='%230f1115' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0f1115;--bg-2:#161a21;--bg-3:#1d222b;--line:#262c37;--line-2:#323a48;
+  --fg:#e8ebf0;--fg-2:#a9b1be;--fg-3:#737c8b;
+  --accent:#22c1b4;--accent-fg:#0b1512;--accent-soft:rgba(34,193,180,.14);
+  --warn:#e2b53c;--danger:#e5564f;--ok:#4fd18b;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  --radius:12px;--shadow:0 20px 60px rgba(0,0,0,.45);
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#f7f8fa;--bg-2:#ffffff;--bg-3:#eef1f5;--line:#e1e5ec;--line-2:#cbd2dd;
+  --fg:#15191f;--fg-2:#4a5260;--fg-3:#7b8494;
+  --accent:#0f9d93;--accent-fg:#ffffff;--accent-soft:rgba(15,157,147,.12);
+  --warn:#b7841a;--danger:#c93c36;--ok:#1f9b5c;
+  --shadow:0 20px 60px rgba(20,30,50,.14);
+  color-scheme:light;
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){
+    --bg:#f7f8fa;--bg-2:#ffffff;--bg-3:#eef1f5;--line:#e1e5ec;--line-2:#cbd2dd;
+    --fg:#15191f;--fg-2:#4a5260;--fg-3:#7b8494;
+    --accent:#0f9d93;--accent-fg:#ffffff;--accent-soft:rgba(15,157,147,.12);
+    --warn:#b7841a;--danger:#c93c36;--ok:#1f9b5c;
+    --shadow:0 20px 60px rgba(20,30,50,.14);
+    color-scheme:light;
+  }
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code,pre,kbd{font-family:var(--mono);font-size:.9em}
+code{background:var(--bg-3);border:1px solid var(--line);border-radius:5px;padding:.08em .4em;color:var(--fg);overflow-wrap:anywhere}
+pre{background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;overflow-x:auto;line-height:1.55;margin:0}
+pre code{background:none;border:0;padding:0;font-size:.88rem}
+h1,h2,h3{line-height:1.2;letter-spacing:-.01em;margin:0}
+h2{font-size:clamp(1.5rem,2.6vw,2rem);font-weight:700}
+h3{font-size:1.05rem;font-weight:600}
+p{margin:0 0 1em}
+.wrap{max-width:1120px;margin:0 auto;padding:0 20px}
+.eyebrow{color:var(--accent);font-weight:600;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase;margin-bottom:10px}
+.lede{color:var(--fg-2);font-size:1.08rem;max-width:62ch}
+section{padding:72px 0;border-top:1px solid var(--line)}
+section:first-of-type{border-top:0}
+.sec-head{margin-bottom:36px;max-width:70ch}
+
+/* nav */
+nav{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+nav .wrap{display:flex;align-items:center;gap:20px;height:58px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;color:var(--fg)}
+.brand:hover{text-decoration:none}
+.brand svg{width:24px;height:24px}
+.brand small{font-weight:500;color:var(--fg-3);font-size:.78rem;border:1px solid var(--line-2);padding:1px 7px;border-radius:999px}
+nav ul{list-style:none;display:flex;gap:18px;margin:0 0 0 auto;padding:0}
+nav ul a{color:var(--fg-2);font-size:.92rem}
+nav ul a:hover{color:var(--fg);text-decoration:none}
+.iconbtn{background:none;border:1px solid var(--line-2);color:var(--fg-2);border-radius:8px;width:34px;height:34px;display:inline-grid;place-items:center;cursor:pointer;flex:none}
+.iconbtn:hover{color:var(--fg);border-color:var(--fg-3)}
+.gh{display:inline-flex;align-items:center;gap:8px;background:var(--fg);color:var(--bg);padding:7px 12px;border-radius:8px;font-weight:600;font-size:.9rem;flex:none}
+.gh:hover{text-decoration:none;opacity:.9}
+@media (max-width:760px){nav ul{display:none}.iconbtn{margin-left:auto}.brand{white-space:nowrap}.brand small{display:none}}
+
+/* hero */
+.hero{padding:72px 0 64px}
+.hero .wrap{display:grid;grid-template-columns:1.1fr .9fr;gap:48px;align-items:center}
+.hero .wrap>*{min-width:0}
+.hero h1{font-size:clamp(2.1rem,4.6vw,3.4rem);font-weight:700;letter-spacing:-.025em;margin-bottom:18px}
+.hero h1 span{color:var(--accent)}
+.badges{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 26px}
+.badge{font-size:.78rem;font-weight:500;color:var(--fg-2);background:var(--bg-2);border:1px solid var(--line);border-radius:999px;padding:3px 10px}
+.badge b{color:var(--fg);font-weight:600}
+.cta{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:9px;font-weight:600;border:1px solid var(--line-2);color:var(--fg);background:var(--bg-2)}
+.btn:hover{text-decoration:none;border-color:var(--fg-3)}
+.btn.primary{background:var(--accent);color:var(--accent-fg);border-color:transparent}
+.btn.primary:hover{filter:brightness(1.07)}
+.cmd{display:flex;align-items:center;gap:10px;min-width:0;background:var(--bg-2);border:1px solid var(--line);border-radius:9px;padding:9px 12px 9px 14px;font-family:var(--mono);font-size:.86rem;color:var(--fg);margin-top:18px;max-width:100%}
+.cmd .dollar{color:var(--fg-3)}
+.cmd span.c{overflow-x:auto;white-space:nowrap;min-width:0;flex:1}
+.copy{margin-left:auto;background:var(--bg-3);border:1px solid var(--line-2);color:var(--fg-2);border-radius:6px;padding:4px 9px;font:inherit;font-size:.75rem;cursor:pointer;flex:none}
+.copy:hover{color:var(--fg)}
+@media (max-width:900px){.hero .wrap{grid-template-columns:1fr}.hero{padding:48px 0 40px}}
+
+/* panel mock */
+.panel{background:var(--bg-2);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:16px;font-size:.84rem;max-width:400px;margin:0 auto;width:100%}
+.panel .ph{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:1rem;margin-bottom:10px}
+.panel .ph span{font-weight:500;font-size:.8rem;color:var(--fg-2)}
+.row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.toggle{width:34px;height:18px;border-radius:999px;background:var(--fg);position:relative;flex:none}
+.toggle::after{content:"";position:absolute;top:3px;right:3px;width:12px;height:12px;border-radius:50%;background:var(--bg-2)}
+.tabs{display:flex;gap:16px;border-bottom:1px solid var(--line);margin:12px 0 14px;color:var(--fg-3)}
+.tabs b{color:var(--fg);font-weight:600;border-bottom:2px solid var(--fg);padding-bottom:6px}
+.tabs span{padding-bottom:6px}
+.card{background:var(--bg-3);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
+.card:last-child{margin-bottom:0}
+.card h4{margin:0 0 2px;font-size:.92rem;font-weight:600}
+.card .sub{color:var(--fg-3);margin-bottom:10px}
+.acct{margin-top:12px}
+.acct .row{margin-bottom:6px}
+.pill{font-size:.72rem;border:1px solid var(--line-2);border-radius:999px;padding:1px 8px;color:var(--fg-2);display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.pill.on::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok)}
+.pill.cool{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 50%,var(--line-2))}
+.meter{color:var(--fg-3);font-size:.76rem;margin-top:5px}
+.bar{height:6px;background:var(--line);border-radius:999px;overflow:hidden;margin-top:3px}
+.bar i{display:block;height:100%;background:var(--fg-2);border-radius:999px}
+.bar i.w{background:var(--warn)}.bar i.d{background:var(--danger)}
+.ghost{display:inline-block;border:1px solid var(--line-2);border-radius:7px;padding:4px 10px;margin-top:8px;color:var(--fg-2);background:var(--bg-2)}
+.muted{color:var(--fg-3)}
+
+/* steps */
+.steps{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;counter-reset:s}
+.step{background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius);padding:16px 14px;position:relative}
+.step::before{counter-increment:s;content:counter(s);display:inline-grid;place-items:center;width:26px;height:26px;border-radius:50%;background:var(--accent-soft);color:var(--accent);font-weight:700;font-size:.8rem;margin-bottom:10px}
+.step h3{font-size:.95rem;margin-bottom:4px}
+.step p{color:var(--fg-2);font-size:.86rem;margin:0}
+@media (max-width:1000px){.steps{grid-template-columns:repeat(3,1fr)}}
+@media (max-width:600px){.steps{grid-template-columns:1fr 1fr}}
+
+/* trace */
+.trace{margin-top:28px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.term{background:#0b0d11;color:#d7dce4;border:1px solid #232a35;border-radius:var(--radius);padding:14px 16px;font-family:var(--mono);font-size:.82rem;line-height:1.6;overflow-x:auto}
+:root[data-theme="light"] .term{background:#1b1f26;border-color:#2a3140}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]) .term{background:#1b1f26;border-color:#2a3140}}
+.term .t{color:#8a93a3;font-size:.74rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
+.term .k{color:#22c1b4}.term .y{color:#e2b53c}.term .r{color:#e5564f}.term .dim{color:#7c8595}.term .g{color:#4fd18b}
+@media (max-width:760px){.trace{grid-template-columns:1fr}}
+
+/* grid cards */
+.grid{display:grid;gap:14px}
+.grid>*{min-width:0}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g2{grid-template-columns:repeat(2,1fr)}
+.g5{grid-template-columns:repeat(5,1fr)}
+@media (max-width:900px){.g3,.g5{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:560px){.g3,.g2,.g5{grid-template-columns:1fr}}
+.tile{min-width:0;background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius);padding:20px}
+.tile h3{margin-bottom:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tile p{color:var(--fg-2);font-size:.92rem;margin:0}
+.tile .tag{font-family:var(--mono);font-size:.74rem;color:var(--accent);background:var(--accent-soft);border-radius:5px;padding:2px 7px}
+.tile.default{border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
+
+/* table */
+.tbl{width:100%;border-collapse:collapse;font-size:.9rem;background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.tbl th,.tbl td{text-align:left;vertical-align:top;padding:11px 14px;border-top:1px solid var(--line)}
+.tbl th{background:var(--bg-3);color:var(--fg-2);font-weight:600;font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;border-top:0}
+.tbl td:first-child{white-space:nowrap}
+.tbl .st{color:var(--fg-3);font-size:.8rem;white-space:normal;margin-top:2px}
+.tbl td{color:var(--fg-2)}
+.tbl td code{white-space:nowrap}
+.tscroll{overflow-x:auto;border-radius:var(--radius)}
+details{margin-top:18px}
+summary{cursor:pointer;color:var(--accent);font-weight:600}
+
+/* checklist */
+.check{list-style:none;padding:0;margin:0;display:grid;gap:10px}
+.check li{position:relative;padding-left:30px;color:var(--fg-2);min-width:0}
+.check li::before{content:"";position:absolute;left:0;top:4px;width:18px;height:18px;border-radius:50%;background:var(--accent-soft);background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 8.5l2.5 2.5L12 5.5' fill='none' stroke='%2322c1b4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");background-size:12px;background-position:center;background-repeat:no-repeat}
+.check li b{color:var(--fg)}
+
+/* status bar mock */
+.sb{display:inline-flex;align-items:center;gap:8px;background:var(--bg-2);border:1px solid var(--line);border-radius:8px;padding:6px 12px;font-family:var(--mono);font-size:.82rem;margin-top:10px;max-width:100%;overflow-x:auto}
+.sb .gauge{width:14px;height:14px;color:var(--fg-2);flex:none}
+.sb .w{color:var(--warn)}
+
+/* install */
+.install ol{padding-left:0;list-style:none;counter-reset:i;display:grid;gap:18px;margin:0}
+.install ol>li{display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;align-items:start;min-width:0}
+.install li>div{min-width:0}
+.install li::before{counter-increment:i;content:counter(i);display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:var(--accent);color:var(--accent-fg);font-weight:700;font-size:.85rem;margin-top:2px}
+.install li p{margin:0 0 8px}
+.note{background:var(--accent-soft);border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);border-radius:10px;padding:12px 16px;color:var(--fg-2);font-size:.92rem;margin-top:22px}
+.note b{color:var(--fg)}
+
+footer{border-top:1px solid var(--line);padding:36px 0 48px;color:var(--fg-3);font-size:.88rem}
+footer .wrap{display:flex;flex-wrap:wrap;gap:12px 28px;align-items:center}
+footer a{color:var(--fg-2)}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="var(--accent)"/><path d="M9 19a7 7 0 1 1 14 0" stroke="var(--accent-fg)" stroke-width="3" fill="none" stroke-linecap="round"/><path d="M16 19l5-6" stroke="var(--accent-fg)" stroke-width="3" stroke-linecap="round"/></svg>
+      Account Rotator <small>Orca plugin</small>
+    </a>
+    <ul>
+      <li><a href="#how">How it works</a></li>
+      <li><a href="#triggers">Triggers</a></li>
+      <li><a href="#strategies">Strategies</a></li>
+      <li><a href="#ui">In the app</a></li>
+      <li><a href="#settings">Settings</a></li>
+      <li><a href="#install">Install</a></li>
+    </ul>
+    <button class="iconbtn" id="theme" title="Toggle light and dark" aria-label="Toggle light and dark">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9c0-.5 0-1-.1-1.4A7 7 0 0 1 12 3z"/></svg>
+    </button>
+    <a class="gh" href="https://github.com/ngoohebi/orca-account-rotator">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+</nav>
+
+<main id="top">
+
+<section class="hero">
+  <div class="wrap">
+    <div>
+      <div class="eyebrow">For Orca · Claude, Codex, Antigravity, OpenCode, Devin</div>
+      <h1>Hit a rate limit? <span>The session moves on.</span></h1>
+      <p class="lede">Account Rotator runs the accounts Orca manages as one pool per service. When an agent pane prints a limit, the plugin cools that account down, selects the next healthy one, and resumes the same session there, with the first message already typed.</p>
+      <div class="badges">
+        <span class="badge">v<b>0.2.0</b></span>
+        <span class="badge">Orca <b>≥ 1.4.261</b></span>
+        <span class="badge"><b>MIT</b> license</span>
+        <span class="badge"><b>60</b> tests, real captured banners</span>
+        <span class="badge">Never switches <b>across services</b></span>
+      </div>
+      <div class="cta">
+        <a class="btn primary" href="#install">Install</a>
+        <a class="btn" href="#how">See what it does</a>
+      </div>
+      <div class="cmd"><span class="dollar">$</span><span class="c">orca plugin install ngoohebi/orca-account-rotator</span><button class="copy" data-copy="orca plugin install ngoohebi/orca-account-rotator">Copy</button></div>
+    </div>
+
+    <div class="panel" aria-label="The Account Rotator panel">
+      <div class="ph">Account Rotator <span>⟳ Refresh</span></div>
+      <div class="row"><span>Automatic switching</span><span class="toggle"></span></div>
+      <div class="tabs"><b>Accounts</b><span>History (13)</span></div>
+      <div class="card">
+        <h4>claude</h4>
+        <div class="sub">3 account(s)</div>
+        <div class="row"><span>Auto-switch claude accounts</span><span class="toggle"></span></div>
+        <div class="acct">
+          <div class="row"><span>you@example.com</span><span class="pill on">active</span></div>
+          <div class="meter">5h 25%</div><div class="bar"><i style="width:25%"></i></div>
+          <div class="meter">Week 5%</div><div class="bar"><i style="width:5%"></i></div>
+          <div class="meter">fable week 7%</div><div class="bar"><i style="width:7%"></i></div>
+        </div>
+        <div class="acct">
+          <div class="row"><span>work@example.com</span><span class="pill cool">⏸ 1h20m</span></div>
+          <div class="meter">5h 100%</div><div class="bar"><i class="d" style="width:100%"></i></div>
+          <div class="meter">Week 62%</div><div class="bar"><i style="width:62%"></i></div>
+          <span class="ghost">Clear</span>
+        </div>
+        <div class="acct">
+          <div class="row"><span>third@example.com</span></div>
+          <div class="muted">Usage unknown until this account runs.</div>
+          <span class="ghost">Use for new claude launches</span>
+        </div>
+      </div>
+      <div class="card">
+        <h4>codex</h4>
+        <div class="sub">2 account(s)</div>
+        <div class="row"><span>Auto-switch codex accounts</span><span class="toggle"></span></div>
+        <div class="acct">
+          <div class="row"><span>you@example.com</span><span class="pill on">active</span></div>
+          <div class="meter">5h 84%</div><div class="bar"><i class="w" style="width:84%"></i></div>
+          <div class="meter">Week 31%</div><div class="bar"><i style="width:31%"></i></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">How it works</div>
+      <h2>Six steps, one swap, no cascade</h2>
+      <p class="lede">Detection runs when a pane turns <code>done</code> or <code>waiting</code>. A limit banner among the last five meaningful lines, shaped like a CLI status line and not an agent reply, starts the sequence.</p>
+    </div>
+    <div class="steps">
+      <div class="step"><h3>Cool down</h3><p>The limited account is parked until the reset time parsed from the banner, else Orca's <code>resetsAt</code>, else the default cooldown.</p></div>
+      <div class="step"><h3>Pick the next</h3><p>The strategy chooses another healthy account of the same service from your chain.</p></div>
+      <div class="step"><h3>Select</h3><p>Runs <code>orca account select</code>, so new launches use the new account too.</p></div>
+      <div class="step"><h3>Close</h3><p>Closes the limited pane, through the host API or the Orca CLI when the pane is in another workspace.</p></div>
+      <div class="step"><h3>Resume</h3><p>Calls <code>agent.resume</code> on the same session id. Services that cannot resume get a handoff prompt instead.</p></div>
+      <div class="step"><h3>First message</h3><p>Types the configured message, "Go continue." by default, and the agent carries on.</p></div>
+    </div>
+
+    <div class="trace">
+      <div class="term">
+        <div class="t">Claude pane, before</div>
+        <div class="dim">⏺ Running the migration now…</div>
+        <div><span class="r">⎿</span>  5-hour limit reached ∙ resets 3pm</div>
+        <div class="dim">❯</div>
+      </div>
+      <div class="term">
+        <div class="t">Account Rotator, moments later</div>
+        <div><span class="k">cooldown</span>  you@example.com <span class="dim">until 15:00</span></div>
+        <div><span class="k">select  </span>  orca account select work@example.com</div>
+        <div><span class="k">close   </span>  pane 3</div>
+        <div><span class="k">resume  </span>  agent.resume 7f3a… <span class="dim">on work@example.com</span></div>
+        <div><span class="k">send    </span>  "Go continue."</div>
+        <div><span class="g">✓</span> one swap, same session, same workspace</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="triggers">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Triggers</div>
+      <h2>Every reason a pane moves, and what happens</h2>
+      <p class="lede">Each banner is handled once per session, so a transcript Orca redraws after a restore is never switched twice. Usage numbers come from Orca's own <code>orca account list</code>. The plugin never reads tokens or keychains.</p>
+    </div>
+    <div class="tscroll">
+    <table class="tbl">
+      <thead><tr><th>Trigger</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td>Rate-limit banner in the pane's latest output</td><td>Cool the account down until the parsed reset time, switch, resume.</td></tr>
+        <tr><td>Model-specific cap (for example a Claude Fable weekly cap)</td><td>Type <code>/model &lt;next&gt;</code> from <em>Model fallback</em> in place. Switch accounts only when the list runs out.</td></tr>
+        <tr><td>API error (529, overloaded, stream disconnected)</td><td>Type the first message again after a Fibonacci backoff from 5 s to 120 s, up to the retry limit.</td></tr>
+        <tr><td>Auth failure</td><td>12-hour cooldown on that account, then switch.</td></tr>
+        <tr><td>A turn ends while the account is over a threshold</td><td>Switch. The account left behind stays out of rotation until its window resets. Thresholds default to 100 %, so this is reactive only.</td></tr>
+        <tr><td>Every account of the service limited</td><td>Park the session and wake it when the earliest account frees up. Carry on in the parked pane yourself and the wait ends.</td></tr>
+        <tr><td>A higher-priority account is healthy again</td><td><b>Switch back.</b> New launches use it, and sessions on lower accounts move back when they finish a turn or sit idle.</td></tr>
+        <tr><td>A session idles on an over-threshold account</td><td>Move it after <em>Move idle sessions after</em> seconds, 900 by default.</td></tr>
+        <tr><td><code>orca account select</code> fails for an account</td><td>Skip that account for 10 minutes and take the next.</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <div class="grid g3" style="margin-top:28px">
+      <div class="tile"><h3>Guards on advisory moves</h3><p>Threshold, idle and switch-back moves never close a pane holding unsent text, need at least a 10 % headroom gap, and change a service's selection at most once per 5 minutes. Hard limits ignore the guards.</p></div>
+      <div class="tile"><h3>Panes it did not start</h3><p>A restored pane has no recorded account. If it hits a limit while Orca shows plenty of room on the active account, the plugin cools nothing and simply resumes the session there.</p></div>
+      <div class="tile"><h3>Off switches</h3><p>Detection is heuristic. One toggle pauses every service, each service has its own switch, and <code>exclude</code> keeps named accounts out of automatic rotation.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="strategies">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Strategies</div>
+      <h2>Choose how the pool is spent</h2>
+      <p class="lede">The <code>chain</code> setting orders accounts within each service, by email or seat key. Example: <code>me@example.com, claude:*</code>. Empty means Orca's order.</p>
+    </div>
+    <div class="grid g5">
+      <div class="tile default"><h3>drain <span class="tag">default</span></h3><p>Stay on an account until it is limited, then take the next in chain order.</p></div>
+      <div class="tile"><h3>balanced</h3><p>Always the account with the most room.</p></div>
+      <div class="tile"><h3>priority</h3><p>Always the first healthy account in the chain.</p></div>
+      <div class="tile"><h3>soonest-reset</h3><p>The account whose weekly window resets first, so expiring usage is spent before it is lost.</p></div>
+      <div class="tile"><h3>manual</h3><p>Never switch automatically. The panel and commands still work.</p></div>
+    </div>
+    <p class="lede" style="margin-top:24px"><b style="color:var(--fg)">Switch back</b> is on by default for drain and priority, where the chain is a priority order. Once an earlier account is out of cooldown and under its thresholds, new launches use it again and lingering sessions migrate back after their next turn, or after sitting idle.</p>
+  </div>
+</section>
+
+<section id="providers">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Providers</div>
+      <h2>Same service only, by design</h2>
+      <p class="lede">A Claude pane moves to another Claude account and a Codex pane to another Codex account, never across services. How the session continues depends on what the service can do.</p>
+    </div>
+    <div class="grid g2">
+      <div class="tile">
+        <h3>Claude <span class="tag">resume by session id</span></h3>
+        <p>Every Orca Claude profile shares the <code>~/.claude/projects</code> transcripts, so the exact session resumes on the next account. Usage for an account that has not run yet is unknown and treated as eligible.</p>
+      </div>
+      <div class="tile">
+        <h3>Codex, Antigravity, OpenCode, Devin <span class="tag">handoff</span></h3>
+        <p>These keep sessions per account, so the same agent is started on the next account with a handoff prompt: why the previous run stopped, the session title, branch, <code>git status</code>, <code>git diff --stat</code> and the last 40 lines of output. OpenCode and Devin report no usage, so only rate limits move them.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="ui">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">In the app</div>
+      <h2>Status bar, panel, commands, console line</h2>
+    </div>
+    <div class="grid g2">
+      <div class="tile">
+        <h3>Status bar</h3>
+        <p>One glance at every service: accounts in rotation and the 5-hour and weekly usage of the active one. Warning tone at 80 %, danger while a session is parked. Click it to move Claude to the next account.</p>
+        <div class="sb"><svg class="gauge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 17a8 8 0 1 1 14 0"/><path d="M12 17l4-5"/></svg>claude 2/3 · 7%·18% | codex 1/3 · <span class="w">84%</span></div>
+      </div>
+      <div class="tile">
+        <h3>Panel</h3>
+        <p>Gauge icon in the right sidebar. Each account with 5-hour, weekly and model bars, active and limited badges, a cooldown countdown, <em>Clear</em> and <em>Use for new launches</em>. Plus the automatic-switching toggle, parked sessions and the swap history.</p>
+      </div>
+      <div class="tile">
+        <h3>Commands</h3>
+        <p>Switch Claude or Codex to the next account. Move this workspace's agent to another account. Pause or resume automatic switching. Refresh usage. Install or remove the console status line.</p>
+      </div>
+      <div class="tile">
+        <h3>Console status line for Claude panes</h3>
+        <p>Orca's own hook leaves Claude Code without a visible status line. The plugin's wrapper forwards every payload to Orca, then prints one row per account of the pane's service: percent left in the 5-hour, 7-day and best-model windows, green above 50 %, red at 20 or less. ▶ marks this pane's account, ⏸ a cooldown. About 40 ms per render, no CLI calls.</p>
+        <pre style="margin-top:12px"><code>▶ you    5h ██████░░  78%  7d ████████  96%  fable ████████  94%
+· work   5h ████████ 100%  7d ████████ 100%  fable ████████ 100%
+· third  5h ░░░░░░░░   0%  7d ██████░░  81%  fable ██████░░  81%  ⏸1h20m</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="settings">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Settings</div>
+      <h2>Every knob, straight from the manifest</h2>
+      <p class="lede">Settings → Plugins → Account Rotator. Every cux key is here, plus the chain, exclusions, switch-back guards and the console status line format.</p>
+    </div>
+    <div class="tscroll">
+    <table class="tbl">
+      <thead><tr><th>Key</th><th>Default</th><th>What it does</th></tr></thead>
+      <tbody>
+<tr><td><code>strategy</code><div class="st">Strategy</div></td><td>drain</td><td>drain, balanced, priority, soonest-reset or manual. See <a href="#strategies">Strategies</a>.</td></tr>
+<tr><td><code>chain</code><div class="st">Account chain</div></td><td><em>empty</em></td><td>Comma-separated order of accounts within each service: emails, seat keys (claude:&lt;id&gt;, codex:system) or provider:*. Example: me@example.com, claude:*. Empty = Orca's order. Switching never leaves the agent's own service.</td></tr>
+<tr><td><code>exclude</code><div class="st">Never switch to</div></td><td><em>empty</em></td><td>Comma-separated accounts that automatic switching never picks (emails, seat keys, or provider:*). Picking them from the panel still works.</td></tr>
+<tr><td><code>service_claude</code><div class="st">Auto-switch Claude accounts</div></td><td>on</td><td>Off: Claude panes are never switched or resumed automatically (manual switching still works). The same switch exists for <code>service_codex</code>, <code>service_antigravity</code>, <code>service_opencode</code> and <code>service_devin</code>.</td></tr>
+<tr><td><code>switch_back</code><div class="st">Switch back when a higher-priority account resets</div></td><td>on</td><td>drain and priority only: once an account earlier in the chain is healthy again, new launches use it and sessions on lower accounts move back when they finish a turn (or sit idle).</td></tr>
+<tr><td><code>switch_cooldown_minutes</code><div class="st">Minimum minutes between automatic selection changes</div></td><td>5</td><td>Applies to threshold, switch-back and idle moves, so two accounts near the line never ping-pong. Rate limits and auth failures ignore it.</td></tr>
+<tr><td><code>min_headroom_gap</code><div class="st">Minimum headroom gap for a threshold move (%)</div></td><td>10</td><td>A threshold move needs a target with at least this many points more room than the current account (when both are known). An exhausted account may always leave.</td></tr>
+<tr><td><code>auto_swap_idle_after_seconds</code><div class="st">Move idle sessions after (seconds)</div></td><td>900</td><td>A session idle this long on an over-threshold account, or on a lower account while a higher-priority one is healthy, is moved. 0 = off. Sessions with unsent text in the input box are left alone.</td></tr>
+<tr><td><code>auto_switch_on_rate_limit</code><div class="st">Switch on rate limit</div></td><td>on</td><td></td></tr>
+<tr><td><code>auto_switch_on_threshold</code><div class="st">Switch at usage threshold</div></td><td>on</td><td>Checked when an agent finishes a turn.</td></tr>
+<tr><td><code>thresholds_five_hour</code><div class="st">5-hour threshold (%)</div></td><td>100</td><td>100 = only when exhausted.</td></tr>
+<tr><td><code>thresholds_seven_day</code><div class="st">Weekly threshold (%)</div></td><td>100</td><td></td></tr>
+<tr><td><code>auto_resume</code><div class="st">Resume the session after a switch</div></td><td>on</td><td>Off: the plugin only switches the account for new launches and tells you. The limited pane stays for you to resume.</td></tr>
+<tr><td><code>auto_message</code><div class="st">First message after a switch</div></td><td>Go continue.</td><td>Empty = resume silently.</td></tr>
+<tr><td><code>wait_for_reset</code><div class="st">Wait for reset when every account is exhausted</div></td><td>on</td><td></td></tr>
+<tr><td><code>retry_on_api_error</code><div class="st">Retry on API errors</div></td><td>on</td><td>Types the first message again after a Fibonacci backoff (5 s … 120 s).</td></tr>
+<tr><td><code>max_api_retries</code><div class="st">Maximum API error retries</div></td><td>6</td><td></td></tr>
+<tr><td><code>model_fallback</code><div class="st">Model fallback</div></td><td><em>empty</em></td><td>Models to try in place before switching account when a model-specific cap is hit, e.g. claude=sonnet,haiku; codex=gpt-5-mini</td></tr>
+<tr><td><code>default_cooldown_minutes</code><div class="st">Default cooldown (minutes)</div></td><td>60</td><td>Used when neither the message nor Orca says when a limit resets.</td></tr>
+<tr><td><code>poll_interval_seconds</code><div class="st">Usage refresh interval (seconds)</div></td><td>60</td><td></td></tr>
+<tr><td><code>handoff_max_chars</code><div class="st">Handoff prompt size limit</div></td><td>6000</td><td></td></tr>
+<tr><td><code>orca_cli_path</code><div class="st">Orca CLI path</div></td><td><em>empty</em></td><td>Empty = detect (ORCA_CLI_COMMAND, the app bundle, then orca).</td></tr>
+<tr><td><code>console_statusline_format</code><div class="st">Console status line header</div></td><td><em>empty</em></td><td>Optional line above the account rows; empty = rows only. Placeholders: {model}, {ctxbar} context-left gauge, {ctx} context left %, {5h} and {7d} this pane's % left, {reset} time until the 5-hour window resets, {best} the best-model window's name. Example: {model} │ ctx {ctxbar} │ 5h reset {reset} │ best={best}</td></tr>
+<tr><td><code>console_statusline_bar_width</code><div class="st">Console status line bar width</div></td><td>8</td><td>Cells per gauge. 8 keeps a row with three gauges and a cooldown inside 80 columns.</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<section id="trust">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Permissions</div>
+      <h2>What it runs, and what it never touches</h2>
+      <p class="lede">Orca shows you exactly this before the plugin is enabled, and the approval fingerprint is bound to the plugin, version, files and access.</p>
+    </div>
+    <div class="grid g2">
+      <div class="tile">
+        <h3>Host capabilities</h3>
+        <ul class="check">
+          <li><b>agent:read, agent:launch</b> to see pane status and resume sessions</li>
+          <li><b>terminal:read, terminal:send</b> to read the last lines and type the first message</li>
+          <li><b>workspace:read, notifications:show</b></li>
+          <li><b>storage:own, settings:own</b> for history and your settings</li>
+        </ul>
+      </div>
+      <div class="tile">
+        <h3>Outside the host API</h3>
+        <ul class="check">
+          <li>Runs the <b>orca CLI</b>: <code>account select</code>, <code>account list</code>, <code>terminal close</code>, <code>terminal send</code>. Always an argument list, never a shell.</li>
+          <li>Runs <b>git status</b> and <b>git diff --stat</b> for handoff prompts</li>
+          <li><b>Never</b> reads tokens, keychains or credential files</li>
+          <li>A handoff prompt carries up to 40 lines of the previous agent's output, so treat it like any pasted terminal output</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install" class="install">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Install</div>
+      <h2>Two commands and an approval</h2>
+    </div>
+    <ol>
+      <li>
+        <div>
+          <p>Install from GitHub. Orca pins the newest version tag and prints what the plugin would be granted, along with a fingerprint.</p>
+          <pre><code>orca plugin install ngoohebi/orca-account-rotator</code></pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <p>Approve with that fingerprint. The command is printed for you; it looks like this.</p>
+          <pre><code>orca plugin install ngoohebi/orca-account-rotator --approve ap1-…</code></pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <p>Add a second account for the service in Orca, if you have not already. Optionally set <code>chain</code> in Settings → Plugins → Account Rotator to order your accounts. Done: the gauge appears in the status bar.</p>
+        </div>
+      </li>
+    </ol>
+    <div class="note"><b>Coming from cux?</b> Run <code>cux uninstall-hooks</code> first so the two don't both rotate. Every cux setting key has the same name here. Per-directory project bindings and <code>cux attach</code> are not migrated yet.</div>
+    <details>
+      <summary>Working on the plugin itself</summary>
+      <pre style="margin-top:12px"><code>orca plugin test . --json        # 60 tests: adapters, selector, worker end to end, panel
+orca plugin check . --json       # renders the panel with the real worker
+npx -p typescript tsc -p .       # type-check
+orca plugin validate . --json
+orca plugin dev load . --json    # needs --approve &lt;fingerprint&gt; the first time
+orca plugin dev request . rotator.debug</code></pre>
+    </details>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Account Rotator · MIT license · by <a href="https://github.com/ngoohebi">ngoohebi</a></span>
+    <a href="https://github.com/ngoohebi/orca-account-rotator">Source on GitHub</a>
+    <a href="https://github.com/ngoohebi/orca-account-rotator/issues">Issues</a>
+    <span>Ideas borrowed with thanks from <a href="https://github.com/inulute/cux">cux</a>, cswap, tokenmaxx and the Orca community's rotation PRs.</span>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var root=document.documentElement,btn=document.getElementById('theme');
+  try{var s=localStorage.getItem('theme');if(s==='light'||s==='dark')root.setAttribute('data-theme',s);}catch(e){}
+  btn.addEventListener('click',function(){
+    var dark=root.getAttribute('data-theme')==='dark'||(!root.getAttribute('data-theme')&&window.matchMedia('(prefers-color-scheme: dark)').matches);
+    var next=dark?'light':'dark';root.setAttribute('data-theme',next);
+    try{localStorage.setItem('theme',next);}catch(e){}
+  });
+  document.querySelectorAll('.copy').forEach(function(b){
+    b.addEventListener('click',function(){
+      var t=b.getAttribute('data-copy');
+      if(navigator.clipboard){navigator.clipboard.writeText(t).then(function(){b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1400);});}
+    });
+  });
+})();
+</script>
+</body>
+</html>

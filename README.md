@@ -1,5 +1,7 @@
 # Account Rotator (Orca plugin)
 
+Product page: <https://ngoohebi.github.io/orca-account-rotator/>
+
 Runs Orca's managed agent accounts as one pool, like [cux](https://github.com/inulute/cux) does for
 Claude Code, but inside Orca and for every provider Orca manages: Claude, Codex, Antigravity,
 OpenCode and Devin. When an agent pane hits a rate limit, or a usage threshold you set, the plugin:
