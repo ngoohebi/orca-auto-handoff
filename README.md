@@ -539,6 +539,47 @@ call. After each switch the plugin makes, it reads again at about 8 and 70 secon
 switch is what makes Orca fetch the accounts not in use. The plugin never reads tokens or
 keychains and never triggers Orca's internal fetches.
 
+## Known limitations
+
+These are known and not fixed. None of them loses text, interrupts a turn or crosses services;
+most are rare.
+
+- **Claude's greyed prompt suggestion counts as unsent text.** After a turn, Claude Code can show
+  a suggested next prompt in grey in the input box. Orca (1.4.263) reports it to plugins the same
+  way as text you typed, so the plugin cannot tell the two apart and plays safe: an early, idle,
+  switch-back or expiring-quota move of that pane is skipped, and the move command and *Switch to
+  this account* say the pane "has unsent text" and leave it. A real limit is not affected as far
+  as known: Claude is not known to show a suggestion after a turn that failed on a limit. To get
+  those moves, turn *Prompt suggestions* off in Claude Code (`/config`).
+- **Banner wordings are not all confirmed.** Only some limit messages were captured from the real
+  CLIs; the others follow each CLI's known wording. If a CLI changes its message, that limit is
+  not seen until the rules are updated. Many extra rows under the input box (for example a long
+  list of running sub-agents) can also push a banner out of the last five lines that are read.
+- **A model limit sets the whole account aside.** When one model's limit is hit on an account, or
+  one model's weekly window is about to run out, the account as a whole cools down or counts as
+  Low, also for sessions that use another model.
+- **Events of a pane that is being handled are dropped.** While the plugin works on a pane (a
+  move, or the wait before an API-error retry), further status events of that pane are ignored. A
+  limit that shows up just then is picked up at the pane's next turn end.
+- **A new session's account is taken from the project in focus.** The launch hook notes the
+  account selected for the project you are looking at. A session started at that moment in a
+  project on another Orca server can be noted on the wrong account until its first move or limit.
+- **Two shortcuts on paired servers.** History entries do not say which server they belong to,
+  so the guess "this unknown pane is still on the account just left" can use a move made on
+  another server. And if you change to a project on another server while the idle check runs,
+  that one check can look at the wrong server's accounts; the next check is right again.
+- **Split terminal groups.** Orca does not tell plugins which pane has the keyboard. With two
+  groups side by side, "the session in this tab" can be the agent of the same service shown in
+  the other group.
+- **At 1,000 history entries** (the most kept), the move command and *Switch to this account* can
+  answer "nothing to do" or "keeps its account" after a move that did happen. The move and the
+  History list are right.
+- **`custom` mode with `auto_resume` off and a threshold below 100:** you are told "new launches
+  now use …" again at every turn end of a session that stays on the account over the threshold.
+  The selection itself changes only once.
+- **Pressing Restart in Orca's own prompt** has not been tested. The plugin may then still take
+  those sessions to be on the old account until their next move or limit.
+
 ## Permissions
 
 Orca asks you to approve the plugin's access. Beyond the host API, the worker runs the `orca` CLI
