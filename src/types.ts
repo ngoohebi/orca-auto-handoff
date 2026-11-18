@@ -76,10 +76,31 @@ export type SeenSignal = {
   line?: string
 }
 
+/** Per-seat state. Every field is optional: entries stored by older versions hold only
+ *  `cooldownUntil` and `reason`. */
 export type SeatHealth = {
   cooldownUntil?: number
   reason?: string
+  /** Limit banners this seat showed while the plugin had no usage numbers for it (or right after
+   *  an automatic move onto it without numbers). Counted for 24 h after `strikeAt`. */
+  strikes?: number
+  /** When the last strike happened. */
+  strikeAt?: number
+  /** The current or last cooldown ends at a real reset time (from the banner or Orca's numbers),
+   *  not at a guessed one. */
+  resetKnown?: boolean
+  /** When the last cooldown expired. */
+  freedAt?: number
 }
+
+/** How long a strike counts, and how long an expired cooldown is remembered. */
+export const STRIKE_TTL_MS = 24 * 3_600_000
+/** The longest guessed cooldown for a seat without usage numbers. */
+export const BLIND_COOLDOWN_CAP_MINUTES = 300
+
+/** After an automatic move onto a seat without usage numbers: until `until`, no advisory move or
+ *  switch-back for that provider, and a limit banner on `key` counts as a strike. */
+export type Probation = { key: string; until: number }
 
 export type SwapReason = 'rate_limit' | 'threshold' | 'auth' | 'manual' | 'reset' | 'model_cap' | 'switch_back' | 'idle'
 export type SwapResult =
@@ -195,6 +216,7 @@ export type RotatorState = {
   history: HistoryEntry[]
   /** Last automatic selection change per provider (for the switch cooldown). */
   lastAutoSwitchAt?: Partial<Record<Provider, number>>
+  probation?: Partial<Record<Provider, Probation>>
 }
 
 export const HISTORY_CAP = 1000
@@ -209,7 +231,8 @@ export function emptyState(): RotatorState {
     modelStep: {},
     waiting: [],
     history: [],
-    lastAutoSwitchAt: {}
+    lastAutoSwitchAt: {},
+    probation: {}
   }
 }
 

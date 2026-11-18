@@ -17,6 +17,9 @@ function world(options: {
   codexUsage?: { session: number; weekly: number }
   /** Orca's numbers for a Claude account switched to later (default: plenty of room). */
   laterClaudeUsage?: { session: number; weekly: number }
+  /** Claude accounts not in use that Orca has numbers for (read on every list, so a test can
+   *  change it); by default Orca reports nothing for them. */
+  inactiveClaude?: Record<string, { session: number; weekly: number }>
   settings?: Record<string, string | number | boolean>
   state?: Partial<RotatorState>
   /** Resumed sessions redraw their transcript, as live Claude does; `late` = only after the
@@ -72,6 +75,7 @@ function world(options: {
       codexActive,
       // Orca stamps each reading when it takes it.
       updatedAt: clock,
+      ...(options.inactiveClaude ? { inactiveClaude: options.inactiveClaude } : {}),
       // The given (or exhausted) numbers belong to the first active account; an account
       // switched to later has room.
       claudeUsage: claudeActive === 'c1' ? options.claudeUsage ?? { session: 100, weekly: 40 } : options.laterClaudeUsage ?? { session: 5, weekly: 5 },
@@ -329,6 +333,8 @@ test('threshold: a finished turn on a busy seat moves on; normal output never tr
     panes: [{ terminalId: 't1', agent: 'claude', state: 'waiting', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
     claudeUsage: { session: 60, weekly: 10 },
+    // A threshold move needs a target with known room.
+    inactiveClaude: { c2: { session: 5, weekly: 5 } },
     settings: { thresholds_five_hour: 50 }
   })
   const worker = await w.mount()
@@ -568,6 +574,8 @@ test('review: every account over a threshold does not rotate (and type) forever'
     tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
     claudeUsage: { session: 60, weekly: 10 },
     laterClaudeUsage: { session: 70, weekly: 10 },
+    // Orca's (older) numbers for the accounts not in use show room: a threshold move needs that.
+    inactiveClaude: { c2: { session: 5, weekly: 5 }, c3: { session: 5, weekly: 5 } },
     settings: { thresholds_five_hour: 50 },
     redraw: true
   })
@@ -689,6 +697,355 @@ test('a seat that fails to switch is skipped for ten minutes; the rotation moves
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c3'])
   state = w.host.data().storage.state as RotatorState
   assert.equal(state.history.at(-1)?.result, 'resumed')
+  await worker.deactivate()
+})
+
+// ---- deciding with no data ----------------------------------------------------------------------
+
+const MIN = 60_000
+const selects = (w: { cliCalls: string[] }) => w.cliCalls.filter((c) => c.startsWith('select'))
+const stored = (w: { host: { data(): { storage: Record<string, unknown> } } }) => w.host.data().storage.state as RotatorState
+
+test('no data: a limit takes an account with known room before one Orca has no numbers for', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    inactiveClaude: { c3: { session: 5, weekly: 5 } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  // Chain order says c2, but nothing is known about c2.
+  assert.deepEqual(selects(w), ['select claude c3'])
+  // The landing was not blind: no probation.
+  assert.deepEqual(stored(w).probation, {})
+  await worker.deactivate()
+})
+
+test('no data: each banner without a reset time on an unknown account is a strike; the cooldown doubles up to 5 h', async () => {
+  const ids = ['p1', 'p2', 'p3', 'p4', 'p5']
+  const w = world({
+    panes: ids.map((terminalId) => ({ terminalId, agent: 'claude', state: 'done' as const, sessionId: `s-${terminalId}` })),
+    tails: Object.fromEntries(ids.map((id) => [id, fx.CLAUDE_LIMIT_NO_RESET])),
+    claudeUsage: { session: 5, weekly: 5 },
+    settings: { auto_resume: false },
+    // Every pane runs on c2, which Orca reports nothing for.
+    state: { paneSeat: Object.fromEntries(ids.map((id) => [id, 'claude:c2'])) }
+  })
+  const worker = await w.mount()
+  let now = 1_000_000
+  const expected = [60, 120, 240, 300, 300]
+  for (const [i, id] of ids.entries()) {
+    await worker.emit('agent.status.changed', statusEvent(id))
+    const h = stored(w).health['claude:c2']!
+    assert.equal(h.strikes, i + 1)
+    assert.equal(h.strikeAt, now)
+    assert.equal(h.cooldownUntil, now + expected[i]! * MIN)
+    assert.notEqual(h.resetKnown, true)
+    // While it cools it is not a target.
+    assert.equal(selects(w).length, 0)
+    w.advance(expected[i]! * MIN + MIN)
+    now += expected[i]! * MIN + MIN
+    await w.rotator.tick()
+    // The cooldown is over; the strikes are not.
+    const after = stored(w).health['claude:c2']!
+    assert.equal(after.cooldownUntil, undefined)
+    assert.equal(after.reason, undefined)
+    assert.equal(after.freedAt, now)
+    assert.equal(after.strikes, i + 1)
+  }
+  // 24 h after the last strike they lapse, and the entry goes.
+  w.advance(24 * 60 * MIN)
+  await w.rotator.tick()
+  assert.equal(stored(w).health['claude:c2'], undefined)
+  await worker.deactivate()
+})
+
+test('no data: two panes showing the same limit on an unknown account are one strike', async () => {
+  const w = world({
+    panes: [
+      { terminalId: 'p1', agent: 'claude', state: 'done', sessionId: 'sa' },
+      { terminalId: 'p2', agent: 'claude', state: 'done', sessionId: 'sb' }
+    ],
+    tails: { p1: fx.CLAUDE_LIMIT_NO_RESET, p2: fx.CLAUDE_LIMIT_NO_RESET },
+    claudeUsage: { session: 5, weekly: 5 },
+    state: { paneSeat: { p1: 'claude:c2', p2: 'claude:c2' } }
+  })
+  const worker = await w.mount()
+  await Promise.all([worker.emit('agent.status.changed', statusEvent('p1')), worker.emit('agent.status.changed', statusEvent('p2'))])
+  assert.equal(stored(w).health['claude:c2']?.strikes, 1)
+  assert.equal(stored(w).health['claude:c2']?.cooldownUntil, 1_000_000 + 60 * MIN)
+  assert.equal(w.host.callsOf('agent.resume').length, 2)
+  await worker.deactivate()
+})
+
+test('no data: strikes are cleared by a current reading with room, not by a remembered or an exhausted one', async () => {
+  const inactiveClaude: Record<string, { session: number; weekly: number }> = { c2: { session: 20, weekly: 10 } }
+  const w = world({ panes: [], tails: {}, claudeUsage: { session: 5, weekly: 5 }, inactiveClaude })
+  const worker = await w.mount()
+  // Orca stops reporting c2; then c2 is struck.
+  delete inactiveClaude.c2
+  w.rotator.state.health['claude:c2'] = { strikes: 2, strikeAt: 1_000_000 + MIN }
+  w.advance(2 * MIN)
+  let view = await w.rotator.accounts(true)
+  assert.equal(view.seats.find((s) => s.key === 'claude:c2')!.usage.source, 'cached')
+  assert.equal(w.rotator.state.health['claude:c2']?.strikes, 2)
+  // A current reading, but at the limit.
+  inactiveClaude.c2 = { session: 100, weekly: 10 }
+  w.advance(2 * MIN)
+  await w.rotator.accounts(true)
+  assert.equal(w.rotator.state.health['claude:c2']?.strikes, 2)
+  // A current reading with room.
+  inactiveClaude.c2 = { session: 30, weekly: 10 }
+  w.advance(2 * MIN)
+  view = await w.rotator.accounts(true)
+  assert.equal(view.seats.find((s) => s.key === 'claude:c2')!.usage.source, 'live')
+  assert.equal(w.rotator.state.health['claude:c2'], undefined)
+  assert.equal(stored(w).health['claude:c2'], undefined)
+  await worker.deactivate()
+})
+
+test('no data: a finished turn without a banner clears the strikes of the account it ran on', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
+    claudeUsage: { session: 5, weekly: 5 },
+    settings: { switch_back: false },
+    state: {
+      paneSeat: { t1: 'claude:c2' },
+      health: { 'claude:c2': { strikes: 2, strikeAt: 1_000_000 - 5 * MIN }, 'claude:c3': { strikes: 1, strikeAt: 1_000_000 - 5 * MIN } }
+    }
+  })
+  const worker = await w.mount()
+  // Waiting for input is not a finished turn.
+  await worker.emit('agent.status.changed', statusEvent('t1', 'waiting'))
+  assert.equal(stored(w).health['claude:c2']?.strikes, 2)
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.equal(stored(w).health['claude:c2'], undefined)
+  // Another account's strikes stay.
+  assert.equal(stored(w).health['claude:c3']?.strikes, 1)
+  assert.equal(selects(w).length, 0)
+  await worker.deactivate()
+})
+
+test('no data: a threshold move needs a known target, unless the account is at 100 % and none is known', async () => {
+  // 60 % of a 50 % threshold, and nothing known about the other accounts: stay.
+  const stay = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'waiting', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
+    claudeUsage: { session: 60, weekly: 10 },
+    settings: { thresholds_five_hour: 50 }
+  })
+  let worker = await stay.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1', 'waiting'))
+  assert.equal(selects(stay).length, 0)
+  assert.equal(stay.host.callsOf('terminal.close').length, 0)
+  assert.equal(stored(stay).waiting.length, 0)
+  await worker.deactivate()
+
+  // Known to be at 100 % (no banner yet): an unknown account is better than a certain failure.
+  const leave = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'waiting', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS }
+  })
+  worker = await leave.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1', 'waiting'))
+  assert.deepEqual(selects(leave), ['select claude c2'])
+  assert.equal(stored(leave).history.at(-1)?.reason, 'threshold')
+  assert.equal(stored(leave).probation?.claude?.key, 'claude:c2')
+  await worker.deactivate()
+})
+
+test('no data: after landing on an unknown account, advisory moves wait out the probation', async () => {
+  const inactiveClaude: Record<string, { session: number; weekly: number }> = {}
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    laterClaudeUsage: { session: 60, weekly: 10 },
+    inactiveClaude,
+    settings: { thresholds_five_hour: 50 }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  // max(10 min, 2 × the 5-minute selection cooldown).
+  assert.deepEqual(stored(w).probation?.claude, { key: 'claude:c2', until: 1_000_000 + 10 * MIN })
+  // c2 turns out to be over the threshold, and c3 is now known to have room.
+  inactiveClaude.c3 = { session: 5, weekly: 5 }
+  w.tails.t2 = [...fx.CLAUDE_TALKING_ABOUT_LIMITS]
+  w.advance(6 * MIN)
+  await worker.emit('agent.status.changed', statusEvent('t2', 'waiting', 2))
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  // Probation over: the same turn end now moves on.
+  w.advance(5 * MIN)
+  await worker.emit('agent.status.changed', statusEvent('t2', 'waiting', 3))
+  assert.deepEqual(selects(w), ['select claude c2', 'select claude c3'])
+  assert.equal(stored(w).history.at(-1)?.reason, 'threshold')
+  await worker.deactivate()
+})
+
+test('no data: a banner on the account under probation is a strike; after probation it is not', async () => {
+  const run = async (waitMs: number) => {
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: fx.CLAUDE_SESSION_LIMIT }
+    })
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    assert.deepEqual(selects(w), ['select claude c2'])
+    w.advance(waitMs)
+    await w.rotator.tick()
+    // c2 is in use now, so Orca has numbers for it; the banner names a reset time.
+    w.tails.t2 = ['⏺ Continuing.', '  ⎿  Weekly limit reached ∙ resets 3pm']
+    await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
+    assert.deepEqual(selects(w), ['select claude c2', 'select claude c3'])
+    const h = stored(w).health['claude:c2']!
+    await worker.deactivate()
+    return h
+  }
+  const during = await run(2 * MIN)
+  assert.equal(during.strikes, 1)
+  assert.equal(during.resetKnown, true)
+  assert.ok(during.cooldownUntil! > 1_000_000)
+  const after = await run(11 * MIN)
+  assert.equal(after.strikes, undefined)
+  assert.equal(after.resetKnown, true)
+})
+
+/** c2 is ahead of the selected c1 in the chain; a pane runs on c1. */
+const behind = (state: Partial<RotatorState> = {}, known?: { c1: number; c2: number }) =>
+  world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
+    claudeUsage: { session: 5, weekly: known?.c1 ?? 5 },
+    ...(known ? { inactiveClaude: { c2: { session: 5, weekly: known.c2 } } } : {}),
+    settings: { chain: 'claude:c2, claude:c1, claude:c3', auto_swap_idle_after_seconds: 0 },
+    state: { paneSeat: { t1: 'claude:c1' }, ...state }
+  })
+
+test('no data, switch back: an unknown account is selected for new launches once; running panes wait until it is known', async () => {
+  const w = behind()
+  const worker = await w.mount()
+  // A running session is not closed and resumed on an account nothing is known about.
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(selects(w).length, 0)
+  // New launches: the selection moves, which is also what makes Orca fetch that account.
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(stored(w).history.at(-1), { ...stored(w).history.at(-1), reason: 'switch_back', result: 'selected', from: 'claude:c1', to: 'claude:c2' })
+  assert.equal(stored(w).probation?.claude?.key, 'claude:c2')
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  // Once: nothing more on later ticks, and the pane stays during probation.
+  w.advance(2 * MIN)
+  await w.rotator.tick()
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  // After probation c2 is in use and known: the pane follows.
+  w.advance(9 * MIN)
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 3))
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.equal(stored(w).paneSeat.t2, 'claude:c2')
+  assert.deepEqual(selects(w), ['select claude c2'])
+  await worker.deactivate()
+})
+
+test('no data, switch back: an unknown account with a strike is not selected, even for new launches', async () => {
+  const w = behind({ health: { 'claude:c2': { strikes: 1, strikeAt: 1_000_000 - 60 * MIN } } })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  await w.rotator.tick()
+  w.advance(20 * MIN)
+  await w.rotator.tick()
+  assert.equal(selects(w).length, 0)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  await worker.deactivate()
+})
+
+test('no data, switch back: a presumed-reset account takes a running pane once; a banner there ends the presumption', async () => {
+  const w = behind({ health: { 'claude:c2': { resetKnown: true, freedAt: 1_000_000 - 1000 } } })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.equal(stored(w).paneSeat.t2, 'claude:c2')
+  assert.equal(stored(w).history.at(-1)?.reason, 'switch_back')
+  assert.equal(stored(w).probation?.claude?.key, 'claude:c2')
+  // The presumption was wrong: the session hits a limit there.
+  w.tails.t2 = ['⏺ Continuing.', '  ⎿  Weekly limit reached ∙ resets 3pm']
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
+  assert.deepEqual(selects(w), ['select claude c2', 'select claude c1'])
+  assert.equal(stored(w).health['claude:c2']?.strikes, 1)
+  await worker.deactivate()
+})
+
+test('no data, switch back: a known account takes a running pane at once, without probation', async () => {
+  // Both known, and c2 has clearly more room (the headroom gap applies to known numbers, as before).
+  const w = behind({}, { c1: 40, c2: 5 })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(stored(w).probation, {})
+  await worker.deactivate()
+})
+
+test('no data: paused, or the service off, means no move at all', async () => {
+  for (const off of ['paused', 'service'] as const) {
+    const w = world({
+      panes: [
+        { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
+        { terminalId: 't9', agent: 'claude', state: 'done', sessionId: 's9', stateStartedAt: 1 }
+      ],
+      tails: { t1: fx.CLAUDE_LIMIT_NO_RESET, t9: fx.CLAUDE_TALKING_ABOUT_LIMITS },
+      // c2 is ahead of the selected c1 and presumed reset: a switch-back target for panes and launches.
+      settings: { chain: 'claude:c2, claude:c1, claude:c3', ...(off === 'service' ? { service_claude: false } : {}) },
+      state: { paneSeat: { t1: 'claude:c1', t9: 'claude:c1' }, health: { 'claude:c2': { resetKnown: true, freedAt: 1_000_000 - 1000 } } }
+    })
+    const worker = await w.mount()
+    if (off === 'paused') await worker.request('rotator.pause', { paused: true })
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    await worker.emit('agent.status.changed', statusEvent('t9'))
+    w.advance(20 * MIN)
+    await w.rotator.tick()
+    w.advance(20 * MIN)
+    await w.rotator.tick()
+    assert.equal(selects(w).length, 0, off)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, off)
+    assert.equal(w.host.callsOf('agent.resume').length, 0, off)
+    assert.deepEqual(w.typed, [], off)
+    const state = stored(w)
+    assert.equal(state.health['claude:c1'], undefined, off)
+    assert.equal(state.probation?.claude, undefined, off)
+    assert.equal(state.history.length, 0, off)
+    await worker.deactivate()
+  }
+})
+
+test('no data: state stored by an older version (cooldowns only, no strikes or probation) loads and works', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    state: {
+      health: {
+        'claude:c2': { cooldownUntil: 1_000_000 - 1, reason: 'rate_limit: old banner' },
+        'claude:c3': { cooldownUntil: 1_000_000 + 60 * MIN, reason: 'rate_limit: old banner' }
+      }
+    }
+  })
+  assert.equal('probation' in (w.host.data().storage.state as object), false)
+  const worker = await w.mount()
+  assert.deepEqual(w.rotator.state.probation, {})
+  await w.rotator.tick()
+  // The expired old cooldown says nothing about a reset: the entry simply goes. The running one stays.
+  assert.equal(stored(w).health['claude:c2'], undefined)
+  assert.deepEqual(stored(w).health['claude:c3'], { cooldownUntil: 1_000_000 + 60 * MIN, reason: 'rate_limit: old banner' })
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(stored(w).history.at(-1)?.result, 'resumed')
+  assert.equal(stored(w).health['claude:c1']?.resetKnown, true)
+  assert.equal(stored(w).probation?.claude?.key, 'claude:c2')
   await worker.deactivate()
 })
 

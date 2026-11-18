@@ -34,6 +34,9 @@ export const CLAUDE_SESSION_LIMIT = [
   '╰──────────────────────────────────────────────╯'
 ]
 
+/** A limit banner that does not say when the limit lifts. */
+export const CLAUDE_LIMIT_NO_RESET = ['⏺ Working on it.', '', '  ⎿  5-hour limit reached', '     /upgrade to increase your usage limit.']
+
 export const CLAUDE_LEGACY_EPOCH = ['⏺ Working on it', 'Claude AI usage limit reached|1795000000']
 
 export const CLAUDE_MODEL_CAP = ['⏺ Reading files', '  ⎿  Fable weekly limit reached ∙ resets Mon 9am', '     /model to switch models.']
@@ -58,6 +61,8 @@ export function accountList(options: {
   codexActive?: string | null
   codexUsage?: { session: number; weekly: number }
   inactiveCodex?: Record<string, number>
+  /** Claude accounts not in use that Orca has numbers for; the others report nothing. */
+  inactiveClaude?: Record<string, { session: number; weekly: number }>
   /** When Orca took the active readings (its `updatedAt`). */
   updatedAt?: number
 } = {}): Record<string, any> {
@@ -103,7 +108,19 @@ export function accountList(options: {
         updatedAt
       },
       inactiveClaudeAccounts: [
-        { accountId: 'c2', rateLimits: { provider: 'claude', status: 'error', session: null, weekly: null, error: 'Claude usage updates the next time Claude runs.' } }
+        ...(options.inactiveClaude?.c2
+          ? []
+          : [{ accountId: 'c2', rateLimits: { provider: 'claude', status: 'error', session: null, weekly: null, error: 'Claude usage updates the next time Claude runs.' } }]),
+        ...Object.entries(options.inactiveClaude ?? {}).map(([accountId, used]) => ({
+          accountId,
+          rateLimits: {
+            provider: 'claude',
+            status: 'ok',
+            session: { usedPercent: used.session, windowMinutes: 300, resetsAt: 1_000_000 + 3_600_000 },
+            weekly: { usedPercent: used.weekly, windowMinutes: 10080, resetsAt: 1_000_000 + 86_400_000 },
+            updatedAt
+          }
+        }))
       ],
       inactiveCodexAccounts: Object.entries(options.inactiveCodex ?? { x2: 100 }).map(([accountId, used]) => ({
         accountId,
