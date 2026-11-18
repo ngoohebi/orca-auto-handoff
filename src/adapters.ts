@@ -175,8 +175,11 @@ export function draftOf(lines: readonly string[]): string | null {
 }
 
 /** Fixed lines Claude Code itself shows in an empty input box, which Orca reports as `draft`
- *  like typed text (Orca 1.4.263). Only wordings seen as a whole draft belong here. */
-export const CLAUDE_HINTS: readonly string[] = ['Press up to edit queued messages']
+ *  like typed text (Orca 1.4.263), and which never mean the user has input waiting. Only
+ *  wordings seen as a whole draft belong here. Empty for now: none has been confirmed.
+ *  "Press up to edit queued messages" is deliberately NOT here: it means messages the user
+ *  queued are waiting to be sent when the turn ends, so closing the pane would lose them. */
+export const CLAUDE_HINTS: readonly string[] = []
 
 /** Is this draft one of Claude Code's own fixed hints, and so not text the user typed? The whole
  *  text must be the hint (after trimming): typing that only contains or resembles one is a draft. */

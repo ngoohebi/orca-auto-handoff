@@ -208,9 +208,8 @@ way, and the answer lifts no other guard: like every other move, these never clo
 is in the middle of a turn, and a limited account is still refused. The plugin asks Orca for
 that text (`orca terminal read --json`, field `draft`) and also looks at the input line on
 screen; if Orca cannot be asked, the screen alone decides. Orca reports Claude Code's own grey
-texts in the same field. A fixed hint is told apart by its exact wording and is not unsent text;
-the list holds one, "Press up to edit queued messages". Text that only resembles it is treated
-as yours. A grey prompt suggestion ("keep going") cannot be told from typing and counts as
+texts in the same field. "Press up to edit queued messages" counts as unsent input on purpose:
+it means messages you queued are waiting to be sent, and closing the pane would lose them. A grey prompt suggestion ("keep going") cannot be told from typing and counts as
 unsent text (see *Known limitations*). The same holds for the first message after a move: if
 you are already typing in the resumed pane, or have sent something there, it is not typed, and
 the notification says the session is left for you to continue. A first message that cannot be
@@ -566,9 +565,9 @@ most are rare.
   moves the session only after *Move anyway*. A real limit is not affected as far as known:
   Claude is not known to show a suggestion after a turn that failed on a limit. To get the
   automatic moves, turn *Prompt suggestions* off in Claude Code (`/config`).
-- **Only one fixed Claude hint is recognised.** "Press up to edit queued messages" is ignored as
-  unsent text, by its exact wording. Any other fixed line Claude Code shows in an empty input box
-  is treated as unsent text, like a suggestion, until its wording is added.
+- **No Claude hint is ignored yet.** Any fixed line Claude Code shows in an empty input box is
+  treated as unsent text, like a suggestion, until a wording is confirmed harmless. "Press up to
+  edit queued messages" is never ignored, because it means queued messages are waiting.
 - **With unsent text showing, the panel cannot select an account for new launches only.**
   *Switch to this account* then either moves the session in the tab (*Move anyway*) or changes
   nothing (*Cancel*). Change tabs, or use Orca's own account switcher, to select the account

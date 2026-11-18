@@ -137,12 +137,13 @@ test('live: unsent text is seen with the console status line rows and the mode l
   assert.equal(hasDraft(['❯ also update the docs', '⏺ Updated.', FRAME, '❯', FRAME, ...STATUS_ROWS, MODE_LINE]), false)
 })
 
-test('the unsent text itself is read from the box; Claude\u2019s fixed hint is known only by its exact wording', () => {
+test('the unsent text itself is read from the box; queued messages are never taken for a harmless hint', () => {
   assert.equal(draftOf(['⏺ Done.', FRAME, '❯ also update the docs', FRAME, ...STATUS_ROWS, MODE_LINE]), 'also update the docs')
   assert.equal(draftOf(['⏺ Done.', '╭────╮', '│ > fix the flaky test  │', '╰────╯']), 'fix the flaky test')
   assert.equal(draftOf(['⏺ Done.', FRAME, '❯', FRAME, MODE_LINE]), null)
-  assert.equal(isClaudeHint('Press up to edit queued messages'), true)
-  assert.equal(isClaudeHint('  Press up to edit queued messages \n'), true)
+  // Queued messages wait to be sent at the end of the turn: closing the pane would lose them.
+  assert.equal(isClaudeHint('Press up to edit queued messages'), false)
+  assert.equal(isClaudeHint('  Press up to edit queued messages \n'), false)
   for (const typed of ['Press up to edit queued messages.', 'press up to edit queued messages', 'Press up to edit queued messages now', 'Press up to edit', 'keep going', '']) {
     assert.equal(isClaudeHint(typed), false, typed)
   }

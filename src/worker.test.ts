@@ -1551,28 +1551,19 @@ test('manual switch: accepting the text lifts no other guard: never in the middl
   await worker.deactivate()
 })
 
-test('Claude\u2019s own fixed hint in the input box is no unsent text; anything else, however close, is', async () => {
+test('queued messages ("Press up to edit queued messages") count as unsent input: asked about by hand, never closed automatically', async () => {
   const HINT = 'Press up to edit queued messages'
-  // The manual switch moves the pane without asking, as Orca reports the hint or as the screen shows it.
-  for (const extra of [{ drafts: { t1: HINT } }, { drafts: { t1: `  ${HINT}\n` } }, { tails: { t1: ['⏺ Done.', '╭──────────────╮', `│ > ${HINT}`, '╰──────────────╯'] } }]) {
+  // The manual switch asks first, as for typed text.
+  for (const extra of [{ drafts: { t1: HINT } }, { drafts: { t1: `  ${HINT}\n` } }]) {
     const w = idleInTab(extra)
     const worker = await w.mount()
-    const { message, draft } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
-    assert.equal(draft, undefined, JSON.stringify(extra))
-    assert.match(message, /this pane moved \(resumed\)/, JSON.stringify(extra))
-    await worker.deactivate()
-  }
-  // Text that only resembles the hint is the user's.
-  for (const text of [`${HINT}.`, HINT.toLowerCase(), `${HINT} please`, `ok. ${HINT}`, 'Press up to edit queued message', 'keep going']) {
-    const w = idleInTab({ drafts: { t1: text } })
-    const worker = await w.mount()
     const { draft } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
-    assert.deepEqual(draft, { terminalId: 't1', text }, text)
-    assert.equal(w.host.callsOf('terminal.close').length, 0, text)
+    assert.equal(draft?.terminalId, 't1', JSON.stringify(extra))
+    assert.equal(w.host.callsOf('terminal.close').length, 0, JSON.stringify(extra))
     await worker.deactivate()
   }
-  // Automatic moves: a limit closes a pane that shows only the hint, and holds for other text.
-  for (const [text, moves] of [[HINT, true], [`${HINT}?`, false], ['push it', false]] as const) {
+  // Automatic moves: a limit never closes a pane with queued messages; it holds as for typed text.
+  for (const text of [HINT, 'push it']) {
     const w = world({
       panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
       tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, '╭──────────────╮', '│ >', '╰──────────────╯'] },
@@ -1581,8 +1572,8 @@ test('Claude\u2019s own fixed hint in the input box is no unsent text; anything 
     })
     const worker = await w.mount()
     await worker.emit('agent.status.changed', statusEvent('t1'))
-    assert.equal(w.host.callsOf('terminal.close').length, moves ? 1 : 0, text)
-    assert.equal(!!stored(w).waiting[0]?.draftAt, !moves, text)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, text)
+    assert.ok(stored(w).waiting[0]?.draftAt, text)
     await worker.deactivate()
   }
 })
