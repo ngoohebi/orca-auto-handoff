@@ -1,10 +1,11 @@
 // The rotator: reacts to agent status, classifies the terminal tail, and swaps seats.
 // Every side effect goes through Deps so tests run it with a fake host, CLI and clock.
-import { ADAPTERS, CHROME, classify, countCopies, parseModelFallback } from './adapters'
+import { ADAPTERS, CHROME, classify, countCopies, hasDraft, parseModelFallback } from './adapters'
 import { parseAccounts, type AccountView } from './accounts'
-import { buildChain, earliestReset, isEligible, overThreshold, pickNext } from './selector'
+import { buildChain, earliestReset, enoughGap, isEligible, overThreshold, pickNext, preferredOver } from './selector'
 import {
   HISTORY_CAP,
+  PROVIDERS,
   allServices,
   emptyState,
   isProvider,
@@ -73,6 +74,9 @@ export function providerOf(agent: string | null | undefined): Provider | null {
   if (agent === 'opencode2') return 'opencode'
   return isProvider(agent) ? agent : null
 }
+
+/** How long a seat that failed to switch is skipped. */
+const FAILED_SWITCH_SKIP_MS = 10 * 60_000
 
 export function backoffMs(attempt: number): number {
   let a = 1
@@ -289,13 +293,14 @@ export class Rotator {
         await this.save()
         this.publishNow()
       }
-      if (config.autoSwitchOnThreshold) {
-        const view = await this.accounts()
-        const seat = this.seatOf(pane.terminalId, pane.agent, view)
-        if (seat && overThreshold(seat, config, this.deps.now())) {
-          await this.swap(pane, 'threshold', lines)
-        }
+      const view = await this.accounts()
+      const seat = this.seatOf(pane.terminalId, pane.agent, view)
+      if (config.autoSwitchOnThreshold && seat && overThreshold(seat, config, this.deps.now())) {
+        await this.swap(pane, 'threshold', lines)
+        return
       }
+      // A turn just ended on a lower seat while a higher-priority one is healthy again.
+      await this.switchBack(pane, lines)
       return
     }
     if (!this.isNew(key, signal)) return
@@ -450,12 +455,65 @@ export class Rotator {
       const picked = healthyActive ?? pickNext(chain, from?.key, this.state.health, config, now)
       // Only ever another account of the same service.
       const target = picked && picked.provider === pane.agent ? picked : null
+      const advisory = reason === 'threshold' || reason === 'idle'
       if (!target) {
         // A threshold is advice: with nowhere to go, the session keeps working where it is.
-        if (reason !== 'threshold') await this.park(pane, from, chain, config, reason)
+        if (!advisory) await this.park(pane, from, chain, config, reason)
         return
       }
+      if (advisory && !(await this.advisoryOk(pane, from, target, lines, view, config, now))) return
       await this.moveTo(pane, from, target, reason, lines, signal, view, config)
+    })
+  }
+
+  /** Guards shared by moves that are advice, not necessity (threshold, idle, switch-back): the
+   *  user's unsent text, the headroom gap, and the per-provider selection cooldown. */
+  private async advisoryOk(
+    pane: PaneInfo,
+    from: Seat | undefined,
+    target: Seat,
+    lines: readonly string[],
+    view: AccountView,
+    config: Config,
+    now: number
+  ): Promise<boolean> {
+    if (hasDraft(lines)) {
+      this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not moving it`)
+      return false
+    }
+    if (!enoughGap(from, target, config)) return false
+    // Moving onto the seat Orca already selected changes nothing for other panes; a selection
+    // change is what must not flap.
+    if (view.active[target.provider] !== target.key && !this.canChangeSelection(target.provider, config, now)) return false
+    return true
+  }
+
+  private canChangeSelection(provider: Provider, config: Config, now: number): boolean {
+    const last = this.state.lastAutoSwitchAt?.[provider] ?? 0
+    return now - last >= config.switchCooldownMinutes * 60_000
+  }
+
+  private noteSelectionChange(provider: Provider, reason: SwapReason, now: number): void {
+    if (reason === 'manual') return
+    this.state.lastAutoSwitchAt = { ...(this.state.lastAutoSwitchAt ?? {}), [provider]: now }
+  }
+
+  /** Switch-back (Orca issue #33193, tokenmaxx "return to primary"): a pane on a lower seat
+   *  moves to the first healthy seat ahead of it in the chain. */
+  async switchBack(pane: PaneInfo, lines: readonly string[]): Promise<void> {
+    await this.withLock(pane.agent, async () => {
+      if (!(await this.allowed(pane.agent))) return
+      const config = await this.deps.config()
+      if (!config.switchBack) return
+      const view = await this.accounts()
+      const now = this.deps.now()
+      const at = this.locate(pane.terminalId, pane.agent, view)
+      if (!at.seat) return
+      const chain = buildChain(view.seats, pane.agent, config)
+      const preferred = preferredOver(chain, at.seat.key, this.state.health, config, now)
+      if (!preferred) return
+      if (!(await this.advisoryOk(pane, at.seat, preferred, lines, view, config, now))) return
+      await this.moveTo(pane, at.seat, preferred, 'switch_back', [...lines], undefined, view, config)
     })
   }
 
@@ -497,6 +555,7 @@ export class Rotator {
         await this.deps.cli.select(target.provider, target.accountId)
         view.active[target.provider] = target.key
         for (const s of view.seats) if (s.provider === target.provider) s.active = s.key === target.key
+        this.noteSelectionChange(target.provider, reason, this.deps.now())
       }
       if (!config.autoResume) {
         // Only the account changes; the pane stays as it is for the user to resume.
@@ -559,6 +618,13 @@ export class Rotator {
       this.deps.log(`swap failed: ${message}`)
       // Never retry a parked session forever: a failure ends its wait.
       this.state.waiting = this.state.waiting.filter((w) => w.terminalId !== pane.terminalId)
+      // A seat that could not be switched to is skipped for a while, so the rotation moves on to
+      // a usable one instead of retrying a broken one (Orca PR #43578).
+      const skipUntil = this.deps.now() + FAILED_SWITCH_SKIP_MS
+      const h = this.state.health[target.key]
+      if (!h?.cooldownUntil || h.cooldownUntil < skipUntil) {
+        this.state.health[target.key] = { cooldownUntil: skipUntil, reason: `switch failed: ${message}`.slice(0, 200) }
+      }
       this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', ...(from ? { from: from.key } : {}), to: target.key, detail: message.slice(0, 200) })
       await this.save()
       await this.deps.notify('Account Rotator', `Swap to ${target.label} failed: ${message}`)
@@ -690,8 +756,111 @@ export class Rotator {
         const ready = w.wakeAt <= now || pickNext(chain, undefined, this.state.health, config, now)
         if (ready) await this.wake(w)
       }
+      await this.reselectPreferred(config)
+      await this.sweepIdle(config)
     }
     this.publishNow()
+  }
+
+  /** Switch-back for new launches: when a seat ahead of the selected one is healthy again, select
+   *  it, so the next launch uses it. Panes follow when they finish a turn or sit idle. */
+  private async reselectPreferred(config: Config): Promise<void> {
+    if (!config.switchBack) return
+    for (const provider of PROVIDERS) {
+      if (!config.services[provider]) continue
+      const view = await this.accounts()
+      const chain = buildChain(view.seats, provider, config)
+      const now = this.deps.now()
+      if (!preferredOver(chain, view.active[provider], this.state.health, config, now)) continue
+      if (!this.canChangeSelection(provider, config, now)) continue
+      await this.withLock(provider, async () => {
+        if (!(await this.allowed(provider))) return
+        const fresh = await this.accounts(true)
+        const chain = buildChain(fresh.seats, provider, config)
+        const from = fresh.active[provider]
+        const preferred = preferredOver(chain, from, this.state.health, config, this.deps.now())
+        if (!preferred) return
+        try {
+          await this.deps.cli.select(provider, preferred.accountId)
+        } catch (error) {
+          const message = String((error as Error)?.message ?? error)
+          this.deps.log(`switch back failed: ${message}`)
+          this.state.health[preferred.key] = { cooldownUntil: this.deps.now() + FAILED_SWITCH_SKIP_MS, reason: `switch failed: ${message}`.slice(0, 200) }
+          await this.save()
+          return
+        }
+        fresh.active[provider] = preferred.key
+        for (const s of fresh.seats) if (s.provider === provider) s.active = s.key === preferred.key
+        this.noteSelectionChange(provider, 'switch_back', this.deps.now())
+        this.record({ provider, reason: 'switch_back', result: 'selected', ...(from ? { from } : {}), to: preferred.key })
+        await this.save()
+        await this.deps.notify('Account Rotator', `${provider}: ${preferred.label} is available again; new launches use it.`)
+        this.publishNow()
+      })
+    }
+  }
+
+  /** cux `auto_swap_idle_after_seconds`: a session idle on an over-threshold seat, or on a
+   *  lower seat while a higher-priority one is healthy, is moved without waiting for its next
+   *  turn. Only looked at when some seat gives a reason to. */
+  private async sweepIdle(config: Config): Promise<void> {
+    if (config.autoSwapIdleAfterSeconds <= 0) return
+    const view = await this.accounts()
+    const now = this.deps.now()
+    const due = PROVIDERS.filter((p) => {
+      if (!config.services[p]) return false
+      const chain = buildChain(view.seats, p, config)
+      if (chain.length < 2) return false
+      return chain.some(
+        (s) =>
+          (config.autoSwitchOnThreshold && overThreshold(s, config, now)) ||
+          preferredOver(chain, s.key, this.state.health, config, now)
+      )
+    })
+    if (due.length === 0) return
+    let workspaces: { id: string }[]
+    try {
+      workspaces = (await this.deps.host.call('workspace.list')).workspaces
+    } catch {
+      return
+    }
+    const idleMs = config.autoSwapIdleAfterSeconds * 1000
+    for (const ws of workspaces) {
+      let agents: any[]
+      try {
+        agents = (await this.deps.host.call('agents.list', { workspaceId: ws.id })).agents
+      } catch {
+        continue
+      }
+      for (const row of agents) {
+        const agent = providerOf(row.agent)
+        if (!agent || !row.terminalId || !due.includes(agent)) continue
+        if (row.state !== 'waiting' && row.state !== 'done') continue
+        if (now - (row.stateStartedAt ?? now) < idleMs) continue
+        if (this.inflight.has(row.terminalId) || this.state.waiting.some((w) => w.terminalId === row.terminalId)) continue
+        const seat = this.seatOf(row.terminalId, agent, view)
+        if (!seat) continue
+        const chain = buildChain(view.seats, agent, config)
+        const over = config.autoSwitchOnThreshold && overThreshold(seat, config, now)
+        if (!over && !preferredOver(chain, seat.key, this.state.health, config, now)) continue
+        const pane: PaneInfo = { terminalId: row.terminalId, workspaceId: ws.id, agent }
+        if (row.agent !== agent) pane.agentId = row.agent
+        if (row.sessionId) pane.sessionId = row.sessionId
+        if (row.title) pane.title = row.title
+        this.inflight.add(row.terminalId)
+        try {
+          const { lines } = await this.deps.host.call('terminal.read', { terminalId: row.terminalId, maxLines: 80 })
+          // A limit banner on screen belongs to the status path, not to an idle move.
+          if (classify(agent, lines, now)) continue
+          if (over) await this.swap(pane, 'idle', lines)
+          else await this.switchBack(pane, lines)
+        } catch (error) {
+          this.deps.log(`idle move of ${row.terminalId} failed: ${String((error as Error)?.message ?? error)}`)
+        } finally {
+          this.inflight.delete(row.terminalId)
+        }
+      }
+    }
   }
 
   private async wake(w: WaitingEntry): Promise<void> {

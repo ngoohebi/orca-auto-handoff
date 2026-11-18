@@ -144,6 +144,27 @@ export function classify(provider: Provider, lines: readonly string[], now: numb
   return null
 }
 
+/** Input-box placeholders the CLIs show when nothing is typed. */
+const PLACEHOLDER = /^(ask (codex|claude|antigravity|opencode|devin) (to do )?anything|try ["“]|type (a|your) (message|prompt)|what (can|should) i|send a message)/i
+/** What may follow the input box: its frame and the CLI footer, never a reply. */
+const FOOTER = /^\s*(╰|─{3,}|│\s*$|←|\? for shortcuts|\S[^\n]*·)/
+
+/**
+ * Unsent text in the agent's input box (Orca issue #41488: an automatic restart threw away a
+ * prompt the user was typing). The input line must be the last content on screen: a submitted
+ * prompt looks the same but has a reply under it.
+ */
+export function hasDraft(lines: readonly string[]): boolean {
+  const content = lines.map((l) => l.replace(/\s+$/, '')).filter((l) => l.trim() !== '')
+  const at = content.map((l) => /^\s*(│\s*)?(›|❯|>)(\s|$)/.test(l)).lastIndexOf(true)
+  if (at < 0 || !content.slice(at + 1).every((l) => FOOTER.test(l))) return false
+  const text = content[at]!
+    .replace(/^\s*(│\s*)?(›|❯|>)\s?/, '')
+    .replace(/│\s*$/, '')
+    .trim()
+  return text.length > 0 && !PLACEHOLDER.test(text)
+}
+
 export function normalise(line: string): string {
   return line.trim().replace(/\s+/g, ' ').slice(0, 200)
 }

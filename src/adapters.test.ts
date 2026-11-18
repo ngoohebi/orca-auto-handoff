@@ -1,5 +1,5 @@
 import { assert, test } from 'orca/testing'
-import { classify, parseModelFallback, parseReset } from './adapters'
+import { classify, hasDraft, parseModelFallback, parseReset } from './adapters'
 import * as fx from './fixtures'
 
 const NOW = new Date(2026, 10, 18, 10, 0, 0).getTime()
@@ -82,4 +82,13 @@ test('a typed prompt that mentions a limit is not a limit (live: Claude ❯ prom
     '✻ Brewed for 2s · done 8:08 AM'
   ]
   assert.equal(classify('claude', tail, NOW), null)
+})
+
+test('unsent text in the input box is a draft; placeholders and empty boxes are not', () => {
+  assert.equal(hasDraft(['⏺ Done.', '╭────╮', '│ > fix the flaky test', '╰────╯']), true)
+  assert.equal(hasDraft(['⏺ Done.', '╭────╮', '│ >', '╰────╯']), false)
+  assert.equal(hasDraft(['⏺ Done.', '╭────╮', '│ > Try "fix lint errors"', '╰────╯']), false)
+  assert.equal(hasDraft(fx.CODEX_OLLAMA_CREDITS), false)
+  assert.equal(hasDraft(['■ done', '› rerun the tests', '  gpt-5 · ~/repo']), true)
+  assert.equal(hasDraft(['❯ Go continue.', '⏺ Working on it']), false)
 })

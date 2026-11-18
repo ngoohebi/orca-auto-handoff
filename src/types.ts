@@ -63,7 +63,7 @@ export type SeatHealth = {
   reason?: string
 }
 
-export type SwapReason = 'rate_limit' | 'threshold' | 'auth' | 'manual' | 'reset' | 'model_cap'
+export type SwapReason = 'rate_limit' | 'threshold' | 'auth' | 'manual' | 'reset' | 'model_cap' | 'switch_back' | 'idle'
 export type SwapResult =
   | 'resumed'
   | 'handoff'
@@ -99,8 +99,20 @@ export type WaitingEntry = {
 export type Config = {
   thresholdFiveHour: number
   thresholdSevenDay: number
-  strategy: 'drain' | 'balanced' | 'priority' | 'manual'
+  strategy: 'drain' | 'balanced' | 'priority' | 'soonest-reset' | 'manual'
   autoSwitchOnThreshold: boolean
+  /** Go back to an earlier seat in the chain once it is healthy again (drain, priority). */
+  switchBack: boolean
+  /** Minimum time between automatic selection changes of one provider (threshold, switch-back,
+   *  idle moves); hard limits ignore it. */
+  switchCooldownMinutes: number
+  /** A threshold move needs a target with at least this many points more room (when known). */
+  minHeadroomGap: number
+  /** Move a session that has been idle this long off an over-threshold seat, or back to the
+   *  preferred seat. 0 = off. */
+  autoSwapIdleAfterSeconds: number
+  /** Comma-separated seats never switched *to* automatically (same tokens as `chain`). */
+  exclude: string
   autoSwitchOnRateLimit: boolean
   autoResume: boolean
   autoMessage: string
@@ -128,6 +140,11 @@ export const DEFAULT_CONFIG: Config = {
   thresholdSevenDay: 100,
   strategy: 'drain',
   autoSwitchOnThreshold: true,
+  switchBack: true,
+  switchCooldownMinutes: 5,
+  minHeadroomGap: 10,
+  autoSwapIdleAfterSeconds: 900,
+  exclude: '',
   autoSwitchOnRateLimit: true,
   autoResume: true,
   autoMessage: 'Go continue.',
@@ -155,6 +172,8 @@ export type RotatorState = {
   modelStep: Record<string, number>
   waiting: WaitingEntry[]
   history: HistoryEntry[]
+  /** Last automatic selection change per provider (for the switch cooldown). */
+  lastAutoSwitchAt?: Partial<Record<Provider, number>>
 }
 
 export const HISTORY_CAP = 1000
@@ -168,7 +187,8 @@ export function emptyState(): RotatorState {
     apiRetries: {},
     modelStep: {},
     waiting: [],
-    history: []
+    history: [],
+    lastAutoSwitchAt: {}
   }
 }
 

@@ -6,7 +6,7 @@ import * as fx from './fixtures'
 import { activateWith, statusText } from './worker'
 import type { RotatorState } from './types'
 
-type Pane = { terminalId: string; agent: string; state: 'working' | 'waiting' | 'done' | 'blocked'; sessionId?: string; title?: string }
+type Pane = { terminalId: string; agent: string; state: 'working' | 'waiting' | 'done' | 'blocked'; sessionId?: string; title?: string; stateStartedAt?: number }
 
 function world(options: {
   panes: Pane[]
@@ -24,6 +24,8 @@ function world(options: {
   redraw?: boolean | 'late'
   /** Live Orca refuses plugin sends outside the focused workspace. */
   refuseHostSend?: boolean
+  /** `orca account select` fails for these account ids. */
+  failSelect?: string[]
 }) {
   let clock = 1_000_000
   let claudeActive: string | null = 'c1'
@@ -48,6 +50,7 @@ function world(options: {
     },
     async select(provider, accountId) {
       cliCalls.push(`select ${provider} ${accountId}`)
+      if (options.failSelect?.includes(accountId)) throw new Error(`account ${accountId} needs sign-in`)
       if (provider === 'claude') claudeActive = accountId === 'system' ? null : accountId
       if (provider === 'codex') codexActive = accountId === 'system' ? null : accountId
     },
@@ -131,6 +134,11 @@ function world(options: {
     },
     advance(ms: number) {
       clock += ms
+    },
+    /** The pane's state changed now (live: `stateStartedAt` moves with every turn). */
+    touch(terminalId: string) {
+      const p = panes.find((x) => x.terminalId === terminalId)
+      if (p) p.stateStartedAt = clock
     },
     async mount() {
       const worker = await mountWorker(mod, { host })
@@ -541,6 +549,7 @@ test('review: a parked session the user went on with is not closed and resumed a
   assert.equal((w.host.data().storage.state as RotatorState).waiting.length, 1)
   // The limit lifted early; the user typed in the parked pane and the agent finished a turn.
   w.tails.t1!.push('❯ carry on', '⏺ Done.', '  All 12 tests pass.', '  Nothing else is left to do.', '  The branch is ready for review.', '  See the summary above.')
+  w.touch('t1')
   await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
   assert.equal((w.host.data().storage.state as RotatorState).waiting.length, 0)
   w.advance(11 * 60_000)
@@ -563,7 +572,7 @@ test('review: every account over a threshold does not rotate (and type) forever'
   const worker = await w.mount()
   // Each resumed pane ends its turn on an account that is over the threshold too.
   for (const id of ['t1', 't2', 't3', 't4', 't5']) {
-    w.advance(61_000) // past the usage poll interval: Orca's numbers for the new account are in
+    w.advance(6 * 60_000) // past the usage poll interval and the selection cooldown
     if (w.panes.some((p) => p.terminalId === id)) await worker.emit('agent.status.changed', statusEvent(id, 'waiting'))
   }
   // c1 → c2 → c3, then it stays: c1 and c2 are still over until their windows reset.
@@ -572,6 +581,112 @@ test('review: every account over a threshold does not rotate (and type) forever'
   const state = w.host.data().storage.state as RotatorState
   assert.equal(state.health['claude:c1']?.cooldownUntil, 1_000_000 + 3_600_000)
   assert.equal(state.waiting.length, 0)
+  await worker.deactivate()
+})
+
+test('switch back: once the first account resets, new launches use it and a pane moves back at turn end', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { auto_swap_idle_after_seconds: 0 }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  // Still limited: nothing moves back.
+  w.advance(2 * 60_000)
+  await w.rotator.tick()
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  // Two days later every window has reset: c1 is preferred again.
+  w.advance(48 * 3_600_000)
+  await w.rotator.tick()
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c1'])
+  let state = w.host.data().storage.state as RotatorState
+  assert.deepEqual(state.history.at(-1), { ...state.history.at(-1), reason: 'switch_back', result: 'selected', from: 'claude:c2', to: 'claude:c1' })
+  // Idle moves are off: the pane stays on c2 until it ends a turn.
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
+  assert.equal(w.host.callsOf('agent.resume').length, 2)
+  assert.deepEqual(w.host.callsOf('terminal.close').map((c: any) => c.terminalId), ['t1', 't2'])
+  assert.deepEqual(w.typed.at(-1), { terminalId: 't3', text: 'Go continue.' })
+  state = w.host.data().storage.state as RotatorState
+  assert.equal(state.paneSeat.t3, 'claude:c1')
+  assert.equal(state.history.at(-1)?.reason, 'switch_back')
+  assert.equal(state.history.at(-1)?.result, 'resumed')
+  // Nothing further to do on the next tick.
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 2)
+  await worker.deactivate()
+})
+
+test('switch back: an idle pane on the backup account moves without waiting for a turn', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  w.advance(48 * 3_600_000)
+  await w.rotator.tick()
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c1'])
+  assert.equal(w.host.callsOf('agent.resume').length, 2)
+  assert.deepEqual(w.typed.at(-1), { terminalId: 't3', text: 'Go continue.' })
+  assert.equal((w.host.data().storage.state as RotatorState).paneSeat.t3, 'claude:c1')
+  await worker.deactivate()
+})
+
+test('switch back is off for balanced, and never closes a pane with unsent text', async () => {
+  const balanced = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { strategy: 'balanced' }
+  })
+  let worker = await balanced.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  balanced.advance(48 * 3_600_000)
+  await balanced.rotator.tick()
+  assert.equal(balanced.cliCalls.filter((c) => c.startsWith('select')).length, 1)
+  await worker.deactivate()
+
+  const draft = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT }
+  })
+  worker = await draft.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  draft.tails.t2 = ['⏺ Done.', '╭──────────────╮', '│ > also update the docs', '╰──────────────╯']
+  draft.advance(48 * 3_600_000)
+  await draft.rotator.tick()
+  // The selection moved back, the pane with the draft did not.
+  assert.deepEqual(draft.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c1'])
+  assert.equal(draft.host.callsOf('agent.resume').length, 1)
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
+  assert.equal(draft.host.callsOf('agent.resume').length, 1)
+  // Draft sent: the next turn end moves it.
+  draft.tails.t2 = ['❯ also update the docs', '⏺ Updated README.md.', '╭──────────────╮', '│ >', '╰──────────────╯']
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 3))
+  assert.equal(draft.host.callsOf('agent.resume').length, 2)
+  await worker.deactivate()
+})
+
+test('a seat that fails to switch is skipped for ten minutes; the rotation moves on', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    failSelect: ['c2']
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  let state = w.host.data().storage.state as RotatorState
+  assert.equal(state.history.at(-1)?.result, 'failed')
+  assert.equal(state.health['claude:c2']?.cooldownUntil, 1_000_000 + 10 * 60_000)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  // The banner is printed again: c2 is skipped, c3 taken.
+  w.tails.t1!.push('❯ Go continue.', '  ⎿  5-hour limit reached ∙ resets 3pm')
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c3'])
+  state = w.host.data().storage.state as RotatorState
+  assert.equal(state.history.at(-1)?.result, 'resumed')
   await worker.deactivate()
 })
 

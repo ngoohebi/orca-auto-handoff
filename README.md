@@ -31,6 +31,9 @@ reads tokens or keychains.
 | Auth failure | 12 h cooldown on that seat, switch |
 | A turn ends while the seat is over a threshold | Switch (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets |
 | Every seat limited | Park; wake when the earliest seat frees up (*Wait for reset*). Carry on in the parked pane yourself and the wait ends |
+| A higher-priority account is healthy again | **Switch back:** select it for new launches; sessions on lower accounts move back when they finish a turn or sit idle |
+| A session idles on an over-threshold account | Move it after *Move idle sessions after* seconds (900 by default; 0 = off) |
+| `orca account select` fails for an account | Skip that account for 10 minutes, take the next |
 
 Detection runs when a pane turns `done` or `waiting`. A banner only counts when all of these hold:
 
@@ -62,7 +65,26 @@ sessions stay parked. Manual switching from the panel or the commands still work
 shows it as `codex off`. The *Automatic switching* toggle at the top pauses every service at once.
 
 Strategies: **drain** (next account in chain order; the default), **balanced** (most room),
-**priority** (always the first healthy account in the chain), **manual** (never automatic).
+**priority** (always the first healthy account in the chain), **soonest-reset** (the account whose
+weekly window resets first, so expiring usage is spent first), **manual** (never automatic).
+
+**Switch back** (on by default; drain and priority, where the chain is a priority order): once an
+account earlier in the chain is out of cooldown and under its thresholds, the plugin selects it
+again so new launches use it, and moves sessions that are still on lower accounts back to it when
+they finish a turn, or once they have been idle for *Move idle sessions after* seconds. The same
+close → resume → first message as any other swap.
+
+**Guards on advisory moves** (threshold, idle, switch-back; hard limits ignore them):
+
+- a pane whose input box holds unsent text is never closed (the move waits for the next turn end);
+- the target needs at least *Minimum headroom gap* (10 %) more room than the current account when
+  both are known, and an exhausted account may always leave;
+- one provider's selection changes automatically at most once per *Minimum minutes between
+  automatic selection changes* (5), so two accounts near the line never ping-pong. Moving a pane
+  onto the account that is already selected is not a selection change.
+
+**Never switch to:** accounts listed in `exclude` (same tokens as `chain`) are kept out of
+automatic rotation and switch-back; picking them from the panel still works.
 
 ## UI
 
@@ -78,7 +100,8 @@ Strategies: **drain** (next account in chain order; the default), **balanced** (
   another account, pause or resume, refresh usage.
 - **Settings** (Settings → Plugins → Account Rotator): every cux key (`thresholds`, `strategy`,
   `auto_resume`, `auto_message`, `wait_for_reset`, `retry_on_api_error`, `model_fallback`, …) plus
-  `chain`, `default_cooldown_minutes`, `handoff_max_chars` and
+  `chain`, `exclude`, `switch_back`, `switch_cooldown_minutes`, `min_headroom_gap`,
+  `auto_swap_idle_after_seconds`, `default_cooldown_minutes`, `handoff_max_chars` and
   `orca_cli_path`.
 
 `chain` example: `me@example.com, claude:*`. It orders the accounts *within* each service. Accounts
@@ -126,8 +149,21 @@ regression tests:
 These cux features are not in the plugin yet:
 
 - per-directory project bindings (only one global `chain` setting);
-- moving idle sessions off an over-threshold seat (`auto_swap_idle_after_seconds`);
 - `cux attach`.
+
+## Borrowed from elsewhere
+
+- Switch back to a higher-priority account when its window resets: Orca issue
+  [#33193](https://github.com/stablyai/orca/issues/33193), tokenmaxx's return-to-primary, cswap's
+  `priority-consume-first`.
+- Headroom gap and selection cooldown: Orca PR [#28044](https://github.com/stablyai/orca/pull/28044),
+  cswap's hysteresis.
+- Skipping an account that fails to switch, per-account exclusion: Orca PR
+  [#43578](https://github.com/stablyai/orca/pull/43578), cswap `disable`, AgentsRoom "never used as
+  backup".
+- `soonest-reset`: Orca PR [#42856](https://github.com/stablyai/orca/pull/42856), cswap `weekly-first`.
+- Leaving a pane with unsent text alone: Orca issue [#41488](https://github.com/stablyai/orca/issues/41488).
+- Idle-session moves: cux `auto_swap_idle_after_seconds`.
 
 Disable cux's own hooks (`cux uninstall-hooks`) before you enable this plugin, so the two don't
 both rotate.

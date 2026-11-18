@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "account-rotator",
   "name": "Account Rotator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pools Orca's managed agent accounts per service (Claude, Codex, Antigravity, OpenCode, Devin): on a rate limit or usage threshold it switches the pane to another account of the same service and resumes the session. To reach panes outside the focused workspace it also runs the orca CLI (account select, terminal close/send).",
   "author": {
     "name": "ngoohebi",
@@ -113,9 +113,51 @@
           "drain",
           "balanced",
           "priority",
+          "soonest-reset",
           "manual"
         ],
-        "description": "drain: stay on an account until it is limited, then take the next in chain order. balanced: the account with the most room. priority: always the first healthy account in the chain. manual: never switch automatically."
+        "description": "drain: stay on an account until it is limited, then take the next in chain order. balanced: the account with the most room. priority: always the first healthy account in the chain. soonest-reset: the account whose weekly window resets first, so expiring usage is spent first. manual: never switch automatically."
+      },
+      {
+        "key": "switch_back",
+        "title": "Switch back when a higher-priority account resets",
+        "type": "boolean",
+        "default": true,
+        "description": "drain and priority only: once an account earlier in the chain is healthy again, new launches use it and sessions on lower accounts move back when they finish a turn (or sit idle, see below)."
+      },
+      {
+        "key": "switch_cooldown_minutes",
+        "title": "Minimum minutes between automatic selection changes",
+        "type": "integer",
+        "default": 5,
+        "minimum": 0,
+        "maximum": 1440,
+        "description": "Applies to threshold, switch-back and idle moves, so two accounts near the line never ping-pong. Rate limits and auth failures ignore it."
+      },
+      {
+        "key": "min_headroom_gap",
+        "title": "Minimum headroom gap for a threshold move (%)",
+        "type": "integer",
+        "default": 10,
+        "minimum": 0,
+        "maximum": 100,
+        "description": "A threshold move needs a target with at least this many points more room than the current account (when both are known). An exhausted account may always leave."
+      },
+      {
+        "key": "auto_swap_idle_after_seconds",
+        "title": "Move idle sessions after (seconds)",
+        "type": "integer",
+        "default": 900,
+        "minimum": 0,
+        "maximum": 86400,
+        "description": "A session idle this long on an over-threshold account, or on a lower account while a higher-priority one is healthy, is moved. 0 = off. Sessions with unsent text in the input box are left alone."
+      },
+      {
+        "key": "exclude",
+        "title": "Never switch to",
+        "type": "string",
+        "default": "",
+        "description": "Comma-separated accounts that automatic switching never picks (emails, seat keys, or provider:*). Picking them from the panel still works."
       },
       {
         "key": "auto_switch_on_rate_limit",
