@@ -46,10 +46,10 @@ const message = atom<string | null>(null)
 const tab = atom('tab', 'accounts', { persist: 'plugin' })
 /** The Claude console status line in the focused workspace; null until read. */
 const consoleLine = atom<ConsoleLineState | null>(null)
-/** The standby account whose *Switch to this account* is waiting for confirmation. */
+/** The standby account whose *Hand off to this account* is waiting for confirmation. */
 const confirming = atom<string | null>(null)
-/** *Yes, switch* found unsent text in the session that would move: the account it was for and the
- *  text, shown in a second confirmation. Only its *Move anyway* gives the text up. */
+/** *Yes, hand off* found unsent text in the session that would move: the account it was for and the
+ *  text, shown in a second confirmation. Only its *Hand off anyway* gives the text up. */
 const draftAsk = atom<{ seatKey: string; draft: UnsentDraft } | null>(null)
 /** Takes a new snapshot. A project on another server lists other accounts under the same keys,
  *  and has another session in front: a question about unsent text asked before is dropped. */
@@ -68,7 +68,7 @@ function shownDraft(text: string): string {
 }
 
 /** Asks the worker to switch. When the session that would move shows unsent text nothing is
- *  switched and the second confirmation opens instead; `accepted` is the text its *Move anyway*
+ *  switched and the second confirmation opens instead; `accepted` is the text its *Hand off anyway*
  *  gives up, and nothing else passes it. */
 function switchTo(seatKey: string, accepted?: UnsentDraft): Promise<void> {
   let asked = false
@@ -107,7 +107,7 @@ async function load(refresh = false): Promise<void> {
   set(consoleLine, await readConsoleLine())
 }
 
-/** How long *Yes, switch* may take. The worker answers only once the pane in the tab has moved:
+/** How long *Yes, hand off* may take. The worker answers only once the pane in the tab has moved:
  *  it closes the pane and waits for the resumed session (over a minute at worst), and a request
  *  gets 30 s by default, after which a switch that worked would read as failed. */
 const SWITCH_TIMEOUT_MS = 120_000
@@ -387,7 +387,7 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
               <Box border="accent" radius="md" padding="sm" gap="sm">
                 <Text size="sm" weight="medium">{`This session shows unsent text: “${shownDraft(read(draftAsk)!.draft.text)}”.`}</Text>
                 <Text size="xs" muted>
-                  Move it anyway? The text will be cleared.
+                  Hand off anyway? The text will be cleared.
                 </Text>
                 <Row justify="end" gap="xs">
                   <Button size="sm" variant="ghost" onPress={() => set(draftAsk, null)}>
@@ -403,13 +403,13 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
                       if (asked) void switchTo(seat.key, asked.draft)
                     }}
                   >
-                    Move anyway
+                    Hand off anyway
                   </Button>
                 </Row>
               </Box>
             ) : read(confirming) === seat.key ? (
               <Box border="accent" radius="md" padding="sm" gap="sm">
-                <Text size="sm" weight="medium">{`Use ${seat.label} for ${name}?`}</Text>
+                <Text size="sm" weight="medium">{`Hand off ${name} to ${seat.label}?`}</Text>
                 <Text size="xs" muted>
                   New {name} sessions will start on this account.
                 </Text>
@@ -432,7 +432,7 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
                       void switchTo(seat.key)
                     }}
                   >
-                    Yes, switch
+                    Yes, hand off
                   </Button>
                 </Row>
               </Box>
@@ -442,7 +442,7 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
                   size="sm"
                   variant="outline"
                   icon="next"
-                  tooltip={`Use this account for ${name} now, instead of waiting for auto hand-off`}
+                  tooltip={`Hand ${name} off to this account now, instead of waiting for auto hand-off`}
                   disabled={read(busy) !== null}
                   onPress={() => {
                     // One question at a time: an older one about unsent text is dropped.
@@ -450,7 +450,7 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
                     set(confirming, seat.key)
                   }}
                 >
-                  Switch to this account
+                  Hand off to this account
                 </Button>
               </Row>
             )}

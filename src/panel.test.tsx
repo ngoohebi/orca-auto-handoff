@@ -183,7 +183,7 @@ test('a service with a single account shows no auto hand-off toggle', async () =
   assert.ok(view.find({ text: 'plus@example.test' }))
 })
 
-test('a standby offers "Switch to this account", asks first in plain words, and the block then says automatic hand-off is off', async () => {
+test('a standby offers "Hand off to this account", asks first in plain words, and the block then says automatic hand-off is off', async () => {
   const calls: string[] = []
   let auto = true
   const seats: Snapshot['seats'] = [
@@ -203,27 +203,27 @@ test('a standby offers "Switch to this account", asks first in plain words, and 
   })
   const view = await mount(panel, { host })
   // Only the standby can be chosen; the account in use has no such button.
-  assert.equal(view.findAll({ text: 'Switch to this account' }).length, 1)
-  assert.ok(!view.find({ text: /Use spare@example.test for Claude/ }))
+  assert.equal(view.findAll({ text: 'Hand off to this account' }).length, 1)
+  assert.ok(!view.find({ text: /Hand off Claude to spare@example.test/ }))
   assert.ok(!view.find({ text: /Automatic hand-off for Claude is off/ }))
-  await view.press({ text: 'Switch to this account' })
-  assert.ok(view.find({ text: 'Use spare@example.test for Claude?' }))
+  await view.press({ text: 'Hand off to this account' })
+  assert.ok(view.find({ text: 'Hand off Claude to spare@example.test?' }))
   assert.ok(view.find({ text: 'New Claude sessions will start on this account.' }))
   assert.ok(view.find({ text: 'The session in this tab moves too if it is idle; a busy one stays where it is.' }))
   assert.ok(view.find({ text: "Auto hand-off for Claude turns off, so it won't switch back on its own." }))
   // Cancel backs out without switching.
   await view.press({ text: 'Cancel' })
-  assert.ok(!view.find({ text: /Use spare@example.test for Claude/ }))
+  assert.ok(!view.find({ text: /Hand off Claude to spare@example.test/ }))
   assert.deepEqual(calls, [])
-  await view.press({ text: 'Switch to this account' })
-  await view.press({ text: 'Yes, switch' })
+  await view.press({ text: 'Hand off to this account' })
+  await view.press({ text: 'Yes, hand off' })
   assert.deepEqual(calls, ['switch claude:b'])
   assert.ok(view.find({ text: /new launches use/ }))
   assert.ok(view.find({ text: /Automatic hand-off for Claude is off/ }))
   assert.equal(view.valueOf({ label: 'Auto hand-off Claude' }), false)
 })
 
-test('"Yes, switch" on a session with unsent text asks once more, with the text; only "Move anyway" gives it up', async () => {
+test('"Yes, hand off" on a session with unsent text asks once more, with the text; only "Hand off anyway" gives it up', async () => {
   const LONG = `please also update the docs ${'and the changelog '.repeat(8)}`.trim()
   const calls: unknown[] = []
   let shown = { terminalId: 't1', text: 'keep going' }
@@ -246,32 +246,32 @@ test('"Yes, switch" on a session with unsent text asks once more, with the text;
     }
   })
   const view = await mount(panel, { host })
-  await view.press({ text: 'Switch to this account' })
-  await view.press({ text: 'Yes, switch' })
+  await view.press({ text: 'Hand off to this account' })
+  await view.press({ text: 'Yes, hand off' })
   assert.deepEqual(calls, [{ seatKey: 'claude:b' }])
   // The second confirmation, in the same block, with the text.
   assert.ok(view.find({ text: 'This session shows unsent text: “keep going”.' }))
-  assert.ok(view.find({ text: 'Move it anyway? The text will be cleared.' }))
-  assert.ok(view.find({ text: 'Move anyway' }))
-  assert.ok(!view.find({ text: 'Yes, switch' }))
+  assert.ok(view.find({ text: 'Hand off anyway? The text will be cleared.' }))
+  assert.ok(view.find({ text: 'Hand off anyway' }))
+  assert.ok(!view.find({ text: 'Yes, hand off' }))
   assert.ok(!view.find({ text: /nothing was switched/ }))
   // Cancel does nothing: no further request, and the button is back.
   await view.press({ text: 'Cancel' })
   assert.equal(calls.length, 1)
   assert.ok(!view.find({ text: /This session shows unsent text/ }))
-  assert.ok(view.find({ text: 'Switch to this account' }))
+  assert.ok(view.find({ text: 'Hand off to this account' }))
   assert.equal(view.valueOf({ label: 'Auto hand-off Claude' }), true)
-  // Again; the text changes before "Move anyway": the worker asks again, the panel shows the new
+  // Again; the text changes before "Hand off anyway": the worker asks again, the panel shows the new
   // text (cut to 80 characters), and nothing has moved.
-  await view.press({ text: 'Switch to this account' })
-  await view.press({ text: 'Yes, switch' })
+  await view.press({ text: 'Hand off to this account' })
+  await view.press({ text: 'Yes, hand off' })
   shown = { terminalId: 't1', text: LONG }
-  await view.press({ text: 'Move anyway' })
+  await view.press({ text: 'Hand off anyway' })
   assert.deepEqual(calls.at(-1), { seatKey: 'claude:b', acceptDraft: true, draft: { terminalId: 't1', text: 'keep going' } })
   assert.ok(view.find({ text: `This session shows unsent text: “${LONG.slice(0, 80)}…”.` }))
   assert.ok(!view.find({ text: /this pane moved/ }))
-  // "Move anyway" sends the explicit acceptance with the whole text it showed.
-  await view.press({ text: 'Move anyway' })
+  // "Hand off anyway" sends the explicit acceptance with the whole text it showed.
+  await view.press({ text: 'Hand off anyway' })
   assert.deepEqual(calls.at(-1), { seatKey: 'claude:b', acceptDraft: true, draft: { terminalId: 't1', text: LONG } })
   assert.equal(calls.length, 4)
   assert.ok(view.find({ text: /this pane moved \(resumed\)/ }))
@@ -299,16 +299,16 @@ test('the question about unsent text is dropped when the focus moves to a projec
     }
   })
   const view = await mount(panel, { host })
-  await view.press({ text: 'Switch to this account' })
-  await view.press({ text: 'Yes, switch' })
-  assert.ok(view.find({ text: 'Move anyway' }))
+  await view.press({ text: 'Hand off to this account' })
+  await view.press({ text: 'Yes, hand off' })
+  assert.ok(view.find({ text: 'Hand off anyway' }))
   await view.post('rotator.changed', snapshot({ server: 'ssh:studio', seats: seats.map((s) => ({ ...s, label: `remote-${s.label}` })) }))
-  assert.ok(!view.find({ text: 'Move anyway' }))
+  assert.ok(!view.find({ text: 'Hand off anyway' }))
   assert.ok(!view.find({ text: /This session shows unsent text/ }))
-  assert.ok(view.find({ text: 'Switch to this account' }))
+  assert.ok(view.find({ text: 'Hand off to this account' }))
   // Back on this computer it is not there again either.
   await view.post('rotator.changed', snapshot({ seats }))
-  assert.ok(!view.find({ text: 'Move anyway' }))
+  assert.ok(!view.find({ text: 'Hand off anyway' }))
   assert.equal(calls.length, 1)
   await view.unmount()
 })
@@ -332,7 +332,7 @@ const twoClaude: Snapshot['seats'] = [
   { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'spare@example.test', active: false, usage: { known: true, session: { usedPercent: 5, resetsAt: NOW + 3_600_000 } } }
 ]
 
-test('"Yes, switch" that worked says so even when the list cannot be read again; only a switch that failed says Failed', async () => {
+test('"Yes, hand off" that worked says so even when the list cannot be read again; only a switch that failed says Failed', async () => {
   let reads = 0
   let refuse = false
   const host = mockHost({
@@ -350,19 +350,19 @@ test('"Yes, switch" that worked says so even when the list cannot be read again;
     }
   })
   const view = await mount(panel, { host })
-  await view.press({ text: 'Switch to this account' })
-  await view.press({ text: 'Yes, switch' })
+  await view.press({ text: 'Hand off to this account' })
+  await view.press({ text: 'Yes, hand off' })
   assert.equal(reads, 2)
   // The switch's own result, then the reload problem, calmly and apart from it.
   assert.ok(view.find({ text: "Claude: new launches use spare@example.test; this pane moved (resumed). Couldn't refresh the list; it updates shortly." }))
   assert.equal(view.findAll({ text: /Failed/ }).length, 0)
   assert.equal(view.findAll({ text: /worker restarting/ }).length, 0)
   // The controls work again.
-  assert.equal(view.find({ text: 'Switch to this account' })?.disabled, false)
+  assert.equal(view.find({ text: 'Hand off to this account' })?.disabled, false)
   // A switch that itself failed is still reported as failed, with its own error.
   refuse = true
-  await view.press({ text: 'Switch to this account' })
-  await view.press({ text: 'Yes, switch' })
+  await view.press({ text: 'Hand off to this account' })
+  await view.press({ text: 'Yes, hand off' })
   assert.ok(view.find({ text: 'Failed: orca account select failed' }))
   assert.equal(view.findAll({ text: /Couldn't refresh/ }).length, 0)
   assert.deepEqual(view.errors, [])
@@ -422,7 +422,7 @@ test('a first read that fails is not an unhandled error: the worker\u2019s next 
   await view.unmount()
 })
 
-test('"Yes, switch" gives the worker longer than the 30 s a request gets by default: moving the pane waits for the resumed session', async () => {
+test('"Yes, hand off" gives the worker longer than the 30 s a request gets by default: moving the pane waits for the resumed session', async () => {
   const host = mockHost({
     requests: {
       'rotator.snapshot': () => snapshot({ seats: twoClaude }),
@@ -431,8 +431,8 @@ test('"Yes, switch" gives the worker longer than the 30 s a request gets by defa
     }
   })
   const view = await mount(panel, { host })
-  await view.press({ text: 'Switch to this account' })
-  await view.press({ text: 'Yes, switch' })
+  await view.press({ text: 'Hand off to this account' })
+  await view.press({ text: 'Yes, hand off' })
   const call = (host.callsOf('plugin.request') as { name: string; timeoutMs?: number }[]).find((c) => c.name === 'rotator.switchTo')
   // The worker closes the pane (up to 10 s) and waits for the resumed session (up to 60 s) before
   // it answers; a request that timed out would read as a failed switch that in fact worked.

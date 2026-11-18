@@ -1478,7 +1478,7 @@ test('manual switch: text that changed since it was shown, or another pane\u2019
   const w = idleInTab({ drafts })
   const worker = await w.mount()
   const first = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
-  // The user typed on before pressing *Move anyway*.
+  // The user typed on before pressing *Hand off anyway*.
   drafts.t1 = 'also update the docs and the changelog'
   const second = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', acceptDraft: true, draft: first.draft! })
   assert.deepEqual(second.draft, { terminalId: 't1', text: 'also update the docs and the changelog' })

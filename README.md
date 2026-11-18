@@ -198,10 +198,10 @@ included: a pane whose input box holds unsent text is never closed. An advisory 
 and considered again at the next turn end or idle check; a limit move stays pending until the
 text is sent or cleared (see the table above). The *Move this workspace's agent to another
 account* command leaves such a pane alone as well, and says so. The panel's *Switch to this
-account* asks instead: after *Yes, switch* it changes nothing and shows a second confirmation in
-the same block, "This session shows unsent text: “…”. Move it anyway? The text will be cleared.",
+account* asks instead: after *Yes, hand off* it changes nothing and shows a second confirmation in
+the same block, "This session shows unsent text: “…”. Hand off anyway? The text will be cleared.",
 with the text (the first 80 characters). *Cancel* leaves everything as it was: no account is
-selected and the session stays. Only *Move anyway* moves the session, and the text is lost with
+selected and the session stays. Only *Hand off anyway* moves the session, and the text is lost with
 the closed pane. The answer covers only the session and the text that were shown: if the text
 changed meanwhile, the panel asks again with what is there now. No automatic move ever gives text up this
 way, and the answer lifts no other guard: like every other move, these never close a pane that
@@ -279,7 +279,7 @@ and these are ignored.
   made this way (or with the commands) is not changed again by advice (switch-back, a Low
   account, expiring quota) until the switch cooldown has passed; a limit is still handled at
   once. With switch-back on, the plugin then returns to the earlier account in your order: use
-  the panel's *Switch to this account* for a choice that stays.
+  the panel's *Hand off to this account* for a choice that stays.
 - **Panel** (gauge icon, right sidebar), laid out after Orca's own style guide (quiet and
   monochrome, colour only for state):
   - one section per service, in Orca's order except that the service of the agent in the current
@@ -298,12 +298,12 @@ and these are ignored.
     ready, amber low, red limited or drained, grey idle), its 5-hour, weekly and model windows as
     "% left" plus the reset time on the same bar Orca's account switcher draws (green, yellow
     from 80 % used, red from 90 %), and *Clear* on a cooldown;
-  - on each standby account, *Switch to this account*, which asks first: new sessions of that
+  - on each standby account, *Hand off to this account*, which asks first: new sessions of that
     service start on it, and the session in the current tab moves there too when it is between
     turns, whatever the headroom of the account you chose. A pane that is working keeps its
     account, and the panel says so; it is not moved later. When the session shows unsent text,
     nothing is switched yet and the block asks once more, showing the text: *Cancel* changes
-    nothing, *Move anyway* moves the session and the text is cleared. This move is yours, so it also happens with *Running sessions*
+    nothing, *Hand off anyway* moves the session and the text is cleared. This move is yours, so it also happens with *Running sessions*
     on `launches` or `auto_resume` off. Automatic hand-off for that service turns off as soon as the
     account is selected, so
     the plugin never undoes a choice you made by hand: no switch-back, no threshold or limit
@@ -561,15 +561,15 @@ most are rare.
   way as text you typed, so the plugin cannot tell the two apart and plays safe. A suggestion
   therefore still holds back automatic early moves: an early, idle, switch-back or
   expiring-quota move of that pane is skipped, and the move command says the pane "has unsent
-  text" and leaves it. The panel's *Switch to this account* asks instead: it shows the text and
-  moves the session only after *Move anyway*. A real limit is not affected as far as known:
+  text" and leaves it. The panel's *Hand off to this account* asks instead: it shows the text and
+  moves the session only after *Hand off anyway*. A real limit is not affected as far as known:
   Claude is not known to show a suggestion after a turn that failed on a limit. To get the
   automatic moves, turn *Prompt suggestions* off in Claude Code (`/config`).
 - **No Claude hint is ignored yet.** Any fixed line Claude Code shows in an empty input box is
   treated as unsent text, like a suggestion, until a wording is confirmed harmless. "Press up to
   edit queued messages" is never ignored, because it means queued messages are waiting.
 - **With unsent text showing, the panel cannot select an account for new launches only.**
-  *Switch to this account* then either moves the session in the tab (*Move anyway*) or changes
+  *Hand off to this account* then either moves the session in the tab (*Hand off anyway*) or changes
   nothing (*Cancel*). Change tabs, or use Orca's own account switcher, to select the account
   without moving that session.
 - **Banner wordings are not all confirmed.** Only some limit messages were captured from the real
@@ -592,7 +592,7 @@ most are rare.
 - **Split terminal groups.** Orca does not tell plugins which pane has the keyboard. With two
   groups side by side, "the session in this tab" can be the agent of the same service shown in
   the other group.
-- **At 1,000 history entries** (the most kept), the move command and *Switch to this account* can
+- **At 1,000 history entries** (the most kept), the move command and *Hand off to this account* can
   answer "nothing to do" or "keeps its account" after a move that did happen. The move and the
   History list are right.
 - **`custom` mode with `auto_resume` off and a threshold below 100:** you are told "new launches
@@ -611,7 +611,7 @@ does not say whether a pane's input box holds unsent text (`terminal read` does;
 field is used, and that text is only shown to you in the panel's second confirmation, never
 stored or logged), and does not say which terminal tab is in front (`terminal list
 --include-visual-layouts` does; read-only, for the panel's *this terminal* mark and for the pane
-*Switch to this account* moves).
+*Hand off to this account* moves).
 
 For a project on a paired Orca server the worker loads Orca's own runtime client from the app
 bundle (`app.asar.unpacked/out/cli/runtime/client.js`) and calls that server's `accounts.*` RPCs

@@ -33,7 +33,7 @@ declare module 'orca' {
      *  terminal's pane when it runs that service and is between turns, and turn the service's
      *  automatic hand-off off so the choice is never undone; the panel offers the toggle. */
     /** When the pane that would move shows unsent text, nothing is switched and the text comes
-     *  back as `draft`, with the pane it is in: the panel asks, and only its *Move anyway* sends
+     *  back as `draft`, with the pane it is in: the panel asks, and only its *Hand off anyway* sends
      *  the request again with `acceptDraft: true` and that same `draft`. The pane then moves only
      *  while it is that pane and its text is still exactly that; other text comes back as
      *  `draft` again. */
