@@ -148,3 +148,25 @@ test('the unsent text itself is read from the box; queued messages are never tak
     assert.equal(isClaudeHint(typed), false, typed)
   }
 })
+
+test('Claude: "You\'ve hit your Opus limit" is a model cap naming the model; "reached your usage limit" is a rate limit', () => {
+  const opus = classify('claude', ['⏺ Reading files', "  ⎿  You've hit your Opus limit ∙ resets Mon 9am", '     /model to switch models'], NOW)
+  assert.equal(opus?.kind, 'model_cap')
+  assert.equal(opus?.model, 'opus')
+  assert.ok(opus!.resetsAt! > NOW)
+  // As an unindented system line too, and for the other models.
+  assert.equal(classify('claude', ["You've hit your Sonnet weekly limit"], NOW)?.model, 'sonnet')
+  const usage = classify('claude', ['⏺ Working on it', "  ⎿  You've reached your usage limit ∙ resets 3pm", '     /upgrade to increase your usage limit.'], NOW)
+  assert.equal(usage?.kind, 'rate_limit')
+  assert.equal(new Date(usage!.resetsAt!).getHours(), 15)
+  assert.equal(classify('claude', ["You've reached your weekly limit"], NOW)?.kind, 'rate_limit')
+  // Prose that mentions them is no limit: Claude's own reply, its indented continuation, a typed prompt.
+  for (const words of ["You've hit your Opus limit", "You've reached your usage limit"]) {
+    assert.equal(classify('claude', [`⏺ The banner would read: ${words}`], NOW), null, words)
+    assert.equal(classify('claude', ['⏺ The adapter looks for this text:', `     ${words}`, '  Done.'], NOW), null, words)
+    assert.equal(classify('claude', [`❯ what happens when it says "${words}"?`, '⏺ It moves to the next account.'], NOW), null, words)
+  }
+  // A banner that scrolled out of the latest output no longer counts.
+  const old = ['⏺ Reading files', "  ⎿  You've hit your Opus limit", ...Array.from({ length: 20 }, (_, i) => `⏺ step ${i}`)]
+  assert.equal(classify('claude', old, NOW), null)
+})

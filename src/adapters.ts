@@ -38,12 +38,13 @@ const CLAUDE: Adapter = {
     },
     {
       kind: 'model_cap',
-      re: /\b(opus|sonnet|fable|haiku)\b[^\n]{0,40}\blimit (reached|hit)|reached your (opus|sonnet|fable|haiku) (weekly )?limit/i,
+      // "Fable weekly limit reached", "You've reached your Opus limit", "You've hit your Opus limit".
+      re: /\b(opus|sonnet|fable|haiku)\b[^\n]{0,40}\blimit (reached|hit)|(?:reached|hit) your (opus|sonnet|fable|haiku) (weekly )?limit/i,
       model: (m) => (m[1] ?? m[3])?.toLowerCase()
     },
     {
       kind: 'rate_limit',
-      re: /(usage limit reached|(session|weekly|5-hour|five-hour|usage) limit (reached|hit)|hit your (session |weekly |usage )?limit|out of extra usage|rate_limit_error|limit will reset at)/i
+      re: /(usage limit reached|(session|weekly|5-hour|five-hour|usage) limit (reached|hit)|(hit|reached) your (session |weekly |usage )?limit|out of extra usage|rate_limit_error|limit will reset at)/i
     },
     {
       kind: 'api_error',

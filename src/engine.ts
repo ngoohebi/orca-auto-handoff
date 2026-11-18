@@ -71,8 +71,10 @@ export type Cli = {
    *  catalog when local `workspace.list` / `project.list` does not carry the paired server's rows. */
   workspaceServer?(workspaceId?: string): Promise<string | undefined>
   /** The text typed in a pane's input box and not sent, as Orca reports it (`draft` of `orca
-   *  terminal read --json`); undefined when there is none, or this Orca does not say. */
-  draft?(terminalId: string, server?: string): Promise<string | undefined>
+   *  terminal read --json`); `''` when Orca answered and reports none. It throws when the read
+   *  fails or times out, and gives `undefined` when the answer is not usable: either way nobody
+   *  knows what the box holds, and the pane is treated as possibly holding unsent text. */
+  draft(terminalId: string, server?: string): Promise<string | undefined>
 }
 
 export type Deps = {
@@ -223,6 +225,14 @@ function hostFromWorkspaceIdentity(id: string | null | undefined): string | unde
 }
 
 type ServerView = { view: AccountView; at: number; error?: string }
+
+/** Orca could not say what a pane's input box holds. Never taken for an empty box: whatever
+ *  would close the pane or type into it treats it as unsent text. */
+const UNCHECKED: unique symbol = Symbol('unchecked')
+type Unsent = string | null | typeof UNCHECKED
+
+/** Said wherever a move did not happen because Orca could not be asked about the pane. */
+const NOT_CHECKED = 'Orca could not be asked whether the session is between turns with an empty input box'
 
 /** The stored key of what is remembered per account or per service (`health`, `leftLow`,
  *  `lastAutoSwitchAt`, `probation`): the bare key on this computer, as it always was, and
@@ -997,6 +1007,15 @@ export class Rotator {
     // it is a resumed pane that has not redrawn its transcript yet (live: the redraw can come
     // after the pane reports ready); forgetting the banner then would make the redraw look new.
     if (truncated || lines.length >= 80) this.recount(key, lines)
+    if (observeOnly || !config.services[pane.agent]) {
+      // Paused or service off: record what is on screen without acting on it. This comes before
+      // everything that notifies or writes History, the SSH-target note below included.
+      if (signal && this.isNew(key, signal)) {
+        this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences, line: signal.line }
+        await this.save()
+      }
+      return
+    }
     if (pane.sshHost && signal?.kind !== 'api_error') {
       // The agent runs on a direct SSH target with that machine's own login. This Orca's managed
       // accounts neither apply there nor can be selected there, so the pane is left alone; a
@@ -1010,14 +1029,6 @@ export class Rotator {
         this.deps.log(`${pane.agent} ${pane.terminalId}: ${signal.kind} — ${detail}`)
         await this.deps.notify('Auto Hand-off', `${PROVIDER_NAME[pane.agent]} hit a limit on SSH target ${pane.sshHost}; Orca manages no accounts there, so the pane was left alone.`)
         this.publishNow()
-      }
-      return
-    }
-    if (observeOnly || !config.services[pane.agent]) {
-      // Paused or service off: record what is on screen without acting on it.
-      if (signal && this.isNew(key, signal)) {
-        this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences, line: signal.line }
-        await this.save()
       }
       return
     }
@@ -1114,7 +1125,8 @@ export class Rotator {
       this.deps.log(`${pane.agent} ${pane.terminalId}: the API error is no longer its latest output, not retrying`)
       return this.inspect(pane)
     }
-    if (await this.unsent(pane.terminalId, pane.server, screen.lines)) return this.leftForDraft(pane, 'api_error', 'the API error was not retried')
+    const box = await this.unsentText(pane.terminalId, pane.server, screen.lines)
+    if (box !== null) return this.leftForDraft(pane, 'api_error', 'the API error was not retried', box === UNCHECKED)
     await this.type(pane.terminalId, config.autoMessage || 'continue', pane.server)
     this.record({ provider: pane.agent, terminalId: pane.terminalId, reason: 'api_error', result: 'retried', detail: `attempt ${attempt + 1}` })
     await this.save()
@@ -1123,11 +1135,16 @@ export class Rotator {
 
   /** Typing into a pane sends whatever is in its input box: with unsent text there, nothing is
    *  typed. Noted in the history and said once, so the user knows why the pane stays as it is. */
-  private async leftForDraft(pane: PaneInfo, reason: 'api_error' | 'model_cap', what: string): Promise<void> {
-    this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not typing into it`)
-    this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', detail: 'unsent text in the input box' })
+  private async leftForDraft(pane: PaneInfo, reason: 'api_error' | 'model_cap', what: string, unchecked = false): Promise<void> {
+    this.deps.log(`${pane.agent} ${pane.terminalId}: ${unchecked ? 'could not check the input box' : 'unsent text in the input box'}, not typing into it`)
+    this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', detail: unchecked ? 'could not check the input box' : 'unsent text in the input box' })
     await this.save()
-    await this.deps.notify('Auto Hand-off', `${PROVIDER_NAME[pane.agent]}: the session has unsent text in its input box, so ${what}. It is left for you to continue.`)
+    await this.deps.notify(
+      'Auto Hand-off',
+      unchecked
+        ? `${PROVIDER_NAME[pane.agent]}: Orca could not be asked whether the session has unsent text in its input box, so ${what}. It is left for you to continue.`
+        : `${PROVIDER_NAME[pane.agent]}: the session has unsent text in its input box, so ${what}. It is left for you to continue.`
+    )
     this.publishNow()
   }
 
@@ -1149,9 +1166,10 @@ export class Rotator {
     const step = this.state.modelStep[pane.terminalId] ?? 0
     if (!adapter.modelSwitch || step >= models.length) return false
     const model = models[step]!
-    if (await this.unsent(pane.terminalId, pane.server, lines)) {
+    const box = await this.unsentText(pane.terminalId, pane.server, lines)
+    if (box !== null) {
       // `/model …` and the first message would both send the user's unsent text.
-      await this.leftForDraft(pane, 'model_cap', `the model was not switched to ${model}`)
+      await this.leftForDraft(pane, 'model_cap', `the model was not switched to ${model}`, box === UNCHECKED)
       return true
     }
     // Looking for unsent text asks Orca (live: a CLI process), and Smart read the accounts before
@@ -1273,9 +1291,12 @@ export class Rotator {
       // A manual move works under the manual strategy too.
       const config: Config = reason === 'manual' && base.strategy === 'manual' ? { ...base, strategy: 'drain' } : base
       const advisory = reason === 'threshold' || reason === 'idle'
+      // Advice never starts a session over: see `resumes`.
+      if (advisory && config.autoResume && !this.resumes(pane)) return
       // The user may have gone on in the pane while this waited behind another move: a turn that
-      // runs is never closed. Its end is a new event. (Advice checks this in `advisoryOk`.)
-      if (reason !== 'manual' && !advisory && (await this.midTurn(pane))) {
+      // runs is never closed. Its end is a new event. (Advice checks this in `advisoryOk`.) When
+      // Orca cannot say, the move goes on to `moveTo`, which holds it until Orca can.
+      if (reason !== 'manual' && !advisory && (await this.turnState(pane)) === 'busy') {
         this.deps.log(`${pane.agent} ${pane.terminalId}: in the middle of a turn again, not moving it`)
         return
       }
@@ -1395,6 +1416,7 @@ export class Rotator {
     await this.withLock(pane.agent, async () => {
       if (!(await this.allowed(pane.agent))) return
       const config = await this.deps.config()
+      if (config.autoResume && !this.resumes(pane)) return
       const view = await this.accountsFor(pane.server)
       const now = this.deps.now()
       if (this.probation(pane.agent, now, pane.server)) return
@@ -1491,11 +1513,33 @@ export class Rotator {
     return null
   }
 
-  /** Is the pane in the middle of a turn right now? False when Orca cannot say. */
-  private async midTurn(pane: PaneInfo): Promise<boolean> {
-    const { agents } = await this.deps.host.call('agents.list', { workspaceId: pane.workspaceId }).catch(() => ({ agents: [] as any[] }))
+  /** Is the pane in the middle of a turn right now? `unknown` when Orca cannot list the agents:
+   *  that is never taken for "between turns". */
+  private async turnState(pane: Pick<PaneInfo, 'terminalId' | 'workspaceId'>): Promise<'busy' | 'idle' | 'unknown'> {
+    let agents: any[]
+    try {
+      agents = (await this.deps.host.call('agents.list', { workspaceId: pane.workspaceId }))?.agents
+    } catch (error) {
+      this.deps.log(`could not ask Orca whether ${pane.terminalId} is in the middle of a turn: ${String((error as Error)?.message ?? error)}`)
+      return 'unknown'
+    }
+    if (!Array.isArray(agents)) return 'unknown'
     const row = agents.find((a: any) => a.terminalId === pane.terminalId)
-    return !!row && row.state !== 'waiting' && row.state !== 'done'
+    return row && row.state !== 'waiting' && row.state !== 'done' ? 'busy' : 'idle'
+  }
+
+  /** In the middle of a turn, or possibly so (Orca cannot say): nothing closes the pane or types
+   *  into it. */
+  private async midTurn(pane: Pick<PaneInfo, 'terminalId' | 'workspaceId'>): Promise<boolean> {
+    return (await this.turnState(pane)) !== 'idle'
+  }
+
+  /** Can this pane go on as the same session, with its context, on another account? Only then is
+   *  it moved as advice (early, idle, expiring quota, switch-back). A service that hands off
+   *  (Codex, Antigravity, OpenCode, Devin), or a pane Orca gives no session id for, would start a
+   *  new session from a summary: that is done only at a real limit, or when the user asks. */
+  private resumes(pane: Pick<PaneInfo, 'agent' | 'sessionId'>): boolean {
+    return !!pane.sessionId && ADAPTERS[pane.agent].resume === 'by-session-id'
   }
 
   private canChangeSelection(provider: Provider, config: Config, now: number, server: string | undefined): boolean {
@@ -1520,6 +1564,7 @@ export class Rotator {
       if (!config.switchBack) return
       // "Only at a limit" and "New launches only" never move a running session back.
       if (config.mode !== 'custom' && config.runningSessions !== 'move') return
+      if (config.autoResume && !this.resumes(pane)) return
       const view = await this.accountsFor(pane.server)
       const now = this.deps.now()
       if (this.probation(pane.agent, now, pane.server)) return
@@ -1589,21 +1634,30 @@ export class Rotator {
     explained?: string
   ): Promise<void> {
     let reselected = false
-    const canResume = !!pane.sessionId && ADAPTERS[pane.agent].resume === 'by-session-id'
+    const canResume = this.resumes(pane)
     const agentId = pane.agentId ?? pane.agent
     // A limit, or the wake of a parked session, closes the pane too: never while its input box
-    // holds unsent text. (Moves that are advice check this in `advisoryOk`.)
+    // holds unsent text. (Moves that are advice check this in `advisoryOk`.) These are also the
+    // moves that interrupted work, after which the first message is typed.
     const closesUnasked = reason === 'rate_limit' || reason === 'auth' || reason === 'model_cap' || reason === 'reset'
-    if (config.autoResume && closesUnasked && (await this.draftIn(pane, lines))) {
-      await this.holdForDraft(pane, from, target, reason, signal?.model, view)
-      return
-    }
-    // Choosing the target read the accounts through the CLI (seconds, live): a turn the user
-    // started meanwhile is never closed. Its end is a new event; a parked session is looked at
-    // again at the next tick.
-    if (config.autoResume && closesUnasked && (await this.midTurn(pane))) {
-      this.deps.log(`${pane.agent} ${pane.terminalId}: in the middle of a turn again, not moving it`)
-      return
+    if (config.autoResume && closesUnasked) {
+      const box = await this.draftIn(pane, lines)
+      if (box) {
+        await this.holdForDraft(pane, from, target, reason, signal?.model, view, box === 'unchecked')
+        return
+      }
+      // Choosing the target read the accounts through the CLI (seconds, live): a turn the user
+      // started meanwhile is never closed. Its end is a new event; a parked session is looked at
+      // again at the next tick. When Orca cannot say, the move is held like one over unsent text.
+      const turn = await this.turnState(pane)
+      if (turn === 'unknown') {
+        await this.holdForDraft(pane, from, target, reason, signal?.model, view, true)
+        return
+      }
+      if (turn === 'busy') {
+        this.deps.log(`${pane.agent} ${pane.terminalId}: in the middle of a turn again, not moving it`)
+        return
+      }
     }
     this.moving.add(pane.terminalId)
     try {
@@ -1677,16 +1731,21 @@ export class Rotator {
       await this.save()
       this.publishNow()
       // Why the first message was not typed into the resumed pane, if it was not.
-      let left: 'busy' | 'draft' | 'untyped' | null = null
+      let left: 'busy' | 'draft' | 'unchecked' | 'untyped' | null = null
       if (canResume) {
         await this.waitReady(newTerminal, pane.workspaceId)
         await this.seedSeen(newTerminal, pane.agent, pane.sessionId)
-        if (config.autoMessage) {
+        // The first message makes the agent work: it is typed only where work was interrupted (a
+        // limit, or the wake of a session parked at one). A session that had finished its turn
+        // and was moved as advice (early, idle, expiring quota, switch-back) or by hand is
+        // resumed and left ready; typing there would start work nobody asked for.
+        if (config.autoMessage && closesUnasked) {
           // The resumed pane takes a while to be ready, and the user can be in it already: typing
           // would send their unsent text with the message, or land in a turn they started.
           const resumed: PaneInfo = { ...pane, terminalId: newTerminal }
-          left = (await this.midTurn(resumed)) ? 'busy' : (await this.draftIn(resumed, [])) ? 'draft' : null
-          if (left) this.deps.log(`${pane.agent} ${newTerminal}: ${left === 'busy' ? 'in the middle of a turn' : 'unsent text in the input box'}, not typing the first message`)
+          const turn = await this.turnState(resumed)
+          left = turn === 'busy' ? 'busy' : turn === 'unknown' ? 'unchecked' : await this.draftIn(resumed, [])
+          if (left) this.deps.log(`${pane.agent} ${newTerminal}: ${left === 'busy' ? 'in the middle of a turn' : left === 'draft' ? 'unsent text in the input box' : 'could not check the pane'}, not typing the first message`)
           else {
             // The session is resumed on the new account whether or not the message gets through:
             // a send that fails must not turn the move into a failed one (below), which would set
@@ -1707,7 +1766,9 @@ export class Rotator {
       const untyped =
         left === 'draft'
           ? ' The session has unsent text in its input box, so it is left for you to continue.'
-          : left === 'untyped'
+          : left === 'unchecked'
+            ? ' Orca could not be asked whether it is safe to type there, so the session is left for you to continue.'
+            : left === 'untyped'
             ? ' The first message could not be typed, so the session is left for you to continue.'
             : ''
       await this.deps.notify('Auto Hand-off', `${body}${untyped}${plain && reselected ? ` ${restartNote(config)}` : ''}`)
@@ -1732,40 +1793,58 @@ export class Rotator {
     }
   }
 
-  /** Unsent text in the pane's input box, as the pane is now (`lines` when it cannot be read). */
-  private async draftIn(pane: PaneInfo, lines: readonly string[]): Promise<boolean> {
+  /** Unsent text in the pane's input box, as the pane is now (`lines` when it cannot be read):
+   *  `draft`, or `unchecked` when Orca could not say. Either way the pane is not closed. */
+  private async draftIn(pane: PaneInfo, lines: readonly string[]): Promise<'draft' | 'unchecked' | null> {
     const screen = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
-    return this.unsent(pane.terminalId, pane.server, screen?.lines ?? lines)
+    const box = await this.unsentText(pane.terminalId, pane.server, screen?.lines ?? lines)
+    return box === null ? null : box === UNCHECKED ? 'unchecked' : 'draft'
   }
 
-  /** Is there unsent text in a pane's input box? Live (Orca 1.4.263): `terminal.read` leaves that
-   *  text out of its lines (the box reads as empty) and only `orca terminal read` reports it, as
-   *  `draft`. So Orca is asked, and the lines are looked at as well, for an Orca that leaves the
-   *  text in them. When Orca cannot say, the lines alone decide. */
+  /** Is there unsent text in a pane's input box, or may there be? Live (Orca 1.4.263):
+   *  `terminal.read` leaves that text out of its lines (the box reads as empty) and only `orca
+   *  terminal read` reports it, as `draft`. So Orca is asked, and the lines are looked at as well,
+   *  for an Orca that leaves the text in them. When Orca cannot say, the answer is yes. */
   private async unsent(terminalId: string, server: string | undefined, lines: readonly string[]): Promise<boolean> {
     return (await this.unsentText(terminalId, server, lines)) !== null
   }
 
-  /** The unsent text in a pane's input box (trimmed), or null when there is none. Orca reports
-   *  Claude Code's grey prompt suggestion and its fixed hints as `draft` too, and nothing tells a
+  /** The unsent text in a pane's input box (trimmed), null when there is none, or `UNCHECKED`
+   *  when `orca terminal read` failed, timed out or gave no usable answer. Orca reports Claude
+   *  Code's grey prompt suggestion and its fixed hints as `draft` too, and nothing tells a
    *  suggestion from typing, so it counts as unsent text; a fixed hint (`isClaudeHint`) is known
    *  by its exact wording and is no text. */
-  private async unsentText(terminalId: string, server: string | undefined, lines: readonly string[]): Promise<string | null> {
+  private async unsentText(terminalId: string, server: string | undefined, lines: readonly string[]): Promise<Unsent> {
     const onScreen = draftOf(lines)
     if (onScreen !== null && !isClaudeHint(onScreen)) return onScreen
+    let text: string | undefined
     try {
-      const text = await (server ? this.deps.cli.draft?.(terminalId, server) : this.deps.cli.draft?.(terminalId))
-      return typeof text === 'string' && text.trim() !== '' && !isClaudeHint(text) ? text.trim() : null
+      text = await (server ? this.deps.cli.draft(terminalId, server) : this.deps.cli.draft(terminalId))
     } catch (error) {
       this.deps.log(`could not ask Orca for unsent text in ${terminalId}: ${String((error as Error)?.message ?? error)}`)
-      return null
+      return UNCHECKED
     }
+    if (typeof text !== 'string') {
+      this.deps.log(`Orca gave no usable answer about unsent text in ${terminalId}`)
+      return UNCHECKED
+    }
+    return text.trim() !== '' && !isClaudeHint(text) ? text.trim() : null
   }
 
   /** The pane holds unsent text, which closing it would throw away: it stays as it is, and the
    *  move stays pending as a waiting entry that every tick (and status event) looks at again.
    *  Noted in the history and said once per wait, not on every look. */
-  private async holdForDraft(pane: PaneInfo, from: Seat | undefined, target: Seat, reason: SwapReason, model: string | undefined, view: AccountView): Promise<void> {
+  private async holdForDraft(
+    pane: PaneInfo,
+    from: Seat | undefined,
+    target: Seat,
+    reason: SwapReason,
+    model: string | undefined,
+    view: AccountView,
+    /** Orca could not say whether the pane is between turns with an empty input box: held the
+     *  same way, and said as that, not as text the user typed. */
+    unchecked = false
+  ): Promise<void> {
     const parked = this.state.waiting.find((w) => w.terminalId === pane.terminalId)
     if (parked?.draftAt) return
     const now = this.deps.now()
@@ -1773,15 +1852,19 @@ export class Rotator {
     const to = labels.get(target.key) ?? target.label
     const source = from ? (labels.get(from.key) ?? from.label) : undefined
     const service = PROVIDER_NAME[pane.agent]
-    this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not closing it`)
-    if (parked) parked.draftAt = now
-    else {
+    this.deps.log(`${pane.agent} ${pane.terminalId}: ${unchecked ? 'could not check the session' : 'unsent text in the input box'}, not closing it`)
+    if (parked) {
+      parked.draftAt = now
+      if (unchecked) parked.unchecked = true
+      else delete parked.unchecked
+    } else {
       const entry: WaitingEntry = { terminalId: pane.terminalId, workspaceId: pane.workspaceId, agent: pane.agent, wakeAt: now, draftAt: now, reason }
       if (model) entry.model = model
       if (pane.sessionId) entry.sessionId = pane.sessionId
       if (pane.agentId) entry.agentId = pane.agentId
       if (from) entry.fromSeat = from.key
       if (pane.server) entry.server = pane.server
+      if (unchecked) entry.unchecked = true
       this.state.waiting = [...this.state.waiting, entry]
     }
     const waited = reason === 'reset'
@@ -1791,12 +1874,15 @@ export class Rotator {
       reason,
       result: 'waiting',
       ...(from ? { from: from.key } : {}),
-      detail: 'unsent text in the input box',
-      why: `${waited ? `${to} is free` : `${source ?? service} hit its limit`}; the session moves to ${to} once the unsent text in its input box is sent or cleared`
+      detail: unchecked ? 'could not check the session' : 'unsent text in the input box',
+      why: `${waited ? `${to} is free` : `${source ?? service} hit its limit`}; the session moves to ${to} once ${unchecked ? 'Orca can say that it is between turns with an empty input box' : 'the unsent text in its input box is sent or cleared'}`
     })
     await this.save()
     const what = waited ? `${service}: ${to} is free again.` : `${service} hit its limit${source ? ` on ${source}` : ''}.`
-    await this.deps.notify('Auto Hand-off', `${what} Send or clear the text you were typing and the session moves to ${to}.`)
+    await this.deps.notify(
+      'Auto Hand-off',
+      unchecked ? `${what} ${NOT_CHECKED}, so it was not moved. It moves to ${to} once that can be checked.` : `${what} Send or clear the text you were typing and the session moves to ${to}.`
+    )
     this.publishNow()
   }
 
@@ -2160,6 +2246,8 @@ export class Rotator {
         if (row.state !== 'waiting' && row.state !== 'done') continue
         if (now - (row.stateStartedAt ?? now) < idleMs) continue
         if (this.inflight.has(row.terminalId) || this.state.waiting.some((w) => w.terminalId === row.terminalId)) continue
+        // An idle move is advice: only a session that can resume as itself is moved (`resumes`).
+        if (config.autoResume && !this.resumes({ agent, sessionId: row.sessionId })) continue
         const seat = this.seatOf(row.terminalId, agent, wsView)
         if (!seat) continue
         const chain = buildChain(wsView.seats, agent, config)
@@ -2230,6 +2318,7 @@ export class Rotator {
         const screen = await this.deps.host.call('terminal.read', { terminalId: w.terminalId, maxLines: 80 }).catch(() => null)
         if (screen && (await this.unsent(w.terminalId, w.server, screen.lines))) return
         delete w.draftAt
+        delete w.unchecked
       }
       const config = await this.deps.config()
       const server = w.server ?? (await this.serverOfWorkspace(w.workspaceId))
@@ -2239,10 +2328,14 @@ export class Rotator {
       const source = view.seats.find((s) => s.key === w.fromSeat)
       if (w.hold === 'short' && source && isEligible(source, this.healthOf(source.key, server), config, now) && agents.some((a: any) => a.terminalId === w.terminalId)) {
         // The short wait is over and the account is back: the session continues where it is.
-        this.state.waiting = this.state.waiting.filter((x) => x.terminalId !== w.terminalId)
         const label = displayLabels(view.seats, w.agent).get(source.key) ?? source.label
         const held = await this.deps.host.call('terminal.read', { terminalId: w.terminalId, maxLines: 80 }).catch(() => ({ lines: [] as string[] }))
-        if (await this.unsent(w.terminalId, server, held.lines)) {
+        const box = await this.unsentText(w.terminalId, server, held.lines)
+        // Orca cannot say whether typing is safe (the input box, or the turn): nothing is typed,
+        // and the wait stays for the next tick to look again.
+        if (box === UNCHECKED || (await this.turnState(w)) === 'unknown') return
+        this.state.waiting = this.state.waiting.filter((x) => x.terminalId !== w.terminalId)
+        if (box !== null) {
           // Typing the first message would send the user's unsent text with it: leave the pane alone.
           await this.save()
           await this.deps.notify('Auto Hand-off', `${PROVIDER_NAME[w.agent]}: ${label} has reset. The session has unsent text in its input box, so it is left for you to continue.`)
@@ -2251,7 +2344,7 @@ export class Rotator {
         }
         // The accounts were read afresh since the look at the pane above (live: seconds): a turn
         // the user started meanwhile is not typed into. They went on there, so the wait is over.
-        if (await this.midTurn({ terminalId: w.terminalId, workspaceId: w.workspaceId, agent: w.agent })) {
+        if (await this.midTurn(w)) {
           this.deps.log(`${w.agent} ${w.terminalId}: in the middle of a turn again, not typing into it`)
           await this.save()
           this.publishNow()
@@ -2402,7 +2495,14 @@ export class Rotator {
     if (ahead && ahead.server === server && !ahead.sshHost && (ahead.state === 'waiting' || ahead.state === 'done') && this.locate(ahead.terminalId, provider, view).seat?.key !== seat.key) {
       const screen = await this.deps.host.call('terminal.read', { terminalId: ahead.terminalId, maxLines: 80 }).catch(() => null)
       // Unreadable: the pane is not moved at all (below), so there is nothing to ask.
-      const text = screen && !(await this.midTurn(ahead)) ? await this.unsentText(ahead.terminalId, ahead.server, screen.lines) : null
+      const turn = screen ? await this.turnState(ahead) : 'busy'
+      const text = screen && turn === 'idle' ? await this.unsentText(ahead.terminalId, ahead.server, screen.lines) : null
+      // Orca cannot say whether a turn runs there, or what the input box holds: said plainly, and
+      // nothing changes. Agreeing to lose text does not apply: nobody knows what would be lost.
+      if (turn === 'unknown' || text === UNCHECKED) {
+        this.deps.log(`${provider} ${ahead.terminalId}: could not check the session, nothing switched`)
+        return { message: `${PROVIDER_NAME[provider]}: Orca could not be asked whether this session is between turns with an empty input box, so nothing was switched. Try again in a moment`, switched: false, provider }
+      }
       if (text !== null && !agreed(ahead.terminalId, text)) {
         this.deps.log(`${provider} ${ahead.terminalId}: unsent text in the input box, asking before moving it`)
         return { message: `${PROVIDER_NAME[provider]}: this session shows unsent text; nothing was switched`, switched: false, provider, draft: { terminalId: ahead.terminalId, text } }
@@ -2425,18 +2525,23 @@ export class Rotator {
       if (cooling && cooling > this.deps.now()) return null
       const screen = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
       // Unreadable: nothing shows that closing it is safe.
-      if (!screen) return null
+      if (!screen) return 'unchecked'
       // The user chose this account, so the guards of a move that is only advice (the headroom
       // gap, the selection cooldown, probation) do not apply. What protects the session does:
       // never in the middle of a turn, and never over unsent text, unless it is exactly the text
       // the user was shown and agreed to lose. Text that came or changed since (the pane as it
       // is now, the last thing looked at before it is closed) is theirs: the pane stays.
-      if (await this.midTurn(pane)) {
+      const turn = await this.turnState(pane)
+      if (turn === 'unknown') return 'unchecked'
+      if (turn === 'busy') {
         this.deps.log(`${pane.agent} ${pane.terminalId}: in the middle of a turn, not moving it`)
         return 'busy'
       }
       const again = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
       const text = await this.unsentText(pane.terminalId, pane.server, again?.lines ?? screen.lines)
+      // Orca cannot say what the box holds now: not even text the user agreed to lose is known
+      // to be all there is.
+      if (text === UNCHECKED) return 'unchecked'
       if (text !== null && !agreed(pane.terminalId, text)) {
         this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not moving it`)
         return 'draft'
@@ -2450,6 +2555,7 @@ export class Rotator {
     })
     if (moved === 'busy') return { message: `${selected}; this pane keeps its account while it works`, switched: true, provider }
     if (moved === 'draft') return { message: `${selected}; this pane has unsent text in its input box and keeps its account`, switched: true, provider }
+    if (moved === 'unchecked') return { message: `${selected}; Orca could not be asked about this session, so it was not moved and keeps its account`, switched: true, provider }
     if (moved && (moved.result === 'resumed' || moved.result === 'handoff')) return { message: `${selected}; this pane moved (${moved.result})`, switched: true, provider }
     return { message: `${selected}; this pane keeps its account until it is relaunched`, switched: true, provider }
   }
@@ -2501,7 +2607,9 @@ export class Rotator {
     if (server) pane.server = server
     const { lines } = await this.deps.host.call('terminal.read', { terminalId: row.terminalId, maxLines: 80 })
     // Moving closes the pane, and with it whatever is typed in its input box.
-    if (await this.unsent(pane.terminalId, pane.server, lines)) return `${pane.agent}: this pane has unsent text in its input box; send or clear it first`
+    const box = await this.unsentText(pane.terminalId, pane.server, lines)
+    if (box === UNCHECKED || (await this.turnState(pane)) === 'unknown') return `${pane.agent}: Orca could not be asked whether this pane is between turns with an empty input box; it was not moved`
+    if (box !== null) return `${pane.agent}: this pane has unsent text in its input box; send or clear it first`
     const before = this.state.history.length
     await this.swap(pane, 'manual', lines)
     const last = this.state.history.length > before ? this.state.history.at(-1) : undefined

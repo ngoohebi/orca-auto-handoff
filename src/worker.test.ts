@@ -33,10 +33,12 @@ function world(options: {
   activeTerminals?: string[]
   /** Called when the plugin waits (a backoff, a settle delay), with the wait in ms. */
   onSleep?: (ms: number) => void
-  /** While it returns true, Orca cannot list agents (`agents.list` fails). */
-  agentsListFails?: () => boolean
+  /** While it returns true, Orca cannot list agents (`agents.list` fails); it is given the call's
+   *  parameters, so a test can fail the listing of one workspace only. */
+  agentsListFails?: (params?: { workspaceId?: string }) => boolean
   /** Unsent text Orca reports apart from the screen lines (`orca terminal read` → `draft`), by
-   *  terminal; read on every look, so a test can change it. `'!'` makes that read fail. */
+   *  terminal; read on every look, so a test can change it. `'!'` makes that read fail, `'?'` makes
+   *  it come back without an answer. No entry is Orca answering that the box is empty. */
   drafts?: Record<string, string>
   /** Called while the CLI lists the active terminals (live: a process that takes a moment). */
   onActiveTerminals?: () => Promise<void>
@@ -45,6 +47,11 @@ function world(options: {
   /** While it returns true, `orca terminal send` fails (live: the pane is gone, or the CLI is). */
   failSend?: () => boolean
 }) {
+  // Each world gets its own copy of the lines: tests add to a pane's tail (`w.tails.t1!.push`), and
+  // the fixtures are shared. (Until fix round 15 such a push changed `fx.CLAUDE_SESSION_LIMIT`
+  // itself, so every later test that used it read a screen whose banner was no longer the latest
+  // output, and exercised the threshold path instead of a limit.)
+  for (const [terminalId, lines] of Object.entries(options.tails)) options.tails[terminalId] = [...lines]
   let clock = 1_000_000
   let claudeActive: string | null = 'c1'
   let codexActive: string | null = 'x1'
@@ -83,7 +90,8 @@ function world(options: {
     async draft(terminalId) {
       const text = options.drafts?.[terminalId]
       if (text === '!') throw new Error('orca terminal read: runtime_unavailable')
-      return text
+      if (text === '?') return undefined
+      return text ?? ''
     },
     async sendText(terminalId, text) {
       cliCalls.push(`send ${terminalId}`)
@@ -121,8 +129,8 @@ function world(options: {
     settings: options.settings ?? {},
     storage: options.state ? { state: { paused: false, health: {}, paneSeat: {}, seen: {}, apiRetries: {}, modelStep: {}, waiting: [], history: [], ...options.state } as never } : {},
     results: {
-      'agents.list': () => {
-        if (options.agentsListFails?.()) throw Object.assign(new Error('selector_not_found'), { code: 'action_failed' })
+      'agents.list': (params?: { workspaceId?: string }) => {
+        if (options.agentsListFails?.(params)) throw Object.assign(new Error('selector_not_found'), { code: 'action_failed' })
         return { agents: panes.map((p) => ({ title: null, task: null, stateStartedAt: 1, sessionId: null, ...p })) }
       },
       'terminal.read': ({ terminalId }: { terminalId: string }) => ({ lines: options.tails[terminalId] ?? [], truncated: false }),
@@ -722,7 +730,10 @@ test('switch back: once the first account resets, new launches use it and a pane
   await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
   assert.equal(w.host.callsOf('agent.resume').length, 2)
   assert.deepEqual(w.host.callsOf('terminal.close').map((c: any) => c.terminalId), ['t1', 't2'])
-  assert.deepEqual(w.typed.at(-1), { terminalId: 't3', text: 'Go continue.' })
+  // Only the limit, which interrupted the work, was followed by the first message (in t2). The
+  // switch-back moved a session that had finished its turn: it is resumed and left ready, since
+  // typing "Go continue." there would start work nobody asked for.
+  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }])
   state = w.host.data().storage.state as RotatorState
   assert.equal(state.paneSeat.t3, 'claude:c1')
   assert.equal(state.history.at(-1)?.reason, 'switch_back')
@@ -746,7 +757,10 @@ test('switch back: an idle pane on the backup account moves without waiting for 
   await w.rotator.tick()
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c1'])
   assert.equal(w.host.callsOf('agent.resume').length, 2)
-  assert.deepEqual(w.typed.at(-1), { terminalId: 't3', text: 'Go continue.' })
+  // The first message follows the limit only (t2). The idle pane moved back had finished its
+  // turn: it is resumed on c1 and left ready, not told to continue (this asserted the opposite
+  // until fix round 15: an idle session was set to work again by a move that was only advice).
+  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }])
   assert.equal((w.host.data().storage.state as RotatorState).paneSeat.t3, 'claude:c1')
   await worker.deactivate()
 })
@@ -1831,6 +1845,9 @@ test('project on a remote Orca server: reads accounts and switches seats on the 
     },
     async git() {
       return ''
+    },
+    async draft() {
+      return ''
     }
   }
   const host = mockHost({
@@ -1925,6 +1942,9 @@ test('project on a direct SSH target: Orca manages no accounts there, so a limit
       cliCalls.push(`send ${id}`)
     },
     async git() {
+      return ''
+    },
+    async draft() {
       return ''
     }
   }
@@ -2362,7 +2382,8 @@ test('smart: a turn that ends on a Low account moves that session, and says why'
   await worker.emit('agent.status.changed', statusEvent('t1'))
   assert.deepEqual(selects(w), ['select claude c2'])
   assert.deepEqual(w.host.callsOf('terminal.close').map((c: any) => c.terminalId), ['t1'])
-  assert.deepEqual(w.typed.at(-1), { terminalId: 't2', text: 'Go continue.' })
+  // The turn had ended and nothing interrupted it: the session is resumed and left ready.
+  assert.deepEqual(w.typed, [])
   const state = stored(w)
   assert.equal(state.paneSeat.t2, 'claude:c2')
   assert.equal(state.history.at(-1)?.reason, 'threshold')
@@ -2953,7 +2974,8 @@ test('unsent text Orca reports apart from the screen: no early move, no retry an
   assert.equal(cmd.host.callsOf('terminal.close').length, 0)
   await worker.deactivate()
 
-  // Orca cannot say (the read fails): the screen lines decide, as before.
+  // Orca cannot say (the read fails): the pane may hold text, since the screen lines leave it
+  // out, so it is not closed. (Until fix round 15 the lines alone decided, and the pane moved.)
   const blind = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, ...EMPTY_BOX] },
@@ -2962,7 +2984,8 @@ test('unsent text Orca reports apart from the screen: no early move, no retry an
   })
   worker = await blind.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
-  assert.deepEqual(selects(blind), ['select claude c2'])
+  assert.deepEqual(selects(blind), [])
+  assert.equal(blind.host.callsOf('terminal.close').length, 0)
   await worker.deactivate()
 })
 
@@ -3671,6 +3694,9 @@ function twoServers(options: {
     },
     async git() {
       return ''
+    },
+    async draft() {
+      return ''
     }
   }
   const host = mockHost({
@@ -3869,7 +3895,7 @@ test('launch hook: a storage failure while noting the new pane’s account is lo
       select: async () => undefined,
       closeTerminal: async () => undefined,
       sendText: async () => undefined,
-      git: async () => ''
+      git: async () => '', draft: async () => ''
     },
     now: () => 1_000_000,
     sleep: async () => undefined,
@@ -4103,4 +4129,356 @@ test('the move command: switch-back does not undo it at the next tick or turn en
     assert.deepEqual(selects(w), ['select claude c2', 'select claude c1'], label)
     await worker.deactivate()
   }
+})
+
+// ---- Fix round 15: the guards fail closed, advice only where a session can resume, and the
+// first message only where work was interrupted ---------------------------------------------------
+
+test('fail closed: when Orca cannot say what the input box holds, a limit does not close the pane; it moves once Orca answers', async () => {
+  // `!`: `orca terminal read` errors or times out. `?`: it comes back without a usable answer.
+  for (const how of ['!', '?']) {
+    const drafts: Record<string, string> = { t1: how }
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, ...EMPTY_BOX] },
+      state: { paneSeat: { t1: 'claude:c1' } },
+      drafts
+    })
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    w.advance(30_000)
+    await w.rotator.tick()
+    assert.equal(w.host.callsOf('terminal.close').length, 0, how)
+    assert.equal(w.host.callsOf('agent.resume').length, 0, how)
+    assert.deepEqual(selects(w), [], how)
+    assert.deepEqual(w.typed, [], how)
+    // Said once, in plain words, and not as "the text you were typing": nobody knows there is any.
+    assert.deepEqual(notes(w), ['Claude hit its limit on one. Orca could not be asked whether the session is between turns with an empty input box, so it was not moved. It moves to two once that can be checked.'], how)
+    assert.equal(stored(w).history.at(-1)?.detail, 'could not check the session', how)
+    assert.ok(stored(w).waiting[0]?.draftAt, how)
+    // Orca answers again, and the box is empty: the next look carries the move out.
+    delete drafts.t1
+    w.advance(30_000)
+    await w.rotator.tick()
+    assert.deepEqual(selects(w), ['select claude c2'], how)
+    assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }], how)
+    assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }], how)
+    await worker.deactivate()
+  }
+})
+
+test('fail closed: when Orca cannot say what the input box holds, no early or idle move, no retry and no model switch', async () => {
+  const drafts: Record<string, string> = { t1: '!' }
+  const low = calm({ session: 97, weekly: 40 }, { drafts })
+  let worker = await low.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  low.advance(20 * MIN)
+  await low.rotator.tick()
+  assert.deepEqual(selects(low), [])
+  assert.equal(low.host.callsOf('terminal.close').length, 0)
+  delete drafts.t1
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.deepEqual(selects(low), ['select claude c2'])
+  await worker.deactivate()
+
+  for (const tail of [fx.CLAUDE_API_ERROR, fx.CLAUDE_MODEL_CAP]) {
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: [...tail, ...EMPTY_BOX] },
+      settings: { mode: 'custom', model_fallback: 'claude=sonnet' },
+      state: { paneSeat: { t1: 'claude:c1' } },
+      drafts: { t1: '?' }
+    })
+    worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    assert.deepEqual(w.typed, [])
+    assert.deepEqual(selects(w), [])
+    assert.equal(stored(w).history.at(-1)?.detail, 'could not check the input box')
+    assert.match(lastNote(w), /Orca could not be asked whether the session has unsent text/)
+    await worker.deactivate()
+  }
+})
+
+test('fail closed: when Orca cannot list the agents, a limit does not close the pane; it moves once Orca answers', async () => {
+  // The listing fails from the moment the accounts are read for the move (live: seconds later).
+  let armed = false
+  let failing = false
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, ...EMPTY_BOX] },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    onListAccounts: async () => {
+      if (armed) failing = true
+    },
+    agentsListFails: () => failing
+  })
+  const worker = await w.mount()
+  armed = true
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(selects(w), [])
+  assert.equal(stored(w).waiting.length, 1)
+  assert.match(lastNote(w), /Orca could not be asked whether the session is between turns/)
+  // Still failing: it keeps waiting, and says nothing more.
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(notes(w).length, 1)
+  armed = false
+  failing = false
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
+  assert.equal(stored(w).waiting.length, 0)
+  await worker.deactivate()
+})
+
+test('fail closed: when Orca cannot list the agents, a move that is advice does not happen', async () => {
+  let armed = false
+  let failing = false
+  const w = calm({ session: 97, weekly: 40 }, {
+    onListAccounts: async () => {
+      if (armed) failing = true
+    },
+    agentsListFails: () => failing
+  })
+  const worker = await w.mount()
+  armed = true
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), [])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  await worker.deactivate()
+})
+
+test('fail closed: after a move, the first message is not typed into a pane Orca cannot say is safe to type into', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    drafts: { t2: '!' }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(w.typed, [])
+  assert.equal(stored(w).history.at(-1)?.result, 'resumed')
+  assert.match(lastNote(w), /Orca could not be asked whether it is safe to type there.*left for you to continue/)
+  await worker.deactivate()
+})
+
+test('fail closed: a short wait that is over keeps waiting while Orca cannot say whether typing is safe', async () => {
+  const usage = { session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }
+  const drafts: Record<string, string> = {}
+  const w = calm(usage, { tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] }, drafts })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting[0]?.hold, 'short')
+  w.advance(4 * MIN + 1000)
+  usage.session = 0
+  usage.sessionReset = 1_000_000 + 5 * 3_600_000
+  drafts.t1 = '!'
+  await w.rotator.tick()
+  assert.deepEqual(w.typed, [])
+  assert.equal(stored(w).waiting.length, 1)
+  delete drafts.t1
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Go continue.' }])
+  assert.equal(stored(w).waiting.length, 0)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  await worker.deactivate()
+})
+
+test('fail closed, by hand: "Hand off to this account" says it could not check the session, and switches nothing', async () => {
+  // Orca cannot say what the input box holds, or cannot list the workspace's agents.
+  for (const how of ['draft-error', 'draft-no-answer', 'agents'] as const) {
+    const w = idleInTab(how === 'agents' ? { agentsListFails: (params) => !!params?.workspaceId } : { drafts: { t1: how === 'draft-error' ? '!' : '?' } })
+    const worker = await w.mount()
+    const answer = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+    assert.match(answer.message, /^Claude: Orca could not be asked whether this session is between turns with an empty input box, so nothing was switched/, how)
+    assert.equal(answer.draft, undefined, how)
+    assert.deepEqual(selects(w), [], how)
+    assert.notEqual(w.host.data().settings.service_claude, false, how)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, how)
+    assert.equal(w.host.callsOf('agent.resume').length, 0, how)
+    // Agreeing to lose text changes nothing: there is no text to agree about.
+    const again = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', acceptDraft: true, draft: { terminalId: 't1', text: '' } })
+    assert.match(again.message, /could not be asked/, how)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, how)
+    // The command that moves this workspace's agent says the same and moves nothing.
+    assert.match(String(await worker.command('rotator.swapThisPane')), /Orca could not be asked whether this pane is between turns with an empty input box; it was not moved/, how)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, how)
+    assert.deepEqual(selects(w), [], how)
+    await worker.deactivate()
+  }
+})
+
+test('fail closed, by hand: a session that cannot be checked once the account is selected keeps its account, and the answer says so', async () => {
+  // The first look is fine; Orca stops answering while the account is being selected.
+  const drafts: Record<string, string> = {}
+  const w = idleInTab({ drafts })
+  const worker = await w.mount()
+  const select = w.rotator['deps'].cli.select
+  w.rotator['deps'].cli.select = async (provider, accountId, server) => {
+    await select(provider, accountId, server)
+    drafts.t1 = '!'
+  }
+  const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.match(message, /Orca could not be asked about this session, so it was not moved and keeps its account/)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  await worker.deactivate()
+})
+
+test('services that cannot resume a session (Codex): a running pane moves only at a real limit, never as advice', async () => {
+  // x1 is at 100 %: a finished turn there, and then an idle pane, would be moved as advice.
+  const w = world({
+    panes: [{ terminalId: 'k1', agent: 'codex', state: 'done', sessionId: 'cs1' }],
+    tails: { k1: ['• Updated the parser.', '', '› Ask Codex to do anything', '  gpt-5 default · ~/projects/demo'] },
+    state: { paneSeat: { k1: 'codex:x1' } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('k1'))
+  w.advance(20 * MIN)
+  await w.rotator.tick()
+  // A handoff starts a new session from a summary: that is never done to a session that works.
+  assert.equal(w.host.callsOf('agent.launch').length, 0)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.ok(w.panes.some((p) => p.terminalId === 'k1'))
+  // The limit itself: now it is handed off.
+  w.tails.k1 = [...fx.CODEX_USAGE_LIMIT]
+  await worker.emit('agent.status.changed', statusEvent('k1', 'done', 2))
+  assert.equal(w.host.callsOf('agent.launch').length, 1)
+  assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 'k1' }])
+  assert.equal(stored(w).history.at(-1)?.result, 'handoff')
+  await worker.deactivate()
+
+  // Switch-back (custom mode) leaves a Codex pane on the lower account as well; new launches follow.
+  const back = world({
+    panes: [{ terminalId: 'k1', agent: 'codex', state: 'done', sessionId: 'cs1' }],
+    tails: { k1: ['• Updated the parser.', '', '› Ask Codex to do anything', '  gpt-5 default · ~/projects/demo'] },
+    codexUsage: { session: 5, weekly: 5 },
+    settings: { mode: 'custom' },
+    state: { paneSeat: { k1: 'codex:system' } }
+  })
+  const bw = await back.mount()
+  await bw.emit('agent.status.changed', statusEvent('k1'))
+  back.advance(20 * MIN)
+  await back.rotator.tick()
+  assert.equal(back.host.callsOf('agent.launch').length, 0)
+  assert.equal(back.host.callsOf('terminal.close').length, 0)
+  await bw.deactivate()
+
+  // A Claude pane Orca gives no session id for cannot be resumed either: no early move.
+  const anon = calm({ session: 97, weekly: 40 }, { panes: [{ terminalId: 't1', agent: 'claude', state: 'done' }] })
+  const aw = await anon.mount()
+  await aw.emit('agent.status.changed', statusEvent('t1'))
+  anon.advance(20 * MIN)
+  await anon.rotator.tick()
+  assert.equal(anon.host.callsOf('agent.launch').length, 0)
+  assert.equal(anon.host.callsOf('terminal.close').length, 0)
+  await aw.deactivate()
+})
+
+test('the first message is typed only where work was interrupted: not after an early, idle, expiring-quota or switch-back move, nor a move by hand', async () => {
+  // Early (Smart, a turn that ended on a Low account): the session finished; it is resumed and left ready.
+  const early = calm({ session: 97, weekly: 40 })
+  let worker = await early.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(early.host.callsOf('agent.resume').length, 1)
+  assert.equal(stored(early).history.at(-1)?.result, 'resumed')
+  assert.deepEqual(early.typed, [])
+  await worker.deactivate()
+
+  // Idle (the sweep) on an account at its threshold, custom mode.
+  const idle = calm({ session: 60, weekly: 10 }, { settings: { mode: 'custom', thresholds_five_hour: 50 } })
+  worker = await idle.mount()
+  idle.advance(20 * MIN)
+  await idle.rotator.tick()
+  assert.equal(stored(idle).history.at(-1)?.reason, 'idle')
+  assert.equal(idle.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(idle.typed, [])
+  await worker.deactivate()
+
+  // Expiring quota (Smart, "use it or lose it").
+  const lose = calm({ session: 20, weekly: 30, weeklyReset: 1_000_000 + 6 * 86_400_000 })
+  worker = await lose.mount()
+  await lose.rotator.tick()
+  assert.deepEqual(stored(lose).history.map((h) => [h.reason, h.result]), [['expiring', 'selected'], ['expiring', 'resumed']])
+  assert.deepEqual(lose.typed, [])
+  await worker.deactivate()
+
+  // By hand: the user is there and types what they want.
+  const hand = idleInTab()
+  worker = await hand.mount()
+  assert.match((await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })).message, /this pane moved \(resumed\)/)
+  assert.deepEqual(hand.typed, [])
+  await worker.deactivate()
+
+  // A limit interrupted the work: the first message is typed, as before.
+  const limit = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] },
+    state: { paneSeat: { t1: 'claude:c1' } }
+  })
+  worker = await limit.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(limit.typed, [{ terminalId: 't2', text: 'Go continue.' }])
+  await worker.deactivate()
+})
+
+/** A Claude pane that shows a limit in a workspace on a direct SSH target. */
+function sshWorld(options: { settings?: Record<string, string | number | boolean>; state?: Partial<RotatorState> } = {}) {
+  const cli: Cli = {
+    listAccounts: async () => fx.accountList({ claudeUsage: { session: 100, weekly: 40 } }),
+    select: async () => undefined,
+    closeTerminal: async () => undefined,
+    sendText: async () => undefined,
+    git: async () => '',
+    draft: async () => ''
+  }
+  const host = mockHost({
+    settings: options.settings ?? {},
+    storage: options.state ? { state: { paused: false, health: {}, paneSeat: {}, seen: {}, apiRetries: {}, modelStep: {}, waiting: [], history: [], ...options.state } as never } : {},
+    results: {
+      'agents.list': { agents: [{ title: null, task: null, stateStartedAt: 1, terminalId: 'ts1', agent: 'claude', state: 'done', sessionId: 'ss1' }] },
+      'terminal.read': () => ({ lines: fx.CLAUDE_SESSION_LIMIT, truncated: false }),
+      'workspace.list': { workspaces: [{ id: 'w-ssh', kind: 'worktree', name: 'build-app', projectId: 'p-ssh', path: '/home/me/repo', branch: 'main', hostId: 'ssh:build-box' }], truncated: false },
+      'workspace.readContext': { workspaceId: 'w-ssh', branch: 'main', displayName: 'build-app', terminals: [] },
+      'notifications.show': { delivered: true },
+      'statusBar.update': { ok: true }
+    }
+  })
+  const mod = {
+    default: async (orca: OrcaWorkerApi) => {
+      await activateWith(orca, { cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false })
+    }
+  }
+  const event = (stamp: number) => ({ workspaceId: 'w-ssh', paneKey: 'pane-ts1', terminalId: 'ts1', state: 'done' as const, receivedAt: stamp, mainAgent: { state: 'done' as const, stateStartedAt: stamp } })
+  return { host, event, mount: () => mountWorker(mod, { host }) }
+}
+
+test('SSH target: paused, or the service off, a limit there is only noted: no notification and no History line', async () => {
+  for (const off of ['paused', 'service'] as const) {
+    const w = sshWorld(off === 'paused' ? { state: { paused: true } } : { settings: { service_claude: false } })
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', w.event(1))
+    assert.equal(w.host.callsOf('notifications.show').length, 0, off)
+    const state = w.host.data().storage.state as RotatorState
+    assert.deepEqual(state.history, [], off)
+    // The banner is noted, so turning hand-off on again does not act on a stale one.
+    assert.equal(Object.keys(state.seen).length, 1, off)
+    await worker.deactivate()
+  }
+  // Neither paused nor off: said once, as before.
+  const on = sshWorld()
+  const worker = await on.mount()
+  await worker.emit('agent.status.changed', on.event(1))
+  assert.equal(on.host.callsOf('notifications.show').length, 1)
+  assert.equal((on.host.data().storage.state as RotatorState).history.length, 1)
+  await worker.deactivate()
 })

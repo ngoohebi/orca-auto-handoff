@@ -263,6 +263,9 @@ async function mount(options: { usage: () => { session: number; weekly: number }
     async sendText() {},
     async git() {
       return ''
+    },
+    async draft() {
+      return ''
     }
   }
   const host = mockHost({

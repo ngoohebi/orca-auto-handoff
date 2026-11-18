@@ -24,8 +24,9 @@ export type Files = {
   home: string
   /** `null` when the file does not exist. */
   read(path: string): string | null
-  /** Creates parent directories; replaces atomically. */
-  write(path: string, text: string, mode?: number): void
+  /** Creates parent directories; replaces atomically. `dirMode`: the mode of the file's folder,
+   *  set also when the folder was already there. */
+  write(path: string, text: string, mode?: number, dirMode?: number): void
   remove(path: string): void
 }
 
@@ -40,8 +41,10 @@ export function nodeFiles(): Files {
         throw error
       }
     },
-    write(path, text, mode) {
-      mkdirSync(dirname(path), { recursive: true })
+    write(path, text, mode, dirMode) {
+      const dir = dirname(path)
+      mkdirSync(dir, { recursive: true, ...(dirMode !== undefined ? { mode: dirMode } : {}) })
+      if (dirMode !== undefined) chmodSync(dir, dirMode)
       const tmp = `${path}.tmp-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
       writeFileSync(tmp, text, { encoding: 'utf8', mode: mode ?? 0o644 })
       if (mode !== undefined) chmodSync(tmp, mode)
@@ -57,7 +60,7 @@ export function nodeFiles(): Files {
   }
 }
 
-/** For tests: a flat map of path → text (and `modes` for what was made executable). */
+/** For tests: a flat map of path → text (and `modes` for the modes asked for, folders included). */
 export function memoryFiles(home = '/home/test'): Files & { files: Map<string, string>; modes: Map<string, number> } {
   const files = new Map<string, string>()
   const modes = new Map<string, number>()
@@ -66,9 +69,10 @@ export function memoryFiles(home = '/home/test'): Files & { files: Map<string, s
     files,
     modes,
     read: (path) => files.get(path) ?? null,
-    write(path, text, mode) {
+    write(path, text, mode, dirMode) {
       files.set(path, text)
       if (mode !== undefined) modes.set(path, mode)
+      if (dirMode !== undefined) modes.set(dirname(path), dirMode)
     },
     remove: (path) => void files.delete(path)
   }
@@ -80,6 +84,11 @@ type Ctx = {
   log(message: string): void
   now(): number
 }
+
+/** The status file names the accounts (emails), and so do the live files beside it: the folder
+ *  and the files in it are the owner's alone. (The script must stay runnable by its owner.) */
+const PRIVATE_DIR = 0o700
+const PRIVATE_FILE = 0o600
 
 export class ConsoleStatusLine {
   private lastStatus = ''
@@ -106,7 +115,7 @@ export class ConsoleStatusLine {
   ensureScript(): void {
     if (this.scriptChecked) return
     try {
-      if (this.files.read(this.scriptPath) !== SCRIPT) this.files.write(this.scriptPath, SCRIPT, 0o755)
+      if (this.files.read(this.scriptPath) !== SCRIPT) this.files.write(this.scriptPath, SCRIPT, 0o755, PRIVATE_DIR)
       this.scriptChecked = true
     } catch (error) {
       this.ctx.log(`console status line: cannot write ${this.scriptPath}: ${String((error as Error)?.message ?? error)}`)
@@ -128,7 +137,7 @@ export class ConsoleStatusLine {
       if (text === this.lastStatus) return
       this.lastStatus = text
       this.ensureScript()
-      this.files.write(this.statusPath, text)
+      this.files.write(this.statusPath, text, PRIVATE_FILE, PRIVATE_DIR)
     } catch (error) {
       this.ctx.log(`console status line: cannot write ${this.statusPath}: ${String((error as Error)?.message ?? error)}`)
     }

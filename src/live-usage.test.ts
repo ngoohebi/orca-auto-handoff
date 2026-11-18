@@ -239,6 +239,9 @@ function cliFor(result: () => Record<string, any>, calls: Calls): Cli {
     },
     async git() {
       return ''
+    },
+    async draft() {
+      return ''
     }
   }
 }

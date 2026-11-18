@@ -4,6 +4,21 @@
 
 Product page: <https://ngoohebi.github.io/orca-account-rotator/>
 
+## Quick start
+
+1. Add at least two accounts of one service in Orca (Settings → Accounts), for example two Claude
+   accounts.
+2. Load the plugin (`orca plugin dev load . --json` from this folder; the first time Orca asks you
+   to approve its access, see [Permissions](#permissions)).
+3. Open the **Auto Hand-off** panel. It lists your accounts per service with their usage. That is
+   all: the default mode, Smart, needs no settings.
+4. Work as usual. When a session hits a limit, it moves to your next account of the same service
+   and carries on. The panel's History says why, in one line per move.
+
+To stop it, use the *Automatic hand-off* toggle at the top of the panel (pause), or the switch on
+a service's card. To move by hand, press *Hand off to this account* on an account's card.
+Before relying on it, read [Known limitations](#known-limitations).
+
 Runs Orca's managed agent accounts as one pool, like [cux](https://github.com/inulute/cux) does for
 Claude Code, but inside Orca and for every provider Orca manages: Claude, Codex, Antigravity,
 OpenCode and Devin. When an agent pane hits a rate limit, or a usage threshold you set, the plugin:
@@ -13,7 +28,8 @@ OpenCode and Devin. When an agent pane hits a rate limit, or a usage threshold y
 3. runs `orca account select`,
 4. closes the limited pane,
 5. resumes the same session (`agent.resume`),
-6. types the configured first message ("Go continue." by default).
+6. types the configured first message ("Go continue." by default), when a limit interrupted the
+   work. A session that had finished its turn and was moved early is resumed and left ready.
 
 When every account of the provider is exhausted it parks the session and resumes it when the
 earliest limit resets. It only ever switches between accounts of the **same service**: a Claude
@@ -21,6 +37,10 @@ pane moves to another Claude account and a Codex pane to another Codex account, 
 services. Where the service cannot resume a session by id on another account (Codex, Antigravity,
 OpenCode, Devin), the same agent is started on the next account with a handoff prompt: why the
 previous run stopped, the session title, branch, `git status`, `git diff --stat` and the last output.
+That is a **new session that starts from a summary**: the earlier conversation is not carried
+over. So for these services a running session moves only when it has hit a real limit (or when
+you move it by hand); the early, idle, expiring-quota and switch-back moves described below apply
+to Claude sessions only, which resume as the same session with their context.
 
 Usage numbers come from Orca itself (`orca account list --json` → `rateLimits`). The plugin never
 reads tokens or keychains.
@@ -54,6 +74,19 @@ Out of the box, Auto Hand-off runs in **Smart** mode. You do not have to set any
   too: you are told once, and the session moves as soon as you have sent or cleared the text.
 - **It moves one session at a time.** Only the session whose turn just ended moves. Your other
   sessions follow when their own turn ends or when they are idle.
+- **It moves early only where nothing is lost.** Leaving an account before its limit, moving an
+  idle session, using quota that is about to expire and going back to an earlier account apply
+  to Claude sessions, which resume as the same session. Codex, Antigravity, OpenCode and Devin
+  sessions would start over from a summary, so they move only at a real limit; for them, only
+  the account for new sessions changes ahead of time.
+- **It does not set a finished session to work.** "Go continue." is typed only after a limit or
+  an API error interrupted the work, or when a session that waited for a reset wakes up. A
+  session that had finished its turn and was moved early, when idle, for expiring quota or back
+  to an earlier account is resumed and left ready for you.
+- **When it cannot check, it does not act.** If Orca cannot be asked whether a session is in the
+  middle of a turn, or what its input box holds, the session is treated as busy or as holding
+  unsent text: it is not closed and not typed into. A limit move then waits and is carried out
+  once Orca answers; you are told once.
 - **It picks the account that will last.** The next account is one the plugin has numbers for,
   with enough room to last at least half an hour at its pace (counting the sessions already
   running on it). Among those it prefers your own order if you set one, then quota that is about
@@ -135,11 +168,11 @@ The table below lists every trigger. Rows that mention thresholds, strategies or
 | Model-specific cap (e.g. Claude Fable weekly) | Smart and Follow my order: an account known to have room for that model, then `/model <next>` from *Model fallback* in place, then an account not known to be full for that model, then wait. Custom: `/model <next>` first; switch accounts only when the list runs out. `/model` is never typed into a pane whose input box holds unsent text (you are told instead), nor into a turn you started meanwhile (its end is handled as a new event) |
 | API error (529, overloaded, stream disconnected) | Type the first message again after a Fibonacci backoff (5 s … 120 s), up to *Maximum API error retries*. Only while the pane is still between turns and the error is still its latest output (if you went on meanwhile, what the pane shows now is handled instead), and never into an input box that holds unsent text; you are told instead |
 | Auth failure | 12 h cooldown on that seat, switch |
-| A turn ends while the seat is over a threshold | Switch to an account with known room (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets. An account without numbers is taken only when the current one is known to be at 100 % and no known account is left |
+| A turn ends while the seat is over a threshold (Claude) | Switch to an account with known room (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets. An account without numbers is taken only when the current one is known to be at 100 % and no known account is left |
 | Every seat limited | Park; wake when the earliest seat frees up (*Wait for reset*). Carry on in the parked pane yourself and the wait ends. Close the parked pane yourself and the wait is dropped when it comes due: the session is not resumed, and History notes it in one line (`closed`), without a notification |
 | A limit, or the wake of a parked session, finds unsent text in the pane's input box | The pane is not closed. The limited account is still set aside, History notes the wait once, and you are told once: "Claude hit its limit on *account*. Send or clear the text you were typing and the session moves to *target*." The plugin looks again at every status event and timer tick and carries out the move once the text is gone; the panel lists the session under *Waiting*, where *Cancel* drops the move. Send the text instead and that turn is handled like any other |
 | A higher-priority account is healthy again | **Switch back:** select it for new launches; sessions on lower accounts move back when they finish a turn or sit idle. Running sessions move only to an account that is known or presumed reset |
-| A session idles on an over-threshold account | Move it after *Move idle sessions after* seconds (900 by default; 0 = off), under the same rule as a threshold move |
+| A session idles on an over-threshold account (Claude) | Move it after *Move idle sessions after* seconds (900 by default; 0 = off), under the same rule as a threshold move |
 | The plugin just moved onto an account without numbers | *Probation* for max(10 min, 2 × the selection cooldown): no threshold, idle or switch-back move for that service, and a banner on that account is a strike |
 | `orca account select` fails for an account | Skip that account for 10 minutes, take the next |
 
@@ -189,7 +222,9 @@ comes before one without numbers (see [Usage of accounts not in use](#usage-of-a
 account earlier in the chain is out of cooldown and under its thresholds, the plugin selects it
 again so new launches use it, and moves sessions that are still on lower accounts back to it when
 they finish a turn, or once they have been idle for *Move idle sessions after* seconds. The same
-close → resume → first message as any other swap. A running session moves back only to an account
+close → resume as any other swap, without the first message: the session had finished its turn,
+so it is left ready. Only sessions that resume by session id (Claude) move back; for the other
+services only the selection for new launches does. A running session moves back only to an account
 with known room, or one presumed reset. The selection for new launches also moves to an account
 without numbers, as long as it has no strikes.
 
@@ -197,7 +232,7 @@ without numbers, as long as it has no strikes.
 included: a pane whose input box holds unsent text is never closed. An advisory move is dropped
 and considered again at the next turn end or idle check; a limit move stays pending until the
 text is sent or cleared (see the table above). The *Move this workspace's agent to another
-account* command leaves such a pane alone as well, and says so. The panel's *Switch to this
+account* command leaves such a pane alone as well, and says so. The panel's *Hand off to this
 account* asks instead: after *Yes, hand off* it changes nothing and shows a second confirmation in
 the same block, "This session shows unsent text: “…”. Hand off anyway? The text will be cleared.",
 with the text (the first 80 characters). *Cancel* leaves everything as it was: no account is
@@ -207,7 +242,13 @@ changed meanwhile, the panel asks again with what is there now. No automatic mov
 way, and the answer lifts no other guard: like every other move, these never close a pane that
 is in the middle of a turn, and a limited account is still refused. The plugin asks Orca for
 that text (`orca terminal read --json`, field `draft`) and also looks at the input line on
-screen; if Orca cannot be asked, the screen alone decides. Orca reports Claude Code's own grey
+screen. If Orca cannot be asked (the command fails, times out or gives no usable answer), the
+pane counts as possibly holding unsent text, because the screen leaves that text out: an
+advisory move is skipped, a limit move waits ("Orca could not be asked whether the session is
+between turns with an empty input box, so it was not moved. It moves to *target* once that can be
+checked."), nothing is typed, and *Hand off to this account* and the move command say that they
+could not check the session and move nothing. The same holds when Orca cannot list the agents:
+the pane counts as possibly in the middle of a turn. Orca reports Claude Code's own grey
 texts in the same field. "Press up to edit queued messages" counts as unsent input on purpose:
 it means messages you queued are waiting to be sent, and closing the pane would lose them. A grey prompt suggestion ("keep going") cannot be told from typing and counts as
 unsent text (see *Known limitations*). The same holds for the first message after a move: if
@@ -218,7 +259,9 @@ stands, and the account moved to is not set aside. A session that waited for its
 reset (the short wait) is likewise not typed into when you started a turn there meanwhile.
 
 **Guards on advisory moves** (threshold, idle, switch-back; hard limits ignore these two, and so
-does a move you ask for yourself from the panel or the command):
+does a move you ask for yourself from the panel or the command). Advisory moves of a running
+session apply only to a session that resumes by session id (Claude, with a session id from
+Orca); for a handoff-only service they change at most the selection for new launches:
 
 - the target needs at least *Minimum headroom gap* (10 %) more room than the current account when
   both are known, and an exhausted account may always leave; a target without numbers never counts
@@ -245,7 +288,7 @@ automatic rotation and switch-back; picking them from the panel still works.
 | `service_claude`, `service_codex`, `service_antigravity`, `service_opencode`, `service_devin` | on | Automatic hand-off per service |
 | `chain` (*Account order*) | empty | Your own order of accounts. Empty = Orca's order |
 | `exclude` (*Never switch to*) | empty | Accounts automatic hand-off never picks |
-| `auto_message` | `Go continue.` | First message typed after a switch. Empty = resume silently |
+| `auto_message` | `Go continue.` | First message typed after a move that a limit or API error caused, or when a waiting session wakes. Not typed after an early, idle, expiring-quota, switch-back or manual move. Empty = resume silently |
 | `model_fallback` | empty | Models to try on the same account when one model's limit is hit, e.g. `claude=sonnet,haiku` |
 | `retry_on_api_error`, `max_api_retries` | on, 6 | Retry in place on API errors |
 | `default_cooldown_minutes` | 60 | Used when nothing says when a limit resets |
@@ -549,12 +592,43 @@ The plugin reads Orca's numbers every *Read usage from Orca every (seconds)*: de
 range 15–3600. A change applies immediately. Concurrent refreshes share one `orca account list`
 call. After each switch the plugin makes, it reads again at about 8 and 70 seconds, because a
 switch is what makes Orca fetch the accounts not in use. The plugin never reads tokens or
-keychains and never triggers Orca's internal fetches.
+keychains. It does not force a usage refresh: on this computer it runs `orca account list`, and
+for a project on a paired server it calls that server's `accounts.list` with
+`refreshUsage: false, refreshStaleUsage: true`, which lets that Orca refresh readings it
+considers stale itself, on its own schedule.
 
 ## Known limitations
 
-These are known and not fixed. None of them loses text, interrupts a turn or crosses services;
-most are rare.
+These are known and not fixed. None of them loses typed text, interrupts a turn or crosses
+services; most are rare. Read the first seven before you rely on the plugin.
+
+- **Closing a pane also stops its background processes.** A move closes the session's terminal
+  pane and resumes the session in a new one. Anything the agent left running in the old pane (a
+  dev server, a watcher, a background shell job) ends with it.
+- **A resume that fails after the close leaves the session closed.** Claude's pane is closed
+  first, because Orca refuses to resume a session that still runs. If the resume then fails, the
+  pane is gone; you are notified ("Swap to *account* failed: …"), History notes it, and you can
+  reopen the session from Orca yourself. The conversation is not lost.
+- **The move command picks the first idle agent when a plain shell tab is in front.** *Move this
+  workspace's agent to another account* moves the agent in the terminal tab in front. If that tab
+  is a plain shell, it takes the first agent of the workspace that is between turns, which may
+  not be the one you meant.
+- **The status bar click switches the Claude account at once.** It selects the next Claude
+  account for new launches without asking, and Orca may then show its own "Restart sessions"
+  prompt. You do not need to press Restart.
+- ***Hand off to this account* turns automatic hand-off off for that service,** so the rotator
+  does not undo your choice. The panel says so; turn the service's switch on again to resume.
+- **The console status line needs `sh`.** It is a POSIX shell script, so it does not work on
+  Windows (outside WSL).
+- **Installing the console status line writes `.claude/settings.local.json` in the workspace's
+  folder,** i.e. inside your repository. It is a personal settings file: make sure it is ignored
+  by git there. Uninstall restores what was there.
+- **A handoff starts a new session.** For Codex, Antigravity, OpenCode and Devin the next account
+  gets a new session with a summary (up to *Handoff prompt size limit* characters), not the
+  conversation. This happens only at a real limit or when you move the session by hand.
+- **While Orca cannot be asked, nothing moves.** If `orca terminal read` keeps failing for a pane
+  (or Orca cannot list its agents), a session stopped at a limit waits there until Orca answers
+  again; the panel lists it under *Waiting*, where *Cancel* drops the move.
 
 - **Claude's greyed prompt suggestion counts as unsent text.** After a turn, Claude Code can show
   a suggested next prompt in grey in the input box. Orca (1.4.263) reports it to plugins the same
@@ -613,8 +687,11 @@ stored or logged), and does not say which terminal tab is in front (`terminal li
 --include-visual-layouts` does; read-only, for the panel's *this terminal* mark and for the pane
 *Hand off to this account* moves).
 
-For a project on a paired Orca server the worker loads Orca's own runtime client from the app
-bundle (`app.asar.unpacked/out/cli/runtime/client.js`) and calls that server's `accounts.*` RPCs
+For a project on a paired Orca server the worker loads two of Orca's own modules from the app
+bundle: the runtime client (`app.asar.unpacked/out/cli/runtime/client.js`) and, before it, the
+store helper it needs to run inside a plugin worker
+(`app.asar.unpacked/out/shared/remote-runtime/host-store/runtime-environment-store-execution.js`,
+of which it calls `environmentStoreRunsInline` and `useInlineEnvironmentStoreForCli`). It calls that server's `accounts.*` RPCs
 (`accounts.list`, `accounts.selectClaude`, …) over the pairing saved on this computer, because the
 CLI's account commands only answer for this computer. When the host API does not say which Orca a
 workspace runs on, the same client is asked, read-only, for this computer's catalog of paired
@@ -624,7 +701,9 @@ published API: an Orca update can break the server path, in which case the panel
 and this computer's accounts keep working.
 
 The worker writes `status.tsv` and the wrapper script under `~/.orca/account-rotator/` and reads
-the `live/` files the wrapper leaves there; the wrapper is the only writer of `live/`.
+the `live/` files the wrapper leaves there; the wrapper is the only writer of `live/`. `status.tsv`
+holds your account names (emails), so it and the `live/` files are written readable by you only
+(mode 0600, the folder 0700).
 
 A handoff prompt (for services that cannot resume by session id) includes up to 40 lines of the
 previous agent's output, so treat it like any pasted terminal output.
@@ -636,7 +715,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 248 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 270 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

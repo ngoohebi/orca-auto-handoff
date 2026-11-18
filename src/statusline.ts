@@ -219,6 +219,8 @@ if [ -n "$live_key" ] && [ -n "@{HOME:-}" ] && [ -z "@{CLAUDE_JOB_DIR:-}" ] && [
         case "$at" in ''|*[!0-9]*) ;; *) [ $((now - at)) -ge 0 ] && [ $((now - at)) -lt 60 ] && exit 0 ;; esac
       fi
     fi
+    # The file names nothing but numbers, yet its name is the account's profile: owner only.
+    umask 077
     [ -d "$live" ] || mkdir -p "$live" || exit 0
     tmp="$file.$$"
     printf '1\t%s\t%s\n' "$now" "$row" >"$tmp" && mv -f "$tmp" "$file"

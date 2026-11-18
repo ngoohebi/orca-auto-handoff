@@ -647,7 +647,9 @@ function Waiting({ snap }: { snap: Snapshot }) {
         {snap.waiting.map((w) => (
           <Row key={w.terminalId} justify="between" align="center" gap="sm">
             <Text size="xs">
-              {w.draftAt ? (
+              {w.draftAt && w.unchecked ? (
+                <>{PROVIDER_NAME[w.agent] ?? w.agent} session moves once Orca can say that it is between turns with an empty input box</>
+              ) : w.draftAt ? (
                 <>{PROVIDER_NAME[w.agent] ?? w.agent} session moves once the text typed in it is sent or cleared</>
               ) : (
                 <>

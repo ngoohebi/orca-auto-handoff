@@ -94,6 +94,10 @@ test('worker pushes keep the panel current; waiting sessions are called out', as
   await view.post('rotator.changed', snapshot({ paused: true, waiting: [{ terminalId: 't1', workspaceId: 'w1', agent: 'claude', wakeAt: NOW, draftAt: NOW, reason: 'rate_limit' }] }))
   assert.ok(view.find({ text: /Claude session moves once the text typed in it is sent or cleared/ }))
   assert.equal(view.findAll({ text: /session resumes/ }).length, 0)
+  // Held because Orca could not be asked about the pane: not said as text the user typed.
+  await view.post('rotator.changed', snapshot({ paused: true, waiting: [{ terminalId: 't1', workspaceId: 'w1', agent: 'claude', wakeAt: NOW, draftAt: NOW, unchecked: true, reason: 'rate_limit' }] }))
+  assert.ok(view.find({ text: /Claude session moves once Orca can say that it is between turns with an empty input box/ }))
+  assert.equal(view.findAll({ text: /text typed in it/ }).length, 0)
   await view.press({ text: 'Cancel' })
   assert.deepEqual(cancelled, ['t1'])
   assert.equal(view.valueOf({ label: 'Automatic hand-off' }), false)

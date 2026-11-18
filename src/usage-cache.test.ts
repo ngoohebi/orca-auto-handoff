@@ -159,6 +159,9 @@ function cliFor(result: () => Record<string, any>, calls: string[], gate?: Promi
     async sendText() {},
     async git() {
       return ''
+    },
+    async draft() {
+      return ''
     }
   }
 }

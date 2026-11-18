@@ -20,6 +20,7 @@ declare module 'node:fs' {
   export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void
   export function readdirSync(path: string): string[]
   export function symlinkSync(target: string, path: string): void
+  export function statSync(path: string): { mode: number }
 }
 declare module 'node:os' {
   export function homedir(): string

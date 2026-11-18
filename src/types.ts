@@ -155,6 +155,9 @@ export type WaitingEntry = {
   /** The move found unsent text in the pane's input box: the pane is not closed, the user was
    *  told (at this time), and every tick looks again until the text is gone. */
   draftAt?: number
+  /** With `draftAt`: held because Orca could not say whether the pane is between turns with an
+   *  empty input box, not because text was seen there. */
+  unchecked?: boolean
   /** The limit whose move waits for that text (absent for a wait for a reset). */
   reason?: SwapReason
 }

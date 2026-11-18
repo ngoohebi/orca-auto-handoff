@@ -217,8 +217,11 @@ export function nodeCli(getPath: () => Promise<string>): Cli {
     },
     async draft(terminalId: string, server?: string) {
       const result = await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'read', '--terminal', terminalId, '--limit', '1', ...envArgs(server)])
-      const text = result?.terminal?.draft
-      return typeof text === 'string' ? text : undefined
+      // Orca leaves `draft` out when the input box is empty. An answer without the terminal is
+      // no answer: the engine then treats the pane as possibly holding unsent text.
+      const terminal = result?.terminal
+      if (!terminal || typeof terminal !== 'object') return undefined
+      return typeof terminal.draft === 'string' ? terminal.draft : ''
     },
     async workspaceServer(workspaceId?: string) {
       return resolveWorkspaceHostFromCatalog(resolveOrcaCli(await getPath()), workspaceId)

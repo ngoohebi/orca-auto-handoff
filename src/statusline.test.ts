@@ -1,7 +1,7 @@
 // The console status line: the status file, the settings.local.json merge, the wrapper script run
 // by a real `sh`, and the worker commands against memory files.
 import { execFile } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
@@ -15,7 +15,7 @@ import {
   renderStatusFile,
   uninstallFromSettings
 } from './statusline'
-import { memoryFiles } from './statusline-files'
+import { ConsoleStatusLine, memoryFiles, nodeFiles } from './statusline-files'
 import type { Snapshot } from './types'
 import { activateWith } from './worker'
 
@@ -564,7 +564,7 @@ test('worker: install and uninstall edit the focused workspace, the status file 
             select: async () => undefined,
             closeTerminal: async () => undefined,
             sendText: async () => undefined,
-            git: async () => ''
+            git: async () => '', draft: async () => ''
           },
           now: () => NOW,
           sleep: async () => undefined
@@ -645,7 +645,7 @@ test('worker: when the focused workspace changes, the panel is told the status l
       await activateWith(
         orca,
         {
-          cli: { listAccounts: async () => ({ claude: { accounts: [{ id: 'aaa', email: 'me@example.com' }], activeAccountId: 'aaa' }, rateLimits: {} }), select: async () => undefined, closeTerminal: async () => undefined, sendText: async () => undefined, git: async () => '' },
+          cli: { listAccounts: async () => ({ claude: { accounts: [{ id: 'aaa', email: 'me@example.com' }], activeAccountId: 'aaa' }, rateLimits: {} }), select: async () => undefined, closeTerminal: async () => undefined, sendText: async () => undefined, git: async () => '', draft: async () => '' },
           now: () => NOW,
           sleep: async () => undefined
         },
@@ -695,7 +695,7 @@ test('worker: the console status line is not installed for a workspace on anothe
         await activateWith(
           orca,
           {
-            cli: { listAccounts: async () => ({ claude: { accounts: [{ id: 'aaa', email: 'me@example.com' }], activeAccountId: 'aaa' }, rateLimits: {} }), select: async () => undefined, closeTerminal: async () => undefined, sendText: async () => undefined, git: async () => '' },
+            cli: { listAccounts: async () => ({ claude: { accounts: [{ id: 'aaa', email: 'me@example.com' }], activeAccountId: 'aaa' }, rateLimits: {} }), select: async () => undefined, closeTerminal: async () => undefined, sendText: async () => undefined, git: async () => '', draft: async () => '' },
             now: () => NOW,
             sleep: async () => undefined
           },
@@ -738,5 +738,53 @@ test('worker: the console status line is not installed for a workspace on anothe
     } finally {
       await m.worker.deactivate()
     }
+  }
+})
+
+// The status file and the live files carry account names (emails): only their owner reads them.
+const modeOf = (path: string) => statSync(path).mode & 0o777
+
+test('private files: the worker writes status.tsv as 0600 in a 0700 folder, also when both existed with wider modes', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'rotator-modes-'))
+  try {
+    const dir = join(home, '.orca/account-rotator')
+    // As an earlier version left them.
+    mkdirSync(dir, { recursive: true, mode: 0o755 })
+    chmodSync(dir, 0o755)
+    writeFileSync(join(dir, 'status.tsv'), 'old\n', { mode: 0o644 })
+    chmodSync(join(dir, 'status.tsv'), 0o644)
+    const line = new ConsoleStatusLine({ ...nodeFiles(), home }, { host: { call: async () => ({}) }, settings: async () => ({}), log: () => undefined, now: () => NOW })
+    await line.writeStatus(snapshot())
+    assert.equal(modeOf(join(dir, 'status.tsv')), 0o600)
+    assert.equal(modeOf(dir), 0o700)
+    assert.equal(modeOf(join(dir, 'claude-statusline.sh')), 0o755)
+    // A workspace's settings file is not the plugin's to lock down.
+    const repo = join(home, 'repo/.claude')
+    nodeFiles().write(join(repo, 'settings.local.json'), '{}\n')
+    assert.equal(modeOf(join(repo, 'settings.local.json')), 0o644)
+    assert.equal(modeOf(repo) & 0o700, 0o700)
+    assert.notEqual(modeOf(repo), 0o700)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+  // The same through the stand-in the worker tests use.
+  const files = memoryFiles('/home/u')
+  const line = new ConsoleStatusLine(files, { host: { call: async () => ({}) }, settings: async () => ({}), log: () => undefined, now: () => NOW })
+  await line.writeStatus(snapshot())
+  assert.equal(files.modes.get('/home/u/.orca/account-rotator/status.tsv'), 0o600)
+  assert.equal(files.modes.get('/home/u/.orca/account-rotator'), 0o700)
+})
+
+test('private files: the wrapper script writes a live file as 0600 and makes its folder 0700', async () => {
+  const fx = fakeHome()
+  try {
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    const env = { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/bbb/home` }
+    const run = await sh(script, PAYLOAD, env)
+    assert.equal(run.code, 0, run.stderr)
+    assert.equal(modeOf(liveFile(fx.home, 'bbb')), 0o600)
+    assert.equal(modeOf(join(fx.home, '.orca/account-rotator/live')), 0o700)
+  } finally {
+    fx.cleanup()
   }
 })
