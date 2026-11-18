@@ -200,7 +200,7 @@ const statusEvent = (terminalId: string, state: 'done' | 'waiting' = 'done', sta
   mainAgent: { state, stateStartedAt: stamp }
 })
 
-test('Claude rate limit: select next account, close, resume, send "Go continue."', async () => {
+test('Claude rate limit: select next account, close, resume, send "Continue."', async () => {
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', title: 'fix parser' }],
     tails: { t1: fx.CLAUDE_SESSION_LIMIT }
@@ -210,7 +210,7 @@ test('Claude rate limit: select next account, close, resume, send "Go continue."
   assert.ok(w.cliCalls.includes('select claude c2'), w.cliCalls.join(','))
   assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
   assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w1', agent: 'claude', sessionId: 's1' }])
-  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }])
+  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Continue.' }])
   const state = w.host.data().storage.state as RotatorState
   assert.equal(state.paneSeat.t2, 'claude:c2')
   assert.ok(state.health['claude:c1']?.cooldownUntil! > 1_000_000)
@@ -298,12 +298,12 @@ test('API error: retry in place with backoff, no account change', async () => {
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1', 'done', 1))
-  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Go continue.' }])
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Continue.' }])
   // A repeated event with no new output does nothing.
   await worker.emit('agent.status.changed', statusEvent('t1', 'done', 1))
   assert.equal(w.typed.length, 1)
   // The same error printed again after the retry (a new copy): retried again.
-  w.tails.t1!.push('❯ Go continue.', ...fx.CLAUDE_API_ERROR)
+  w.tails.t1!.push('❯ Continue.', ...fx.CLAUDE_API_ERROR)
   await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
   assert.equal(w.typed.length, 2)
   assert.equal(w.cliCalls.filter((c) => c.startsWith('select')).length, 0)
@@ -392,7 +392,7 @@ test('model cap: switch model in place before rotating accounts', async () => {
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
-  assert.deepEqual(w.typed.map((t) => t.text), ['/model sonnet', 'Go continue.'])
+  assert.deepEqual(w.typed.map((t) => t.text), ['/model sonnet', 'Continue.'])
   assert.equal(w.cliCalls.filter((c) => c.startsWith('select')).length, 0)
   await worker.deactivate()
 })
@@ -499,7 +499,7 @@ test('live bug: a resumed session redrawing the old banner does not cascade thro
   await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
   // A real new limit on the new account (a new copy of a banner) still switches.
-  w.tails.t2!.push('❯ Go continue.', '⏺ Continuing.', '  ⎿  5-hour limit reached ∙ resets 3pm')
+  w.tails.t2!.push('❯ Continue.', '⏺ Continuing.', '  ⎿  5-hour limit reached ∙ resets 3pm')
   await worker.emit('agent.status.changed', statusEvent('t2', 'done', 3))
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c3'])
   await worker.deactivate()
@@ -513,7 +513,7 @@ test('live bug: the redraw arrives after the plugin first reads the new pane —
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
-  assert.match(w.tails.t2!.join('\n'), /5-hour limit reached[\s\S]*❯ Go continue\./)
+  assert.match(w.tails.t2!.join('\n'), /5-hour limit reached[\s\S]*❯ Continue\./)
   await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
   await worker.deactivate()
@@ -528,7 +528,7 @@ test('live bug: host send refused outside the focused workspace falls back to th
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
   assert.ok(w.cliCalls.includes('send t2'), w.cliCalls.join(','))
-  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }])
+  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Continue.' }])
   const state = w.host.data().storage.state as RotatorState
   assert.equal(state.history.at(-1)?.result, 'resumed')
   assert.equal(state.history.filter((h) => h.result === 'failed').length, 0)
@@ -554,7 +554,7 @@ test('a service switched off is left alone; the others still switch', async () =
   const out = await worker.request('rotator.setService', { provider: 'claude', enabled: true })
   assert.equal(out.services.claude, true)
   assert.equal(w.host.data().settings.service_claude, true)
-  w.tails.t1!.push('❯ Go continue.', '  ⎿  5-hour limit reached ∙ resets 3pm')
+  w.tails.t1!.push('❯ Continue.', '  ⎿  5-hour limit reached ∙ resets 3pm')
   await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
   assert.ok(w.cliCalls.includes('select claude c2'), w.cliCalls.join(','))
   const snap = await worker.request('rotator.snapshot', {})
@@ -626,7 +626,7 @@ test('review: a resumed pane read before its transcript is redrawn does not forg
   w.tails.t2 = []
   await worker.emit('agent.status.changed', statusEvent('t2', 'waiting'))
   // …then draws the old transcript, and the agent answers briefly.
-  w.tails.t2 = [...fx.CLAUDE_SESSION_LIMIT, '❯ Go continue.', '⏺ Continuing.']
+  w.tails.t2 = [...fx.CLAUDE_SESSION_LIMIT, '❯ Continue.', '⏺ Continuing.']
   await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
   assert.equal(w.host.callsOf('agent.resume').length, 1)
@@ -732,8 +732,8 @@ test('switch back: once the first account resets, new launches use it and a pane
   assert.deepEqual(w.host.callsOf('terminal.close').map((c: any) => c.terminalId), ['t1', 't2'])
   // Only the limit, which interrupted the work, was followed by the first message (in t2). The
   // switch-back moved a session that had finished its turn: it is resumed and left ready, since
-  // typing "Go continue." there would start work nobody asked for.
-  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }])
+  // typing "Continue." there would start work nobody asked for.
+  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Continue.' }])
   state = w.host.data().storage.state as RotatorState
   assert.equal(state.paneSeat.t3, 'claude:c1')
   assert.equal(state.history.at(-1)?.reason, 'switch_back')
@@ -760,7 +760,7 @@ test('switch back: an idle pane on the backup account moves without waiting for 
   // The first message follows the limit only (t2). The idle pane moved back had finished its
   // turn: it is resumed on c1 and left ready, not told to continue (this asserted the opposite
   // until fix round 15: an idle session was set to work again by a move that was only advice).
-  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }])
+  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Continue.' }])
   assert.equal((w.host.data().storage.state as RotatorState).paneSeat.t3, 'claude:c1')
   await worker.deactivate()
 })
@@ -813,7 +813,7 @@ test('a seat that fails to switch is skipped for ten minutes; the rotation moves
   assert.equal(state.health['claude:c2']?.cooldownUntil, 1_000_000 + 10 * 60_000)
   assert.equal(w.host.callsOf('terminal.close').length, 0)
   // The banner is printed again: c2 is skipped, c3 taken.
-  w.tails.t1!.push('❯ Go continue.', '  ⎿  5-hour limit reached ∙ resets 3pm')
+  w.tails.t1!.push('❯ Continue.', '  ⎿  5-hour limit reached ∙ resets 3pm')
   await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c3'])
   state = w.host.data().storage.state as RotatorState
@@ -2236,7 +2236,7 @@ test('model cap, Smart: an account known to have room for that model comes befor
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
   assert.deepEqual(selects(w), ['select claude c2'])
-  assert.deepEqual(w.typed.map((t) => t.text), ['Go continue.'])
+  assert.deepEqual(w.typed.map((t) => t.text), ['Continue.'])
   assert.equal(stored(w).history.at(-1)?.reason, 'model_cap')
   assert.equal(stored(w).history.at(-1)?.result, 'resumed')
   await worker.deactivate()
@@ -2251,7 +2251,7 @@ test('model cap, Smart: an account known to have room for that model comes befor
   const fw = await full.mount()
   await fw.emit('agent.status.changed', statusEvent('t1'))
   assert.deepEqual(selects(full), [])
-  assert.deepEqual(full.typed.map((t) => t.text), ['/model sonnet', 'Go continue.'])
+  assert.deepEqual(full.typed.map((t) => t.text), ['/model sonnet', 'Continue.'])
   await fw.deactivate()
 })
 
@@ -2344,7 +2344,7 @@ test('model cap, custom: the legacy order is unchanged (fallback model first, th
   let worker = await withFallback.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
   assert.deepEqual(selects(withFallback), [])
-  assert.deepEqual(withFallback.typed.map((t) => t.text), ['/model sonnet', 'Go continue.'])
+  assert.deepEqual(withFallback.typed.map((t) => t.text), ['/model sonnet', 'Continue.'])
   await worker.deactivate()
 
   const without = world({
@@ -2694,7 +2694,7 @@ test('smart: short wait. An account that resets within 5 minutes is waited for, 
   await w.rotator.tick()
   state = stored(w)
   assert.equal(state.waiting.length, 0)
-  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Go continue.' }])
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Continue.' }])
   assert.equal(w.host.callsOf('terminal.close').length, 0)
   assert.equal(w.host.callsOf('agent.resume').length, 0)
   assert.deepEqual(selects(w), [])
@@ -2931,7 +2931,7 @@ test('unsent text Orca reports apart from the screen: a limit does not close the
   await w.rotator.tick()
   assert.deepEqual(selects(w), ['select claude c2'])
   assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
-  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }])
+  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Continue.' }])
   await worker.deactivate()
 })
 
@@ -3048,7 +3048,7 @@ test('unsent text: once it is cleared the limit move happens (at a tick, or at a
     assert.deepEqual(selects(w), ['select claude c2'], by)
     assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }], by)
     assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w1', agent: 'claude', sessionId: 's1' }], by)
-    assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }], by)
+    assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Continue.' }], by)
     const state = stored(w)
     assert.equal(state.waiting.length, 0, by)
     assert.equal(state.paneSeat.t2, 'claude:c2', by)
@@ -3558,7 +3558,7 @@ test('API error: no retry is typed once the error is no longer the latest output
   worker = await limited.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
   assert.deepEqual(selects(limited), ['select claude c2'])
-  assert.deepEqual(limited.typed, [{ terminalId: 't2', text: 'Go continue.' }])
+  assert.deepEqual(limited.typed, [{ terminalId: 't2', text: 'Continue.' }])
   assert.equal(stored(limited).history.at(-1)?.result, 'resumed')
   await worker.deactivate()
 })
@@ -4027,7 +4027,7 @@ test('model cap: the fallback model is never typed into a turn the user started 
     w.panes[0]!.state = 'done'
     w.tails.t1 = [...fx.CLAUDE_MODEL_CAP, '❯ go on', ...fx.CLAUDE_MODEL_CAP]
     await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
-    assert.deepEqual(w.typed.map((t) => t.text), ['/model sonnet', 'Go continue.'], mode)
+    assert.deepEqual(w.typed.map((t) => t.text), ['/model sonnet', 'Continue.'], mode)
     await worker.deactivate()
   }
 })
@@ -4162,7 +4162,7 @@ test('fail closed: when Orca cannot say what the input box holds, a limit does n
     await w.rotator.tick()
     assert.deepEqual(selects(w), ['select claude c2'], how)
     assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }], how)
-    assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }], how)
+    assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Continue.' }], how)
     await worker.deactivate()
   }
 })
@@ -4286,7 +4286,7 @@ test('fail closed: a short wait that is over keeps waiting while Orca cannot say
   delete drafts.t1
   w.advance(30_000)
   await w.rotator.tick()
-  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Go continue.' }])
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Continue.' }])
   assert.equal(stored(w).waiting.length, 0)
   assert.equal(w.host.callsOf('terminal.close').length, 0)
   await worker.deactivate()
@@ -4427,7 +4427,7 @@ test('the first message is typed only where work was interrupted: not after an e
   })
   worker = await limit.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
-  assert.deepEqual(limit.typed, [{ terminalId: 't2', text: 'Go continue.' }])
+  assert.deepEqual(limit.typed, [{ terminalId: 't2', text: 'Continue.' }])
   await worker.deactivate()
 })
 

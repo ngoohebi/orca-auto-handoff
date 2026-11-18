@@ -296,7 +296,7 @@ footer a{color:var(--fg-2)}
       <div class="step"><h3>Select</h3><p>Runs <code>orca account select</code>, so new launches use the new account too.</p></div>
       <div class="step"><h3>Close</h3><p>Closes the limited pane, through the host API or the Orca CLI when the pane is in another workspace.</p></div>
       <div class="step"><h3>Resume</h3><p>Calls <code>agent.resume</code> on the same session id. Services that cannot resume (Codex, Antigravity, OpenCode, Devin) start a new session from a summary instead, and only at a real limit.</p></div>
-      <div class="step"><h3>First message</h3><p>Types the configured message, "Go continue." by default, and the agent carries on. Only where a limit or API error interrupted the work: a session that had finished its turn and was moved early is resumed and left ready.</p></div>
+      <div class="step"><h3>First message</h3><p>Types the configured message, "Continue." by default, and the agent carries on. Only where a limit or API error interrupted the work: a session that had finished its turn and was moved early is resumed and left ready.</p></div>
     </div>
 
     <div class="trace">
@@ -312,7 +312,7 @@ footer a{color:var(--fg-2)}
         <div><span class="k">select  </span>  orca account select work@example.com</div>
         <div><span class="k">close   </span>  pane 3</div>
         <div><span class="k">resume  </span>  agent.resume 7f3a… <span class="dim">on work@example.com</span></div>
-        <div><span class="k">send    </span>  "Go continue."</div>
+        <div><span class="k">send    </span>  "Continue."</div>
         <div><span class="g">✓</span> one swap, same session, same workspace</div>
       </div>
     </div>
@@ -448,7 +448,7 @@ footer a{color:var(--fg-2)}
 <tr><td><code>thresholds_five_hour</code><div class="st">5-hour threshold (%)</div></td><td>100</td><td>100 = only when exhausted.</td></tr>
 <tr><td><code>thresholds_seven_day</code><div class="st">Weekly threshold (%)</div></td><td>100</td><td></td></tr>
 <tr><td><code>auto_resume</code><div class="st">Resume the session after a switch</div></td><td>on</td><td>Only used when Auto-switch is custom (otherwise see Running sessions). Off: the plugin only switches the account for new launches and tells you. The limited pane stays for you to resume.</td></tr>
-<tr><td><code>auto_message</code><div class="st">First message after a switch</div></td><td>Go continue.</td><td>Empty = resume silently.</td></tr>
+<tr><td><code>auto_message</code><div class="st">First message after a switch</div></td><td>Continue.</td><td>Empty = resume silently.</td></tr>
 <tr><td><code>wait_for_reset</code><div class="st">Wait for reset when every account is exhausted</div></td><td>on</td><td></td></tr>
 <tr><td><code>retry_on_api_error</code><div class="st">Retry on API errors</div></td><td>on</td><td>Types the first message again after a Fibonacci backoff (5 s … 120 s).</td></tr>
 <tr><td><code>max_api_retries</code><div class="st">Maximum API error retries</div></td><td>6</td><td></td></tr>

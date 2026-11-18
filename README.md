@@ -28,7 +28,7 @@ OpenCode and Devin. When an agent pane hits a rate limit, or a usage threshold y
 3. runs `orca account select`,
 4. closes the limited pane,
 5. resumes the same session (`agent.resume`),
-6. types the configured first message ("Go continue." by default), when a limit interrupted the
+6. types the configured first message ("Continue." by default), when a limit interrupted the
    work. A session that had finished its turn and was moved early is resumed and left ready.
 
 When every account of the provider is exhausted it parks the session and resumes it when the
@@ -79,7 +79,7 @@ Out of the box, Auto Hand-off runs in **Smart** mode. You do not have to set any
   to Claude sessions, which resume as the same session. Codex, Antigravity, OpenCode and Devin
   sessions would start over from a summary, so they move only at a real limit; for them, only
   the account for new sessions changes ahead of time.
-- **It does not set a finished session to work.** "Go continue." is typed only after a limit or
+- **It does not set a finished session to work.** "Continue." is typed only after a limit or
   an API error interrupted the work, or when a session that waited for a reset wakes up. A
   session that had finished its turn and was moved early, when idle, for expiring quota or back
   to an earlier account is resumed and left ready for you.
@@ -288,7 +288,7 @@ automatic rotation and switch-back; picking them from the panel still works.
 | `service_claude`, `service_codex`, `service_antigravity`, `service_opencode`, `service_devin` | on | Automatic hand-off per service |
 | `chain` (*Account order*) | empty | Your own order of accounts. Empty = Orca's order |
 | `exclude` (*Never switch to*) | empty | Accounts automatic hand-off never picks |
-| `auto_message` | `Go continue.` | First message typed after a move that a limit or API error caused, or when a waiting session wakes. Not typed after an early, idle, expiring-quota, switch-back or manual move. Empty = resume silently |
+| `auto_message` | `Continue.` | First message typed after a move that a limit or API error caused, or when a waiting session wakes. Not typed after an early, idle, expiring-quota, switch-back or manual move. Empty = resume silently |
 | `model_fallback` | empty | Models to try on the same account when one model's limit is hit, e.g. `claude=sonnet,haiku` |
 | `retry_on_api_error`, `max_api_retries` | on, 6 | Retry in place on API errors |
 | `default_cooldown_minutes` | 60 | Used when nothing says when a limit resets |
@@ -444,7 +444,7 @@ A scratch Claude agent printed a `5-hour limit reached ∙ resets 3pm` line. The
 - ran `orca account select` for the next account,
 - closed the pane,
 - `agent.resume`d the same session on the new account,
-- typed "Go continue.", which the agent answered.
+- typed "Continue.", which the agent answered.
 
 There was exactly one swap and no cascade. Behaviour learned on the way, all covered by
 regression tests:

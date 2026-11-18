@@ -241,7 +241,7 @@ export const DEFAULT_CONFIG: Config = {
   exclude: '',
   autoSwitchOnRateLimit: true,
   autoResume: true,
-  autoMessage: 'Go continue.',
+  autoMessage: 'Continue.',
   waitForReset: true,
   retryOnApiError: true,
   maxApiRetries: 6,

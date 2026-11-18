@@ -98,7 +98,7 @@ test('unsent text in the input box is a draft; placeholders and empty boxes are 
   assert.equal(hasDraft(['⏺ Done.', '╭────╮', '│ > Try "fix lint errors"', '╰────╯']), false)
   assert.equal(hasDraft(fx.CODEX_OLLAMA_CREDITS), false)
   assert.equal(hasDraft(['■ done', '› rerun the tests', '  gpt-5 · ~/repo']), true)
-  assert.equal(hasDraft(['❯ Go continue.', '⏺ Working on it']), false)
+  assert.equal(hasDraft(['❯ Continue.', '⏺ Working on it']), false)
 })
 
 // Live (Orca 1.4.263, Claude Code with the console status line installed): `terminal.read` gives the

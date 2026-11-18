@@ -182,7 +182,7 @@
         "key": "auto_message",
         "title": "First message after a switch",
         "type": "string",
-        "default": "Go continue.",
+        "default": "Continue.",
         "description": "Typed after a move that a limit or API error caused, or when a waiting session wakes; not after an early, idle or manual move. Empty = resume silently."
       },
       {
