@@ -947,7 +947,11 @@ export class Rotator {
       } catch {
         continue
       }
-      const row = agents.find((a) => a.terminalId === event.terminalId)
+      // Orca 1.4.263 lists a pane that was started in the background and never shown with
+      // `terminalId: null`; its session id still ties it to the event.
+      const row =
+        agents.find((a) => a.terminalId === event.terminalId) ??
+        (event.sessionId ? agents.find((a) => !a.terminalId && a.sessionId === event.sessionId) : undefined)
       if (!row) continue
       const agent = providerOf(row.agent)
       if (!agent) return null

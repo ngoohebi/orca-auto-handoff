@@ -6,7 +6,7 @@ import * as fx from './fixtures'
 import { activateWith, readConfig, resolveMode, statusText } from './worker'
 import { DEFAULT_CONFIG, SMART_CONFIG, type Config, type RotatorState } from './types'
 
-type Pane = { terminalId: string; agent: string; state: 'working' | 'waiting' | 'done' | 'blocked'; sessionId?: string; title?: string; stateStartedAt?: number }
+type Pane = { terminalId: string; agent: string; state: 'working' | 'waiting' | 'done' | 'blocked'; sessionId?: string; title?: string; stateStartedAt?: number; unlisted?: boolean }
 
 function world(options: {
   panes: Pane[]
@@ -131,7 +131,10 @@ function world(options: {
     results: {
       'agents.list': (params?: { workspaceId?: string }) => {
         if (options.agentsListFails?.(params)) throw Object.assign(new Error('selector_not_found'), { code: 'action_failed' })
-        return { agents: panes.map((p) => ({ title: null, task: null, stateStartedAt: 1, sessionId: null, ...p })) }
+        // Orca 1.4.263 lists a background pane that was never shown with `terminalId: null`.
+        return {
+          agents: panes.map(({ unlisted, ...p }) => ({ title: null, task: null, stateStartedAt: 1, sessionId: null, ...p, ...(unlisted ? { terminalId: null } : {}) }))
+        }
       },
       'terminal.read': ({ terminalId }: { terminalId: string }) => ({ lines: options.tails[terminalId] ?? [], truncated: false }),
       'terminal.close': ({ terminalId }: { terminalId: string }) => {
@@ -198,6 +201,27 @@ const statusEvent = (terminalId: string, state: 'done' | 'waiting' = 'done', sta
   state,
   receivedAt: stamp,
   mainAgent: { state, stateStartedAt: stamp }
+})
+
+test('live (Orca 1.4.263): a background pane listed without its terminal id is found by its session id', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', unlisted: true }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', { ...statusEvent('t1'), sessionId: 's1' })
+  assert.ok(w.cliCalls.includes('select claude c2'), w.cliCalls.join(','))
+  assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w1', agent: 'claude', sessionId: 's1' }])
+  // Without a session id in the event there is nothing to tie it to: left alone.
+  const blind = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', unlisted: true }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT }
+  })
+  const w2 = await blind.mount()
+  await w2.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(blind.cliCalls.filter((c) => c.startsWith('select')).length, 0)
+  await worker.deactivate()
+  await w2.deactivate()
 })
 
 test('Claude rate limit: select next account, close, resume, send "Continue."', async () => {
