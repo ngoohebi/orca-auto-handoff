@@ -960,7 +960,12 @@ export class Rotator {
       await this.switchBack(pane, lines)
       return
     }
-    if (!this.isNew(key, signal)) return
+    if (!this.isNew(key, signal)) {
+      // A move that waits for unsent text to go: look again (the tick does the same).
+      const held = this.state.waiting.find((w) => w.terminalId === pane.terminalId && w.draftAt)
+      if (held) await this.wake(held)
+      return
+    }
     this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences, line: signal.line }
     await this.save()
     this.deps.log(`${pane.agent} ${pane.terminalId}: ${signal.kind} — ${signal.line}`)
@@ -1445,6 +1450,13 @@ export class Rotator {
     let reselected = false
     const canResume = !!pane.sessionId && ADAPTERS[pane.agent].resume === 'by-session-id'
     const agentId = pane.agentId ?? pane.agent
+    // A limit, or the wake of a parked session, closes the pane too: never while its input box
+    // holds unsent text. (Moves that are advice check this in `advisoryOk`.)
+    const closesUnasked = reason === 'rate_limit' || reason === 'auth' || reason === 'model_cap' || reason === 'reset'
+    if (config.autoResume && closesUnasked && (await this.draftIn(pane, lines))) {
+      await this.holdForDraft(pane, from, target, reason, signal?.model, view)
+      return
+    }
     try {
       if (view.active[target.provider] !== target.key) {
         await this.selectOn(target.provider, target.accountId, pane.server)
@@ -1534,6 +1546,50 @@ export class Rotator {
       await this.deps.notify('Auto Hand-off', `Swap to ${target.label} failed: ${message}`)
       this.publishNow()
     }
+  }
+
+  /** Unsent text in the pane's input box, as the pane is now (`lines` when it cannot be read). */
+  private async draftIn(pane: PaneInfo, lines: readonly string[]): Promise<boolean> {
+    const screen = await this.deps.host.call('terminal.read', { terminalId: pane.terminalId, maxLines: 80 }).catch(() => null)
+    return hasDraft(screen?.lines ?? lines)
+  }
+
+  /** The pane holds unsent text, which closing it would throw away: it stays as it is, and the
+   *  move stays pending as a waiting entry that every tick (and status event) looks at again.
+   *  Noted in the history and said once per wait, not on every look. */
+  private async holdForDraft(pane: PaneInfo, from: Seat | undefined, target: Seat, reason: SwapReason, model: string | undefined, view: AccountView): Promise<void> {
+    const parked = this.state.waiting.find((w) => w.terminalId === pane.terminalId)
+    if (parked?.draftAt) return
+    const now = this.deps.now()
+    const labels = displayLabels(view.seats, pane.agent)
+    const to = labels.get(target.key) ?? target.label
+    const source = from ? (labels.get(from.key) ?? from.label) : undefined
+    const service = PROVIDER_NAME[pane.agent]
+    this.deps.log(`${pane.agent} ${pane.terminalId}: unsent text in the input box, not closing it`)
+    if (parked) parked.draftAt = now
+    else {
+      const entry: WaitingEntry = { terminalId: pane.terminalId, workspaceId: pane.workspaceId, agent: pane.agent, wakeAt: now, draftAt: now, reason }
+      if (model) entry.model = model
+      if (pane.sessionId) entry.sessionId = pane.sessionId
+      if (pane.agentId) entry.agentId = pane.agentId
+      if (from) entry.fromSeat = from.key
+      if (pane.server) entry.server = pane.server
+      this.state.waiting = [...this.state.waiting, entry]
+    }
+    const waited = reason === 'reset'
+    this.record({
+      provider: pane.agent,
+      terminalId: pane.terminalId,
+      reason,
+      result: 'waiting',
+      ...(from ? { from: from.key } : {}),
+      detail: 'unsent text in the input box',
+      why: `${waited ? `${to} is free` : `${source ?? service} hit its limit`}; the session moves to ${to} once the unsent text in its input box is sent or cleared`
+    })
+    await this.save()
+    const what = waited ? `${service}: ${to} is free again.` : `${service} hit its limit${source ? ` on ${source}` : ''}.`
+    await this.deps.notify('Auto Hand-off', `${what} Send or clear the text you were typing and the session moves to ${to}.`)
+    this.publishNow()
   }
 
   /** A resumed session redraws its transcript, old limit banner included: that copy is not new. */
@@ -1877,12 +1933,15 @@ export class Rotator {
 
   private async wake(w: WaitingEntry): Promise<void> {
     await this.withLock(w.agent, async () => {
+      // Cancelled, or carried out by another look at it, while this one waited for its turn.
+      if (!this.state.waiting.includes(w)) return
       if (!(await this.allowed(w.agent))) return
       // The user went on in the parked pane, or the session already runs elsewhere: stop waiting.
       const { agents } = await this.deps.host.call('agents.list', { workspaceId: w.workspaceId }).catch(() => ({ agents: [] as any[] }))
       const busy = agents.some(
         (a: any) =>
-          (a.terminalId === w.terminalId && a.state === 'working') ||
+          // Anything but between turns: `blocked` (a permission question) is mid-turn too.
+          (a.terminalId === w.terminalId && a.state !== 'waiting' && a.state !== 'done') ||
           (w.sessionId && a.sessionId === w.sessionId && a.terminalId !== w.terminalId)
       )
       if (busy) {
@@ -1890,6 +1949,12 @@ export class Rotator {
         await this.save()
         this.publishNow()
         return
+      }
+      if (w.draftAt) {
+        // The move waits for unsent text: nothing to do, and nothing new to say, while it is there.
+        const screen = await this.deps.host.call('terminal.read', { terminalId: w.terminalId, maxLines: 80 }).catch(() => null)
+        if (screen && hasDraft(screen.lines)) return
+        delete w.draftAt
       }
       const config = await this.deps.config()
       const server = w.server ?? (await this.serverOfWorkspace(w.workspaceId))
@@ -1920,8 +1985,17 @@ export class Rotator {
       // in it.
       const early = w.model && w.wakeAt > now ? { only: this.modelRoom(chain, w.model, now, true) } : {}
       const context = this.looksAhead(config) && config.strategy === 'smart' ? { smart: await this.smartContext(w.agent, view, server, now) } : {}
-      const target = pickNext(chain, w.model && w.wakeAt > now ? w.fromSeat : undefined, this.state.health, config, now, { ...early, ...context })
+      // A model cap whose move waited for unsent text keeps its order: an account known to have
+      // room for that model, then one not known to be full in it.
+      const capped = w.reason === 'model_cap' && this.looksAhead(config)
+      const room = (unknownToo: boolean) =>
+        pickNext(chain, w.fromSeat, this.state.health, config, now, { only: this.modelRoom(chain, w.model, now, unknownToo), ...context })
+      const target = capped
+        ? (room(false) ?? room(true))
+        : pickNext(chain, w.model && w.wakeAt > now ? w.fromSeat : undefined, this.state.health, config, now, { ...early, ...context })
       if (!target) {
+        // Nowhere to go any more: from here on it is an ordinary wait for a reset.
+        delete w.reason
         w.wakeAt = earliestReset(chain, this.state.health, now) ?? now + config.defaultCooldownMinutes * 60_000
         await this.save()
         return
@@ -1937,7 +2011,9 @@ export class Rotator {
       } catch {
         // The parked pane may be gone already.
       }
-      await this.moveTo(pane, from, target, 'reset', lines, undefined, view, config)
+      const reason = w.reason ?? 'reset'
+      const why = reason === 'model_cap' && w.model ? this.why(reason, from, target, view, { model: w.model }) : undefined
+      await this.moveTo(pane, from, target, reason, lines, undefined, view, config, why)
     })
   }
 
@@ -2046,6 +2122,8 @@ export class Rotator {
     if (row.sessionId) pane.sessionId = row.sessionId
     if (server) pane.server = server
     const { lines } = await this.deps.host.call('terminal.read', { terminalId: row.terminalId, maxLines: 80 })
+    // Moving closes the pane, and with it whatever is typed in its input box.
+    if (hasDraft(lines)) return `${pane.agent}: this pane has unsent text in its input box; send or clear it first`
     const before = this.state.history.length
     await this.swap(pane, 'manual', lines)
     const last = this.state.history.length > before ? this.state.history.at(-1) : undefined

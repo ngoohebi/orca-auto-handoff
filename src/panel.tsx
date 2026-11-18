@@ -524,7 +524,13 @@ function Waiting({ snap }: { snap: Snapshot }) {
         {snap.waiting.map((w) => (
           <Row key={w.terminalId} justify="between" align="center" gap="sm">
             <Text size="xs">
-              {PROVIDER_NAME[w.agent] ?? w.agent} session resumes <RelativeTime at={w.wakeAt} />
+              {w.draftAt ? (
+                <>{PROVIDER_NAME[w.agent] ?? w.agent} session moves once the text typed in it is sent or cleared</>
+              ) : (
+                <>
+                  {PROVIDER_NAME[w.agent] ?? w.agent} session resumes <RelativeTime at={w.wakeAt} />
+                </>
+              )}
             </Text>
             <Button
               size="xs"

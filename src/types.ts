@@ -150,6 +150,11 @@ export type WaitingEntry = {
   /** Waiting for this model's bucket: woken at `wakeAt`, or once an account is known to have room
    *  in that bucket. */
   model?: string
+  /** The move found unsent text in the pane's input box: the pane is not closed, the user was
+   *  told (at this time), and every tick looks again until the text is gone. */
+  draftAt?: number
+  /** The limit whose move waits for that text (absent for a wait for a reset). */
+  reason?: SwapReason
 }
 
 /** How the plugin decides (the `mode` setting, with `auto` resolved; see `resolveSettings`). */

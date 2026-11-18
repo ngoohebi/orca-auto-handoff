@@ -233,7 +233,7 @@ footer a{color:var(--fg-2)}
         <span class="badge">v<b>0.2.0</b></span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
         <span class="badge"><b>MIT</b> license</span>
-        <span class="badge"><b>188</b> tests, real captured banners</span>
+        <span class="badge"><b>199</b> tests, real captured banners</span>
         <span class="badge">Never switches <b>across services</b></span>
       </div>
       <div class="cta">
@@ -344,7 +344,7 @@ footer a{color:var(--fg-2)}
     </div>
 
     <div class="grid g3" style="margin-top:28px">
-      <div class="tile"><h3>Guards on advisory moves</h3><p>Threshold, idle and switch-back moves never close a pane holding unsent text, need at least a 10 % headroom gap, and change a service's selection at most once per 5 minutes. Hard limits ignore the guards.</p></div>
+      <div class="tile"><h3>Guards on moves</h3><p>No automatic move closes a pane holding unsent text. At a hard limit, or when a parked session is due, you are told once and the move is carried out as soon as the text is sent or cleared. Threshold, idle and switch-back moves also need at least a 10 % headroom gap, and change a service's selection at most once per 5 minutes; hard limits ignore those two.</p></div>
       <div class="tile"><h3>Panes it did not start</h3><p>A restored pane has no recorded account. If it hits a limit while Orca shows plenty of room on the active account, the plugin cools nothing and simply resumes the session there.</p></div>
       <div class="tile"><h3>Off switches</h3><p>Detection is heuristic. One toggle pauses every service, each service has its own switch, and <code>exclude</code> keeps named accounts out of automatic rotation.</p></div>
     </div>
@@ -523,7 +523,7 @@ footer a{color:var(--fg-2)}
     <div class="note"><b>Coming from cux?</b> Run <code>cux uninstall-hooks</code> first so the two don't both rotate. Every cux setting key has the same name here. Per-directory project bindings and <code>cux attach</code> are not migrated yet.</div>
     <details>
       <summary>Working on the plugin itself</summary>
-      <pre style="margin-top:12px"><code>orca plugin test . --json        # 188 tests: adapters, selector, usage, status line, worker end to end, panel
+      <pre style="margin-top:12px"><code>orca plugin test . --json        # 199 tests: adapters, selector, usage, status line, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker
 npx -p typescript tsc -p .       # type-check
 orca plugin validate . --json

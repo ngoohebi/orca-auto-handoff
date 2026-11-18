@@ -89,6 +89,11 @@ test('worker pushes keep the panel current; waiting sessions are called out', as
   const view = await mount(panel, { host })
   await view.post('rotator.changed', snapshot({ paused: true, waiting: [{ terminalId: 't1', workspaceId: 'w1', agent: 'claude', wakeAt: NOW + 600_000 }] }))
   assert.ok(view.find({ text: /Waiting for a limit to reset/ }))
+  assert.ok(view.find({ text: /Claude session resumes/ }))
+  // A move that waits for unsent text says so instead of a time.
+  await view.post('rotator.changed', snapshot({ paused: true, waiting: [{ terminalId: 't1', workspaceId: 'w1', agent: 'claude', wakeAt: NOW, draftAt: NOW, reason: 'rate_limit' }] }))
+  assert.ok(view.find({ text: /Claude session moves once the text typed in it is sent or cleared/ }))
+  assert.equal(view.findAll({ text: /session resumes/ }).length, 0)
   await view.press({ text: 'Cancel' })
   assert.deepEqual(cancelled, ['t1'])
   assert.equal(view.valueOf({ label: 'Automatic hand-off' }), false)

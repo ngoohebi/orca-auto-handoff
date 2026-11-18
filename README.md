@@ -46,7 +46,8 @@ Out of the box, Auto Hand-off runs in **Smart** mode. You do not have to set any
   account *before* the limit is hit, so a turn does not fail halfway.
 - **It only moves a session at a safe moment.** That is between two turns, or when the session
   has been sitting idle for 15 minutes. It never interrupts a turn that is running, and it never
-  closes a session that has text typed in its input box but not sent yet.
+  closes a session that has text typed in its input box but not sent yet. That holds at a limit
+  too: you are told once, and the session moves as soon as you have sent or cleared the text.
 - **It moves one session at a time.** Only the session whose turn just ended moves. Your other
   sessions follow when their own turn ends or when they are idle.
 - **It picks the account that will last.** The next account is one the plugin has numbers for,
@@ -129,6 +130,7 @@ The table below lists every trigger. Rows that mention thresholds, strategies or
 | Auth failure | 12 h cooldown on that seat, switch |
 | A turn ends while the seat is over a threshold | Switch to an account with known room (thresholds default to 100 %, so this is reactive only); the seat left stays out of rotation until that window resets. An account without numbers is taken only when the current one is known to be at 100 % and no known account is left |
 | Every seat limited | Park; wake when the earliest seat frees up (*Wait for reset*). Carry on in the parked pane yourself and the wait ends |
+| A limit, or the wake of a parked session, finds unsent text in the pane's input box | The pane is not closed. The limited account is still set aside, History notes the wait once, and you are told once: "Claude hit its limit on *account*. Send or clear the text you were typing and the session moves to *target*." The plugin looks again at every status event and timer tick and carries out the move once the text is gone; the panel lists the session under *Waiting*, where *Cancel* drops the move. Send the text instead and that turn is handled like any other |
 | A higher-priority account is healthy again | **Switch back:** select it for new launches; sessions on lower accounts move back when they finish a turn or sit idle. Running sessions move only to an account that is known or presumed reset |
 | A session idles on an over-threshold account | Move it after *Move idle sessions after* seconds (900 by default; 0 = off), under the same rule as a threshold move |
 | The plugin just moved onto an account without numbers | *Probation* for max(10 min, 2 × the selection cooldown): no threshold, idle or switch-back move for that service, and a banner on that account is a strike |
@@ -177,9 +179,14 @@ close → resume → first message as any other swap. A running session moves ba
 with known room, or one presumed reset. The selection for new launches also moves to an account
 without numbers, as long as it has no strikes.
 
-**Guards on advisory moves** (threshold, idle, switch-back; hard limits ignore them):
+**Unsent text** is a guard on every automatic move, a hard limit and the wake of a parked session
+included: a pane whose input box holds unsent text is never closed. An advisory move is dropped
+and considered again at the next turn end or idle check; a limit move stays pending until the
+text is sent or cleared (see the table above). The *Move this workspace's agent to another
+account* command refuses such a pane as well.
 
-- a pane whose input box holds unsent text is never closed (the move waits for the next turn end);
+**Guards on advisory moves** (threshold, idle, switch-back; hard limits ignore these two):
+
 - the target needs at least *Minimum headroom gap* (10 %) more room than the current account when
   both are known, and an exhausted account may always leave; a target without numbers never counts
   as having more room. When Smart or Follow my order leaves an account because it is about to run
@@ -508,7 +515,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 188 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 199 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

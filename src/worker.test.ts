@@ -2372,3 +2372,293 @@ test('smart: a short wait never types into a pane that holds unsent text', async
   assert.match(lastNote(w), /has reset.*unsent text/)
   await worker.deactivate()
 })
+
+// ---- Unsent text: a limit, or the wake of a parked session, never closes such a pane ------------
+
+const notes = (w: { host: { callsOf(method: string): any[] } }): string[] => w.host.callsOf('notifications.show').map((c: any) => c.body as string)
+
+/** A Claude pane known to run on c1 that stopped on a limit while the user was typing in it. */
+const limitedWithDraft = (extra: Partial<Parameters<typeof world>[0]> = {}) =>
+  world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, ...DRAFT_BOX] },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    ...extra
+  })
+
+test('unsent text: a limit does not close the pane; it is said once and noted once', async () => {
+  const w = limitedWithDraft()
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('close')), [])
+  assert.deepEqual(selects(w), [])
+  assert.deepEqual(w.typed, [])
+  assert.ok(w.panes.some((p) => p.terminalId === 't1'))
+  assert.deepEqual(notes(w), ['Claude hit its limit on one. Send or clear the text you were typing and the session moves to two.'])
+  let state = stored(w)
+  assert.equal(state.waiting.length, 1)
+  assert.equal(state.waiting[0]!.reason, 'rate_limit')
+  assert.ok(state.waiting[0]!.draftAt)
+  // The account is still set aside, so nothing else is sent there.
+  assert.ok(state.health['claude:c1']?.cooldownUntil! > 1_000_000)
+  assert.deepEqual(state.history.map((h) => [h.reason, h.result, h.detail]), [['rate_limit', 'waiting', 'unsent text in the input box']])
+  // Status events and ticks look again while the text is there: no second notice, no second
+  // history entry, and the pane stays.
+  for (let i = 0; i < 4; i++) {
+    await worker.emit('agent.status.changed', statusEvent('t1', i % 2 ? 'done' : 'waiting', 2 + i))
+    w.advance(30_000)
+    await w.rotator.tick()
+  }
+  state = stored(w)
+  assert.equal(notes(w).length, 1)
+  assert.equal(state.history.length, 1)
+  assert.equal(state.waiting.length, 1)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.deepEqual(selects(w), [])
+  assert.deepEqual(w.typed, [])
+  await worker.deactivate()
+})
+
+test('unsent text: once it is cleared the limit move happens (at a tick, or at a status event)', async () => {
+  for (const by of ['tick', 'event'] as const) {
+    const w = limitedWithDraft()
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    assert.equal(w.host.callsOf('terminal.close').length, 0, by)
+    w.tails.t1 = [...fx.CLAUDE_LIMIT_NO_RESET, '╭──────────────╮', '│ >', '╰──────────────╯']
+    w.advance(30_000)
+    if (by === 'tick') await w.rotator.tick()
+    else await worker.emit('agent.status.changed', statusEvent('t1', 'waiting', 2))
+    assert.deepEqual(selects(w), ['select claude c2'], by)
+    assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }], by)
+    assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w1', agent: 'claude', sessionId: 's1' }], by)
+    assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Go continue.' }], by)
+    const state = stored(w)
+    assert.equal(state.waiting.length, 0, by)
+    assert.equal(state.paneSeat.t2, 'claude:c2', by)
+    assert.deepEqual([state.history.at(-1)?.reason, state.history.at(-1)?.result], ['rate_limit', 'resumed'], by)
+    assert.match(state.history.at(-1)?.why ?? '', /hit a usage limit; moved to two/, by)
+    // One notice for the wait, one for the move.
+    assert.equal(notes(w).length, 2, by)
+    await w.rotator.tick()
+    assert.equal(w.host.callsOf('agent.resume').length, 1, by)
+    await worker.deactivate()
+  }
+})
+
+test('unsent text: sent instead of cleared, the turn that follows is handled as any other', async () => {
+  const w = limitedWithDraft()
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  // The user sends it: the pane works, and a tick in between leaves it alone and stops waiting.
+  w.tails.t1 = [...fx.CLAUDE_LIMIT_NO_RESET, '❯ also update the docs']
+  w.panes[0]!.state = 'working'
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(stored(w).waiting.length, 0)
+  // The turn ends on the same limit (a new copy of the banner): now the session moves.
+  w.panes[0]!.state = 'done'
+  w.tails.t1 = [...fx.CLAUDE_LIMIT_NO_RESET, '❯ also update the docs', ...fx.CLAUDE_LIMIT_NO_RESET]
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('unsent text: the wake of a parked session waits for it too', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] },
+    state: {
+      paneSeat: { t1: 'claude:c1' },
+      health: { 'claude:c2': { cooldownUntil: 1_000_000 + 10 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 20 * MIN } }
+    }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting.length, 1)
+  const before = notes(w).length
+  // While parked, the user starts typing and does not send it.
+  w.tails.t1 = [...fx.CLAUDE_LIMIT_NO_RESET, ...DRAFT_BOX]
+  w.advance(11 * MIN)
+  for (let i = 0; i < 3; i++) {
+    await w.rotator.tick()
+    w.advance(30_000)
+  }
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(selects(w), [])
+  assert.deepEqual(w.typed, [])
+  assert.deepEqual(notes(w).slice(before), ['Claude: two is free again. Send or clear the text you were typing and the session moves to two.'])
+  let state = stored(w)
+  assert.equal(state.waiting.length, 1)
+  assert.ok(state.waiting[0]!.draftAt)
+  assert.equal(state.history.filter((h) => h.detail === 'unsent text in the input box').length, 1)
+  // Cleared: the wake goes through as before.
+  w.tails.t1 = [...fx.CLAUDE_LIMIT_NO_RESET]
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  state = stored(w)
+  assert.equal(state.waiting.length, 0)
+  assert.deepEqual([state.history.at(-1)?.reason, state.history.at(-1)?.result], ['reset', 'resumed'])
+  await worker.deactivate()
+})
+
+test('unsent text: paused, or the service off, the pending move stays pending after the text is gone', async () => {
+  for (const off of ['paused', 'service'] as const) {
+    const w = limitedWithDraft()
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    assert.equal(stored(w).waiting.length, 1, off)
+    if (off === 'paused') await worker.request('rotator.pause', { paused: true })
+    else await worker.request('rotator.setService', { provider: 'claude', enabled: false })
+    w.tails.t1 = [...fx.CLAUDE_LIMIT_NO_RESET]
+    for (let i = 0; i < 3; i++) {
+      w.advance(30_000)
+      await w.rotator.tick()
+      await worker.emit('agent.status.changed', statusEvent('t1', 'waiting', 2 + i))
+    }
+    assert.deepEqual(selects(w), [], off)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, off)
+    assert.equal(w.host.callsOf('agent.resume').length, 0, off)
+    assert.deepEqual(w.typed, [], off)
+    assert.equal(notes(w).filter((n) => /Send or clear/.test(n)).length, 1, off)
+    assert.equal(stored(w).waiting.length, 1, off)
+    // Back on: the move is carried out.
+    if (off === 'paused') await worker.request('rotator.pause', { paused: false })
+    else await worker.request('rotator.setService', { provider: 'claude', enabled: true })
+    await w.rotator.tick()
+    assert.deepEqual(selects(w), ['select claude c2'], off)
+    assert.equal(w.host.callsOf('agent.resume').length, 1, off)
+    await worker.deactivate()
+  }
+})
+
+test('unsent text: a limit on a paused or switched-off service is only noted, as before', async () => {
+  for (const off of ['paused', 'service'] as const) {
+    const w = limitedWithDraft(off === 'service' ? { settings: { service_claude: false } } : {})
+    const worker = await w.mount()
+    if (off === 'paused') await worker.request('rotator.pause', { paused: true })
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    await w.rotator.tick()
+    assert.equal(stored(w).waiting.length, 0, off)
+    assert.equal(stored(w).history.length, 0, off)
+    assert.equal(notes(w).filter((n) => /Send or clear/.test(n)).length, 0, off)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, off)
+    await worker.deactivate()
+  }
+})
+
+test('unsent text: a Codex limit (handoff) launches nothing and closes nothing until it is gone', async () => {
+  const w = world({
+    panes: [{ terminalId: 'k1', agent: 'codex', state: 'done', sessionId: 'cs1' }],
+    tails: { k1: [...fx.CODEX_USAGE_LIMIT, '', '› and bump the version', '  gpt-5 default · ~/projects/demo'] }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('k1'))
+  assert.equal(w.host.callsOf('agent.launch').length, 0)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(notes(w).filter((n) => /^Codex hit its limit.*Send or clear/.test(n)).length, 1)
+  w.tails.k1 = [...fx.CODEX_USAGE_LIMIT, '', '› Ask Codex to do anything', '  gpt-5 default · ~/projects/demo']
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.launch').length, 1)
+  assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 'k1' }])
+  assert.equal(stored(w).history.at(-1)?.result, 'handoff')
+  await worker.deactivate()
+})
+
+test('unsent text: the command that moves this workspace’s agent refuses instead of closing the pane', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: ['⏺ Done.', ...DRAFT_BOX] },
+    claudeUsage: { session: 5, weekly: 5 }
+  })
+  const worker = await w.mount()
+  assert.match(await w.rotator.swapFocused(), /unsent text in its input box/)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.deepEqual(selects(w), [])
+  w.tails.t1 = ['⏺ Done.']
+  assert.match(await w.rotator.swapFocused(), /moved to/)
+  assert.equal(w.host.callsOf('terminal.close').length, 1)
+  await worker.deactivate()
+})
+
+test('unsent text: a model cap that waited still goes to the account with room for that model', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_MODEL_CAP, ...DRAFT_BOX] },
+    // c2 is full in its Fable bucket; c3 has room there.
+    inactiveClaude: { c2: { session: 5, weekly: 5, fable: 95 }, c3: { session: 30, weekly: 30, fable: 20 } },
+    state: { paneSeat: { t1: 'claude:c1' } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.deepEqual(w.typed, [])
+  assert.match(lastNote(w), /Send or clear the text you were typing and the session moves to me\./)
+  assert.equal(stored(w).waiting[0]?.model, 'fable')
+  w.tails.t1 = [...fx.CLAUDE_MODEL_CAP]
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c3'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual([stored(w).history.at(-1)?.reason, stored(w).history.at(-1)?.result], ['model_cap', 'resumed'])
+  assert.match(stored(w).history.at(-1)?.why ?? '', /hit its fable limit; moved to me/)
+  await worker.deactivate()
+})
+
+test('unsent text: a wait cancelled from the panel is not carried out; two looks at once move the session once', async () => {
+  const w = limitedWithDraft()
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  w.tails.t1 = [...fx.CLAUDE_LIMIT_NO_RESET]
+  await worker.request('rotator.cancelWaiting', { terminalId: 't1' })
+  await w.rotator.tick()
+  await worker.emit('agent.status.changed', statusEvent('t1', 'waiting', 2))
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  await worker.deactivate()
+
+  // A handoff leaves no session id to recognise the moved session by: the tick and a status
+  // event that look at the same wait at once must still launch one successor, not two.
+  const c = world({
+    panes: [{ terminalId: 'k1', agent: 'codex', state: 'done' }],
+    tails: { k1: [...fx.CODEX_USAGE_LIMIT, '', '› and bump the version', '  gpt-5 default · ~/projects/demo'] }
+  })
+  const cw = await c.mount()
+  await cw.emit('agent.status.changed', statusEvent('k1'))
+  assert.equal(c.host.callsOf('agent.launch').length, 0)
+  c.tails.k1 = [...fx.CODEX_USAGE_LIMIT]
+  await Promise.all([c.rotator.tick(), cw.emit('agent.status.changed', statusEvent('k1', 'waiting', 2))])
+  assert.equal(c.host.callsOf('agent.launch').length, 1)
+  await cw.deactivate()
+})
+
+test('a parked session that is in the middle of a turn again (asking for permission) is not closed at wake time', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] },
+    state: {
+      paneSeat: { t1: 'claude:c1' },
+      health: { 'claude:c2': { cooldownUntil: 1_000_000 + 10 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 20 * MIN } }
+    }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting.length, 1)
+  // The limit lifted early and the user went on there; the agent now waits for a permission
+  // answer, which is the middle of a turn (Orca reports `blocked`, and no turn end yet).
+  w.tails.t1 = [...fx.CLAUDE_LIMIT_NO_RESET, '❯ carry on', '⏺ Bash(npm test)', '  Do you want to proceed?', '  1. Yes', '  2. No']
+  w.panes[0]!.state = 'blocked'
+  w.advance(11 * MIN)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.deepEqual(selects(w), [])
+  assert.deepEqual(w.typed, [])
+  assert.equal(stored(w).waiting.length, 0)
+  await worker.deactivate()
+})
