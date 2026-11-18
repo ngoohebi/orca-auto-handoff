@@ -117,6 +117,28 @@ const BRAND_TINT: Record<Provider, 'muted' | Tone> = {
 }
 
 /** `rate_limit` → `rate limit`, `api_error` → `API error`. */
+/** Why Orca has no live numbers for this account, in plain words. */
+function reasonText(seat: { usage: Snapshot['seats'][number]['usage']; active: boolean }): string | undefined {
+  switch (seat.usage.reason) {
+    case 'stale-token':
+      return 'Updates the next time this account runs.'
+    case 'sign-in':
+      return 'Sign in to this account again in Orca.'
+    case 'rate-limited':
+      return 'Usage check is throttled for now; the account itself may be fine.'
+    case 'fetching':
+      return 'Orca is fetching usage.'
+    case 'no-usage-api':
+      return 'This service reports no usage; only limits switch it.'
+    case 'not-reported':
+      return seat.active ? 'Orca has not reported usage yet.' : 'Orca reports usage for this account only while it is in use.'
+    case 'error':
+      return seat.usage.detail ?? 'Orca could not read usage.'
+    default:
+      return undefined
+  }
+}
+
 function words(code: string | undefined): string {
   if (!code) return ''
   return code.replace(/_/g, ' ').replace(/\bapi\b/i, 'API')
@@ -232,10 +254,17 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
             <UsageBar name="5h" window={seat.usage.session} />
             <UsageBar name="Week" window={seat.usage.weekly} />
             {seat.usage.model ? <UsageBar name={`${capital(seat.usage.model.name)} week`} window={seat.usage.model} /> : null}
+            {seat.usage.source === 'cached' || seat.usage.source === 'projected' ? (
+              <Text muted size="xs">
+                Last reading {seat.usage.asOf ? <RelativeTime at={seat.usage.asOf} muted /> : null}
+                {seat.usage.source === 'projected' ? ' · a window has reset since' : ''}
+                {reasonText(seat) ? ` · ${reasonText(seat)}` : ''}
+              </Text>
+            ) : null}
           </Stack>
         ) : (
           <Text muted size="xs">
-            No usage yet: Orca reports it once this account runs.
+            {reasonText(seat) ?? 'No usage yet: Orca reports it once this account runs.'}
           </Text>
         )}
         {cooling ? (
@@ -417,11 +446,17 @@ function Accounts({ snap }: { snap: Snapshot }) {
       </EmptyState>
     )
   }
+  const notLive = snap.seats.some((s) => s.usage.source !== undefined && s.usage.source !== 'live' && s.usage.reason !== 'no-usage-api')
   return (
     <Stack gap="md">
       {providers.map((p) => (
         <ServiceSection key={p} provider={p} snap={snap} now={now} />
       ))}
+      {notLive ? (
+        <Text muted size="xs">
+          Orca refreshes accounts that are not in use when its usage view is open or right after an account switch; until then the last reading is shown.
+        </Text>
+      ) : null}
     </Stack>
   )
 }

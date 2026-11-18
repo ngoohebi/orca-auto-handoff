@@ -259,11 +259,21 @@
       },
       {
         "key": "poll_interval_seconds",
-        "title": "Usage refresh interval (seconds)",
+        "title": "Read usage from Orca every (seconds)",
         "type": "integer",
         "default": 60,
         "minimum": 15,
-        "maximum": 3600
+        "maximum": 3600,
+        "description": "How often the plugin reads Orca's usage numbers (15–3600). Orca itself refreshes the account in use about every 5 minutes while its window is open, and accounts not in use only when its usage view opens or right after an account switch, so a shorter period only picks those up sooner."
+      },
+      {
+        "key": "usage_cache_max_age_hours",
+        "title": "Remember usage of accounts not in use for (hours)",
+        "type": "integer",
+        "default": 168,
+        "minimum": 0,
+        "maximum": 720,
+        "description": "When Orca has no current numbers for an account, the plugin uses its last reading, shown with its age; windows whose reset time has passed count as reset. 0 = only Orca's current numbers."
       },
       {
         "key": "handoff_max_chars",

@@ -8,11 +8,29 @@ export function isProvider(value: unknown): value is Provider {
 }
 
 /** One usage window as Orca reports it (`rateLimits.<provider>.session|weekly`). */
-export type UsageWindow = { usedPercent: number; resetsAt: number | null }
+export type UsageWindow = {
+  usedPercent: number
+  resetsAt: number | null
+  /** A remembered window whose reset time has passed: shown as 0 %, "reset since". */
+  reset?: true
+}
+
+/** Why Orca has no live numbers for an account right now. */
+export type UsageReason = 'stale-token' | 'rate-limited' | 'sign-in' | 'fetching' | 'not-reported' | 'no-usage-api' | 'error'
 
 export type SeatUsage = {
-  /** False when Orca has no numbers for this seat (e.g. an inactive Claude account). */
+  /** True when the plugin has numbers to go by: Orca's live ones, or a recent remembered reading. */
   known: boolean
+  /** live: Orca reports it now; cached: the last reading Orca gave; projected: a cached reading with
+   *  a window reset since; unknown: nothing usable. */
+  source?: 'live' | 'cached' | 'projected' | 'unknown'
+  /** When the numbers were taken. */
+  asOf?: number
+  reason?: UsageReason
+  /** Orca's own message for the reason, shortened. */
+  detail?: string
+  /** When Orca retries a rate-limited fetch. */
+  retryAt?: number
   session?: UsageWindow
   weekly?: UsageWindow
   /** A model-specific weekly bucket (Claude `fableWeekly`, ...). */
@@ -58,10 +76,31 @@ export type SeenSignal = {
   line?: string
 }
 
+/** Per-seat state. Every field is optional: entries stored by older versions hold only
+ *  `cooldownUntil` and `reason`. */
 export type SeatHealth = {
   cooldownUntil?: number
   reason?: string
+  /** Limit banners this seat showed while the plugin had no usage numbers for it (or right after
+   *  an automatic move onto it without numbers). Counted for 24 h after `strikeAt`. */
+  strikes?: number
+  /** When the last strike happened. */
+  strikeAt?: number
+  /** The current or last cooldown ends at a real reset time (from the banner or Orca's numbers),
+   *  not at a guessed one. */
+  resetKnown?: boolean
+  /** When the last cooldown expired. */
+  freedAt?: number
 }
+
+/** How long a strike counts, and how long an expired cooldown is remembered. */
+export const STRIKE_TTL_MS = 24 * 3_600_000
+/** The longest guessed cooldown for a seat without usage numbers. */
+export const BLIND_COOLDOWN_CAP_MINUTES = 300
+
+/** After an automatic move onto a seat without usage numbers: until `until`, no advisory move or
+ *  switch-back for that provider, and a limit banner on `key` counts as a strike. */
+export type Probation = { key: string; until: number }
 
 export type SwapReason = 'rate_limit' | 'threshold' | 'auth' | 'manual' | 'reset' | 'model_cap' | 'switch_back' | 'idle'
 export type SwapResult =
@@ -127,6 +166,8 @@ export type Config = {
   modelFallback: string
   defaultCooldownMinutes: number
   pollIntervalSeconds: number
+  /** How long a remembered reading stays usable; 0 turns the cache off. */
+  usageCacheMaxAgeHours: number
   handoffMaxChars: number
   orcaCliPath: string
   /** Automatic hand-off per service; a service that is off is never touched automatically. */
@@ -157,6 +198,7 @@ export const DEFAULT_CONFIG: Config = {
   modelFallback: '',
   defaultCooldownMinutes: 60,
   pollIntervalSeconds: 60,
+  usageCacheMaxAgeHours: 168,
   handoffMaxChars: 6000,
   orcaCliPath: '',
   services: allServices(true)
@@ -176,6 +218,7 @@ export type RotatorState = {
   history: HistoryEntry[]
   /** Last automatic selection change per provider (for the switch cooldown). */
   lastAutoSwitchAt?: Partial<Record<Provider, number>>
+  probation?: Partial<Record<Provider, Probation>>
 }
 
 export const HISTORY_CAP = 1000
@@ -192,7 +235,8 @@ export function emptyState(): RotatorState {
     modelStep: {},
     waiting: [],
     history: [],
-    lastAutoSwitchAt: {}
+    lastAutoSwitchAt: {},
+    probation: {}
   }
 }
 
