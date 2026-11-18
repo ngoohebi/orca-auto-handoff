@@ -12,6 +12,7 @@ import './protocol'
 
 const STATE_KEY = 'state'
 const USAGE_KEY = 'usage'
+const SAMPLES_KEY = 'usage-samples'
 
 /** The tick follows the usage read period but never runs slower than 30 s, so parked sessions and
  *  cooldowns stay on time; the CLI is still called only once per read period. */
@@ -121,6 +122,8 @@ export async function activateWith(
     saveState: (state) => orca.storage.set(STATE_KEY, state as never),
     loadUsage: () => orca.storage.get(USAGE_KEY),
     saveUsage: (cache) => orca.storage.set(USAGE_KEY, cache as never),
+    loadSamples: () => orca.storage.get(SAMPLES_KEY),
+    saveSamples: (samples) => orca.storage.set(SAMPLES_KEY, samples as never),
     readLive: async (liveKey) => (LIVE_KEY.test(liveKey) ? files.read(`${files.home}/${DATA_DIR}/${LIVE_DIR}/${liveFileName(liveKey)}`) : null),
     config: () => readConfig(orca),
     log: (message) => orca.log(message),

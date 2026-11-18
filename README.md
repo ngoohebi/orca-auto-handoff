@@ -136,7 +136,11 @@ automatic rotation and switch-back; picking them from the panel still works.
     selection changes come from the plugin, the status-bar click or the commands;
   - the automatic-switching toggle and when usage was last read;
   - parked sessions;
+  - under an account's bars, "About 8 min left at this pace" when its last readings show a pace
+    (see [Pace of use](#pace-of-use)); amber at 30 minutes or less, red at 10;
   - swap history: the last 7 days, older entries are cleaned up automatically (at most 1,000 kept).
+    Each move, wait and selection change says why in one line, for example "work is over its
+    usage threshold (used 97 % of 5h, 40 % of the week); moved to personal (used 12 % of 5h)".
 - **Commands:** switch Claude or Codex to the next account, move this workspace's agent to
   another account, pause or resume, refresh usage, install or remove the console status line.
 - **Console status line** (Claude panes): see below.
@@ -289,6 +293,20 @@ numbers too:
 - reading is passive: it also happens while hand-off is paused or the service is off, and it
   switches nothing by itself. Accounts on a paired Orca server are not covered.
 
+### Pace of use
+
+Every usage read also adds a sample to a short history per account (this computer's accounts):
+the percent used of each window, its reset time, and whether Orca or a pane took the reading. A
+sample is kept when a number changes, or every 5 minutes otherwise; the last 48 samples (about
+4 hours) and 14 daily weekly levels are kept, about 4 KB per account, under the plugin's own
+storage key `usage-samples`. When a window's reset time changes, that window's samples are dropped.
+
+From it the plugin works out a **rate** per window (the rise over the last 30 minutes; it needs two
+samples at least 3 minutes apart and a rise of a point) and a **runway**: how long until the first
+window is used up at that rate. A window that resets before it would run out does not count, and a
+reading more than 10 minutes old gives no runway. The panel shows it as "About N min left at this
+pace". This is observation only for now: nothing switches on the runway yet.
+
 When there is no reading at all, the panel says why, in Orca's terms: "Updates the next time this
 account runs", "Sign in to this account again in Orca", "Orca is rate limited", or Orca's own
 message.
@@ -365,7 +383,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 131 tests: adapters (real captured banners), selector, usage cache, live usage, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 146 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

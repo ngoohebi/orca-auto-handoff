@@ -127,6 +127,9 @@ export type HistoryEntry = {
   reason: SwapReason | 'api_error'
   result: SwapResult
   detail?: string
+  /** Why it happened, in one line a person can read ("work is over its usage threshold (used
+   *  97 % of 5h); moved to personal (used 12 % of 5h)"). Entries from older versions have none. */
+  why?: string
 }
 
 /** A session parked until a seat frees up (every seat exhausted, wait_for_reset on). */
@@ -250,7 +253,13 @@ export function emptyState(): RotatorState {
 export type Snapshot = {
   paused: boolean
   updatedAt: number
-  seats: (Seat & { cooldownUntil?: number; cooldownReason?: string })[]
+  seats: (Seat & {
+    cooldownUntil?: number
+    cooldownReason?: string
+    /** How long until the first window is used up at the current pace (usage-history.ts); absent
+     *  when the pace is unknown. Observed only: nothing switches on it yet. */
+    runwayMs?: number
+  })[]
   waiting: WaitingEntry[]
   history: HistoryEntry[]
   /** Which services switch automatically. */

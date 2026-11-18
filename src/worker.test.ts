@@ -1402,3 +1402,89 @@ test('project on a direct SSH target: Orca manages no accounts there, so a limit
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
 })
+
+test('history: every move and wait says why in one line', async () => {
+  // A limit: the session moves, and the entry names both accounts as the panel does.
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    inactiveClaude: { c2: { session: 5, weekly: 6 } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  let state = w.host.data().storage.state as RotatorState
+  assert.equal(state.history.at(-1)?.result, 'resumed')
+  assert.equal(state.history.at(-1)?.why, 'one hit a usage limit; moved to two (used 5 % of 5h, 6 % of the week)')
+  // The snapshot the panel reads carries it.
+  assert.equal(w.rotator.snapshot().history.at(-1)?.why, state.history.at(-1)?.why)
+  await worker.deactivate()
+
+  // A threshold: the level that caused it is in the line.
+  const t = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'waiting', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
+    claudeUsage: { session: 60, weekly: 10 },
+    inactiveClaude: { c2: { session: 5, weekly: 5 } },
+    settings: { thresholds_five_hour: 50 }
+  })
+  const tw = await t.mount()
+  await tw.emit('agent.status.changed', statusEvent('t1', 'waiting'))
+  state = t.host.data().storage.state as RotatorState
+  assert.equal(state.history.at(-1)?.reason, 'threshold')
+  assert.equal(state.history.at(-1)?.why, 'one is over its usage threshold (used 60 % of 5h, 10 % of the week); moved to two (used 5 % of 5h, 5 % of the week)')
+  await tw.deactivate()
+
+  // Nowhere to go: the wait explains itself; so does the wake.
+  const p = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    state: { health: { 'claude:c2': { cooldownUntil: 1_000_000 + 10 * 60_000 }, 'claude:c3': { cooldownUntil: 1_000_000 + 20 * 60_000 } } }
+  })
+  const pw = await p.mount()
+  await pw.emit('agent.status.changed', statusEvent('t1'))
+  state = p.host.data().storage.state as RotatorState
+  assert.equal(state.history.at(-1)?.result, 'waiting')
+  assert.equal(state.history.at(-1)?.why, 'every Claude account is used up or cooling down; waiting for the earliest reset')
+  p.advance(11 * 60_000)
+  await p.rotator.tick()
+  state = p.host.data().storage.state as RotatorState
+  assert.equal(state.history.at(-1)?.reason, 'reset')
+  assert.match(state.history.at(-1)?.why ?? '', /^a limit has reset; resumed on two/)
+  await pw.deactivate()
+
+  // A choice made by hand, and auto resume off (only the selection moves).
+  const m = world({ panes: [], tails: {}, claudeUsage: { session: 10, weekly: 10 } })
+  const mw = await m.mount()
+  await m.rotator.selectSeat('claude:c2')
+  state = m.host.data().storage.state as RotatorState
+  assert.equal(state.history.at(-1)?.why, 'chosen by hand; new launches use two')
+  await mw.deactivate()
+
+  const s = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { auto_resume: false }
+  })
+  const sw = await s.mount()
+  await sw.emit('agent.status.changed', statusEvent('t1'))
+  state = s.host.data().storage.state as RotatorState
+  assert.equal(state.history.at(-1)?.result, 'selected')
+  assert.equal(state.history.at(-1)?.why, 'one hit a usage limit; new launches use two')
+  await sw.deactivate()
+})
+
+test('history: switching back for new launches says which account is available again', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { auto_swap_idle_after_seconds: 0 }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  w.advance(48 * 3_600_000)
+  await w.rotator.tick()
+  const state = w.host.data().storage.state as RotatorState
+  assert.equal(state.history.at(-1)?.reason, 'switch_back')
+  assert.match(state.history.at(-1)?.why ?? '', /^one is available again.*; new launches use it$/)
+  await worker.deactivate()
+})

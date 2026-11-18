@@ -33,7 +33,7 @@ import {
   type PanelContext,
   type Tone
 } from 'orca'
-import { minLeft, percentLeft, PROVIDER_NAME, seatOrder } from './labels'
+import { minLeft, percentLeft, PROVIDER_NAME, runwayWords, seatOrder } from './labels'
 import type { ConsoleLineState, Snapshot } from './protocol'
 import { PROVIDERS, type Provider } from './types'
 
@@ -254,6 +254,12 @@ function SeatCard({ seat, now, switchable }: { seat: SeatRow; now: number; switc
             <UsageBar name="5h" window={seat.usage.session} />
             <UsageBar name="Week" window={seat.usage.weekly} />
             {seat.usage.model ? <UsageBar name={`${capital(seat.usage.model.name)} week`} window={seat.usage.model} /> : null}
+            {/* The pace of use, when the last readings show one; half an hour or less takes a colour. */}
+            {seat.runwayMs !== undefined ? (
+              <Text size="xs" tone={seat.runwayMs <= 10 * 60_000 ? 'danger' : seat.runwayMs <= 30 * 60_000 ? 'warning' : 'neutral'} muted={seat.runwayMs > 30 * 60_000}>
+                {capital(runwayWords(seat.runwayMs))}
+              </Text>
+            ) : null}
             {seat.usage.source === 'cached' || seat.usage.source === 'projected' ? (
               <Text muted size="xs">
                 Last reading {seat.usage.asOf ? <RelativeTime at={seat.usage.asOf} muted /> : null}
@@ -491,6 +497,7 @@ function History({ snap }: { snap: Snapshot }) {
               <Text size="xs" muted truncate>
                 {h.to ? `${label(h.from)} → ${label(h.to)}` : label(h.from)}
               </Text>
+              {h.why ? <Text size="xs">{capital(h.why)}</Text> : null}
               {h.detail ? (
                 <Text size="xs" muted>
                   {h.detail}

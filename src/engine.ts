@@ -2,9 +2,10 @@
 // Every side effect goes through Deps so tests run it with a fake host, CLI and clock.
 import { ADAPTERS, CHROME, classify, countCopies, hasDraft, parseModelFallback } from './adapters'
 import { parseAccounts, type AccountView } from './accounts'
-import { PROVIDER_NAME } from './labels'
+import { PROVIDER_NAME, displayLabels, whyMove } from './labels'
 import { parseLive } from './live-usage'
 import { emptyUsageCache, loadedUsageCache, observe, observeLive, resolve, type UsageCache } from './usage-cache'
+import { addSample, emptyUsageSamples, loadedUsageSamples, pruneSamples, runwayMs, type UsageSamples } from './usage-history'
 import {
   blindCooldownMs,
   buildChain,
@@ -73,6 +74,9 @@ export type Deps = {
   /** The text of a pane's live usage file for this key (`live/claude-<key>.tsv`, written by the
    *  console status line wrapper), or `null` when there is none. Read-only. */
   readLive(liveKey: string): Promise<string | null>
+  /** The persisted usage history (storage key `usage-samples`; see usage-history.ts). */
+  loadSamples(): Promise<unknown>
+  saveSamples(samples: UsageSamples): Promise<void>
 }
 
 /** What the plugin knows about one agent pane. */
@@ -201,6 +205,8 @@ export class Rotator {
 
   /** Last-known usage per account; see usage-cache.ts. */
   private usage: UsageCache = emptyUsageCache()
+  /** Recent readings per account, for the pace of use; see usage-history.ts. Local accounts only. */
+  private samples: UsageSamples = emptyUsageSamples()
   /** When each provider's active account last changed, so a stale reading is not misattributed. */
   private activeSince: Partial<Record<Provider, number>> = {}
   /** One `orca account list` at a time: the timer, the panel and commands share it (~3 s). */
@@ -232,6 +238,7 @@ export class Rotator {
     this.state = { ...emptyState(), ...(saved ?? {}) }
     if (this.pruneHistory()) await this.deps.saveState(this.state)
     this.usage = loadedUsageCache(await this.deps.loadUsage().catch(() => null))
+    this.samples = loadedUsageSamples(await this.deps.loadSamples().catch(() => null))
     await this.refreshServices(false)
   }
 
@@ -278,6 +285,13 @@ export class Rotator {
 
   private record(entry: Omit<HistoryEntry, 'at'>): void {
     this.state.history.push({ at: this.deps.now(), ...entry })
+  }
+
+  /** The one-line reason for a move, with accounts named as the panel names them. */
+  private why(reason: SwapReason, from: Seat | undefined, to: Seat, view: AccountView, options: { selectionOnly?: boolean; model?: string } = {}): string {
+    const labels = displayLabels(view.seats, to.provider)
+    const named = (seat: Seat) => ({ label: labels.get(seat.key) ?? seat.label, usage: seat.usage })
+    return whyMove(reason, from ? named(from) : undefined, named(to), options).slice(0, 240)
   }
 
   // ---- server & accounts ------------------------------------------------------------------
@@ -440,6 +454,10 @@ export class Rotator {
         const maxAgeMs = config.usageCacheMaxAgeHours * 3_600_000
         for (const seat of parsed.seats) seat.usage = resolve(seat, this.usage, now, maxAgeMs, this.activeSince)
         if (changed) await this.deps.saveUsage(this.usage).catch(() => undefined)
+        // Observe only: the pace of use, for the runway the panel shows.
+        let sampled = pruneSamples(this.samples, parsed.seats.map((s) => s.key))
+        for (const seat of parsed.seats) if (addSample(this.samples, seat, now)) sampled = true
+        if (sampled) await this.deps.saveSamples(this.samples).catch(() => undefined)
         if (this.clearStrikesByReading(parsed.seats, config, now)) await this.save()
       }
       nextView = parsed
@@ -1016,7 +1034,7 @@ export class Rotator {
   private async park(pane: PaneInfo, from: Seat | undefined, chain: Seat[], config: Config, reason: SwapReason) {
     const now = this.deps.now()
     if (config.strategy === 'manual' || !config.waitForReset) {
-      this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', ...(from ? { from: from.key } : {}), detail: config.strategy === 'manual' ? 'manual strategy' : 'no healthy seat' })
+      this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'failed', ...(from ? { from: from.key } : {}), detail: config.strategy === 'manual' ? 'manual strategy' : 'no healthy seat', why: `no other ${PROVIDER_NAME[pane.agent]} account has room, and ${config.strategy === 'manual' ? 'the strategy is manual' : 'waiting for a reset is off'}` })
       await this.save()
       await this.deps.notify('Auto Hand-off', `${pane.agent}: no healthy account to switch to.`)
       this.publishNow()
@@ -1029,7 +1047,7 @@ export class Rotator {
     if (from) entry.fromSeat = from.key
     if (pane.server) entry.server = pane.server
     this.state.waiting = [...this.state.waiting.filter((w) => w.terminalId !== pane.terminalId), entry]
-    this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'waiting', ...(from ? { from: from.key } : {}), detail: `until ${new Date(wakeAt).toISOString()}` })
+    this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'waiting', ...(from ? { from: from.key } : {}), detail: `until ${new Date(wakeAt).toISOString()}`, why: `every ${PROVIDER_NAME[pane.agent]} account is used up or cooling down; waiting for the earliest reset` })
     await this.save()
     await this.deps.notify('Auto Hand-off', `Every ${pane.agent} account is exhausted; resuming at ${new Date(wakeAt).toLocaleString()}.`)
     this.publishNow()
@@ -1057,7 +1075,7 @@ export class Rotator {
       if (!config.autoResume) {
         // Only the account changes; the pane stays as it is for the user to resume.
         this.state.waiting = this.state.waiting.filter((w) => w.terminalId !== pane.terminalId)
-        this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'selected', ...(from ? { from: from.key } : {}), to: target.key, detail: 'auto_resume off' })
+        this.record({ provider: pane.agent, terminalId: pane.terminalId, reason, result: 'selected', ...(from ? { from: from.key } : {}), to: target.key, detail: 'auto_resume off', why: this.why(reason, from, target, view, { selectionOnly: true, ...(signal?.model ? { model: signal.model } : {}) }) })
         if (reason !== 'manual') this.startProbation(target, config, this.deps.now())
         await this.save()
         this.publishNow()
@@ -1101,7 +1119,8 @@ export class Rotator {
         reason,
         result: canResume ? 'resumed' : 'handoff',
         ...(from ? { from: from.key } : {}),
-        to: target.key
+        to: target.key,
+        why: this.why(reason, from, target, view, signal?.model ? { model: signal.model } : {})
       })
       if (reason !== 'manual') this.startProbation(target, config, this.deps.now())
       await this.save()
@@ -1322,7 +1341,7 @@ export class Rotator {
         for (const s of fresh.seats) if (s.provider === provider) s.active = s.key === preferred.key
         this.noteSelectionChange(provider, 'switch_back', this.deps.now())
         this.startProbation(preferred, config, this.deps.now())
-        this.record({ provider, reason: 'switch_back', result: 'selected', ...(from ? { from } : {}), to: preferred.key })
+        this.record({ provider, reason: 'switch_back', result: 'selected', ...(from ? { from } : {}), to: preferred.key, why: this.why('switch_back', fresh.seats.find((s) => s.key === from), preferred, fresh, { selectionOnly: true }) })
         await this.save()
         await this.deps.notify('Auto Hand-off', `${PROVIDER_NAME[provider]}: ${preferred.label} is available again; new launches use it.`)
         this.publishNow()
@@ -1450,7 +1469,7 @@ export class Rotator {
     return this.withLock(seat.provider, async () => {
       const from = view.active[seat.provider]
       if (from !== seat.key) await this.selectOn(seat.provider, seat.accountId, server)
-      this.record({ provider: seat.provider, reason: 'manual', result: 'selected', ...(from ? { from } : {}), to: seat.key })
+      this.record({ provider: seat.provider, reason: 'manual', result: 'selected', ...(from ? { from } : {}), to: seat.key, why: this.why('manual', view.seats.find((s) => s.key === from), seat, view, { selectionOnly: true }) })
       await this.save()
       await this.accountsFor(server, true)
       this.publishNow()
@@ -1587,8 +1606,11 @@ export class Rotator {
       seats: view.seats.map((s) => {
         const h = this.state.health[s.key]
         const { liveKeys: _liveKeys, ...seat } = s
+        // The history covers this computer's accounts only.
+        const runway = this.server ? null : runwayMs(this.samples.seats[s.key]?.recent ?? [], now)
         return {
           ...seat,
+          ...(runway !== null ? { runwayMs: Math.round(runway) } : {}),
           ...(h?.cooldownUntil ? { cooldownUntil: h.cooldownUntil } : {}),
           ...(h?.reason ? { cooldownReason: h.reason } : {})
         }

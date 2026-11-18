@@ -57,6 +57,24 @@ test('shows every seat with usage, cooldown and history; the panel never switche
   await view.unmount()
 })
 
+test('an account with a known pace shows about how long it lasts; history entries say why', async () => {
+  const snap = snapshot()
+  snap.seats[1]!.runwayMs = 8.4 * 60_000
+  snap.history[0]!.why = 'one hit a usage limit; moved to two (used 7 % of 5h, 18 % of the week)'
+  const host = mockHost({ requests: { 'rotator.snapshot': () => snap, 'rotator.consoleLine': () => ({ installed: false, workspace: 'app' }) } })
+  const view = await mount(panel, { host })
+  // Only the account with a pace has the line.
+  assert.equal(view.findAll({ text: /left at this pace/ }).length, 1)
+  assert.ok(view.find({ text: 'About 8 min left at this pace' }))
+  // Hours once it is long.
+  await view.post('rotator.changed', { ...snap, seats: snap.seats.map((s, i) => (i === 1 ? { ...s, runwayMs: 5 * 3_600_000 } : s)) })
+  assert.ok(view.find({ text: 'About 5 h left at this pace' }))
+  await view.select({ role: 'tablist' }, 'history')
+  assert.ok(view.find({ text: 'One hit a usage limit; moved to two (used 7 % of 5h, 18 % of the week)' }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
 test('worker pushes keep the panel current; waiting sessions are called out', async () => {
   const cancelled: string[] = []
   const host = mockHost({

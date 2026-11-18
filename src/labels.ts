@@ -1,7 +1,7 @@
 // Account labels as the panel and the console status line show them: when every account of a
 // service shares one email domain the domain is dropped (`me`, `system (third)`); otherwise the
 // labels stay whole.
-import type { Provider, Seat, Snapshot } from './types'
+import type { Provider, Seat, Snapshot, SwapReason } from './types'
 
 type SeatRow = Snapshot['seats'][number]
 
@@ -57,5 +57,59 @@ export function seatOrder(now: number) {
     if (la === undefined) return 1
     if (lb === undefined) return -1
     return lb - la
+  }
+}
+
+/** An account's level in a few words: `used 94 % of 5h, 30 % of the week`; '' when unknown. */
+export function levelWords(seat: Pick<Seat, 'usage'> | undefined): string {
+  if (!seat?.usage.known) return ''
+  const parts: string[] = []
+  const s = seat.usage.session?.usedPercent
+  const w = seat.usage.weekly?.usedPercent
+  if (typeof s === 'number') parts.push(`${Math.round(s)} % of 5h`)
+  if (typeof w === 'number') parts.push(`${Math.round(w)} % of the week`)
+  return parts.length ? `used ${parts.join(', ')}` : ''
+}
+
+/** "About N min left" / "about N h left" for a runway; minutes up to an hour and a half. */
+export function runwayWords(ms: number): string {
+  const minutes = Math.round(ms / 60_000)
+  if (minutes < 1) return 'under a minute left at this pace'
+  if (minutes <= 90) return `about ${minutes} min left at this pace`
+  return `about ${Math.round(minutes / 60)} h left at this pace`
+}
+
+type Named = { label: string; usage: Seat['usage'] }
+
+/**
+ * Why a session or the selection moved, in one line for the history. `from` is absent when the
+ * pane's account was not known. `selectionOnly`: only new launches changed account.
+ */
+export function whyMove(
+  reason: SwapReason,
+  from: Named | undefined,
+  to: Named,
+  options: { selectionOnly?: boolean; model?: string } = {}
+): string {
+  const level = (seat: Named | undefined) => (levelWords(seat) ? ` (${levelWords(seat)})` : '')
+  const arrived = `${options.selectionOnly ? 'new launches use' : 'moved to'} ${to.label}${level(to)}`
+  const source = from?.label ?? 'another account'
+  switch (reason) {
+    case 'rate_limit':
+      return `${source} hit a usage limit; ${arrived}`
+    case 'model_cap':
+      return `${source} hit its ${options.model ?? 'model'} limit; ${arrived}`
+    case 'auth':
+      return `${source} needs sign-in; ${arrived}`
+    case 'threshold':
+      return `${source} is over its usage threshold${level(from)}; ${arrived}`
+    case 'idle':
+      return `idle session on ${source}, which is over its usage threshold${level(from)}; ${arrived}`
+    case 'switch_back':
+      return `${to.label} is available again${level(to)}; ${options.selectionOnly ? 'new launches use it' : `moved back from ${source}`}`
+    case 'reset':
+      return `a limit has reset; ${options.selectionOnly ? `new launches use ${to.label}` : `resumed on ${to.label}`}${level(to)}`
+    case 'manual':
+      return `chosen by hand; ${arrived}`
   }
 }
