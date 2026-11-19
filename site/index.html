@@ -230,7 +230,7 @@ footer a{color:var(--fg-2)}
       <h1>Hit a rate limit? <span>Auto-switch to your next account.</span></h1>
       <p class="lede">Automatic account switching for Orca. Claude to Claude, Codex to Codex: a session always keeps its provider. Auto Hand-off runs the accounts Orca manages as one pool per service. When an agent pane prints a limit, the plugin cools that account down and selects the next healthy one. A Claude session is resumed there as the same session, with its context and the first message already typed. Codex, Antigravity, OpenCode and Devin cannot resume a session on another account: they start a new session there from a summary of the old one.</p>
       <div class="badges">
-        <span class="badge">v<b>0.2.0</b></span>
+        <span class="badge">v<b>0.2.1</b></span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
         <span class="badge"><b>MIT</b> license</span>
         <span class="badge"><b>270</b> tests, real captured banners</span>
@@ -556,7 +556,7 @@ footer a{color:var(--fg-2)}
     <div class="note"><b>Coming from cux?</b> Run <code>cux uninstall-hooks</code> first so the two don't both rotate. Every cux setting key has the same name here. Per-directory project bindings and <code>cux attach</code> are not migrated yet.</div>
     <details>
       <summary>Working on the plugin itself</summary>
-      <pre style="margin-top:12px"><code>orca plugin test . --json        # 271 tests: adapters, selector, usage, status line, worker end to end, panel
+      <pre style="margin-top:12px"><code>orca plugin test . --json        # 272 tests: adapters, selector, usage, status line, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker
 npx -p typescript tsc -p .       # type-check
 orca plugin validate . --json

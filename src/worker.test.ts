@@ -543,6 +543,29 @@ test('live bug: the redraw arrives after the plugin first reads the new pane —
   await worker.deactivate()
 })
 
+test('live (Orca 1.4.263): an older banner the redraw briefly shows as newest is not a new limit', async () => {
+  const OLD = ['⏺ Running.', '  ⎿  Claude usage limit reached. Your limit will reset at 9pm', '⏺ Noted.']
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: OLD }
+  })
+  const worker = await w.mount()
+  // First limit (the "9pm" banner): moved to c2.
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
+  // A second, different limit in the resumed pane: moved on to c3.
+  w.tails.t2 = [...(w.tails.t2 ?? []), '❯ Continue.', '⏺ Working.', '  ⎿  5-hour limit reached ∙ resets 3pm']
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c3'])
+  // The next resumed pane is caught mid-redraw: the older "9pm" banner is the newest line yet.
+  const t3 = w.panes.at(-1)!.terminalId
+  w.tails[t3] = [...OLD]
+  await worker.emit('agent.status.changed', statusEvent(t3, 'done', 3))
+  assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2', 'select claude c3'])
+  assert.equal(stored(w).waiting.length, 0)
+  await worker.deactivate()
+})
+
 test('live bug: host send refused outside the focused workspace falls back to the CLI', async () => {
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],

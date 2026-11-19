@@ -80,6 +80,10 @@ export type SeenSignal = {
   occurrences: number
   /** The banner text, to recount copies as it scrolls away. */
   line?: string
+  /** Banners handled before this one in the same session (newest last, at most 12). A resumed
+   *  session redraws its whole transcript, and while it does, an older banner can briefly be the
+   *  newest on screen (live, Orca 1.4.263): it is not a new limit. */
+  earlier?: { fingerprint: string; occurrences: number; line?: string }[]
 }
 
 /** Per-seat state. Every field is optional: entries stored by older versions hold only

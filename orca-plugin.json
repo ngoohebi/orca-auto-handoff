@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "auto-handoff",
   "name": "Auto Hand-off",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Automatic account switching for Orca agents. Pools the managed accounts per provider (Claude, Codex, Antigravity, OpenCode, Devin). Smart mode looks ahead: a Claude session leaves an account shortly before it runs out and is resumed, as the same session, on the next Claude account. Codex, Antigravity, OpenCode and Devin sessions move only at a real limit and start a new session from a summary on the next account of the same provider. To reach panes outside the focused workspace it also runs the orca CLI (account select, terminal close/send).",
   "author": {
     "name": "ngoohebi",

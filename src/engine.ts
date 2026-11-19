@@ -47,6 +47,7 @@ import {
   type RotatorState,
   type Seat,
   type SeatHealth,
+  type SeenSignal,
   type Signal,
   type Snapshot,
   type SwapReason,
@@ -976,20 +977,37 @@ export class Rotator {
   /** New when this banner was not seen in this pane, or another copy of it has been printed. */
   private isNew(key: string, signal: Signal): boolean {
     const seen = this.state.seen[key]
-    if (!seen || seen.fingerprint !== signal.fingerprint) return true
-    if (signal.occurrences > seen.occurrences) return true
+    if (!seen) return true
+    const known = seen.fingerprint === signal.fingerprint ? seen : seen.earlier?.find((e) => e.fingerprint === signal.fingerprint)
+    if (!known) return true
+    if (signal.occurrences > known.occurrences) return true
     // Copies scrolled out of the read window: remember the lower count so the next copy counts.
-    if (signal.occurrences < seen.occurrences) seen.occurrences = signal.occurrences
+    if (signal.occurrences < known.occurrences) known.occurrences = signal.occurrences
     return false
+  }
+
+  /** Record a handled banner for a session, keeping the ones handled before it. */
+  private remember(key: string, fingerprint: string, occurrences: number, line?: string): void {
+    const prev = this.state.seen[key]
+    const earlier = (prev?.earlier ?? []).filter((e) => e.fingerprint !== fingerprint)
+    if (prev && prev.fingerprint !== fingerprint) {
+      earlier.push({ fingerprint: prev.fingerprint, occurrences: prev.occurrences, ...(prev.line ? { line: prev.line } : {}) })
+    }
+    const next: SeenSignal = { fingerprint, occurrences, ...(line ? { line } : {}) }
+    if (earlier.length) next.earlier = earlier.slice(-12)
+    this.state.seen[key] = next
   }
 
   /** Copies of a handled banner that have scrolled out of the read window no longer count, so
    *  the next identical banner (same limit text hours later) is seen as new. */
   private recount(key: string, lines: readonly string[]): void {
     const seen = this.state.seen[key]
-    if (!seen?.line) return
-    const copies = countCopies(lines, seen.line)
-    if (copies < seen.occurrences) seen.occurrences = copies
+    if (!seen) return
+    for (const entry of [seen, ...(seen.earlier ?? [])]) {
+      if (!entry.line) continue
+      const copies = countCopies(lines, entry.line)
+      if (copies < entry.occurrences) entry.occurrences = copies
+    }
   }
 
   /** Handled banners are remembered per session: Orca can restore or restart a session in a new
@@ -1015,7 +1033,7 @@ export class Rotator {
       // Paused or service off: record what is on screen without acting on it. This comes before
       // everything that notifies or writes History, the SSH-target note below included.
       if (signal && this.isNew(key, signal)) {
-        this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences, line: signal.line }
+        this.remember(key, signal.fingerprint, signal.occurrences, signal.line)
         await this.save()
       }
       return
@@ -1026,7 +1044,7 @@ export class Rotator {
       // limit is noted once in the history so the user knows why nothing moved. (An API error
       // falls through: retrying in place only types into the pane.)
       if (signal && this.isNew(key, signal)) {
-        this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences, line: signal.line }
+        this.remember(key, signal.fingerprint, signal.occurrences, signal.line)
         const detail = `runs on SSH target ${pane.sshHost}: Orca manages no accounts there`
         this.record({ provider: pane.agent, terminalId: pane.terminalId, reason: signal.kind, result: 'failed', detail })
         await this.save()
@@ -1072,7 +1090,7 @@ export class Rotator {
       if (held) await this.wake(held)
       return
     }
-    this.state.seen[key] = { fingerprint: signal.fingerprint, occurrences: signal.occurrences, line: signal.line }
+    this.remember(key, signal.fingerprint, signal.occurrences, signal.line)
     await this.save()
     this.deps.log(`${pane.agent} ${pane.terminalId}: ${signal.kind} — ${signal.line}`)
 
@@ -1898,7 +1916,7 @@ export class Rotator {
       const key = this.seenKey(sessionId ? { terminalId, sessionId } : { terminalId })
       const had = this.state.seen[key]
       if (old && !(had && had.fingerprint === old.fingerprint && had.occurrences >= old.occurrences)) {
-        this.state.seen[key] = { fingerprint: old.fingerprint, occurrences: old.occurrences }
+        this.remember(key, old.fingerprint, old.occurrences)
         await this.save()
       }
     } catch {
