@@ -8,7 +8,7 @@
     "name": "ngoohebi",
     "url": "https://github.com/ngoohebi"
   },
-  "repository": "https://github.com/ngoohebi/orca-account-rotator",
+  "repository": "https://github.com/ngoohebi/orca-auto-handoff",
   "license": "MIT",
   "engines": {
     "orca": ">=1.4.261"

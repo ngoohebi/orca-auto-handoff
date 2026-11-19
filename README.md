@@ -2,14 +2,21 @@
 
 **Hit a rate limit? Auto-switch to your next account.** Automatic account switching for Orca agents. When a Claude, Codex, Antigravity, OpenCode or Devin account hits a limit, Auto Hand-off moves the session to your next account and keeps working. Claude stays Claude, Codex stays Codex: a session always keeps its provider.
 
-Product page: <https://ngoohebi.github.io/orca-account-rotator/>
+Product page: <https://ngoohebi.github.io/orca-auto-handoff/>
 
 ## Quick start
 
 1. Add at least two accounts of one service in Orca (Settings → Accounts), for example two Claude
    accounts.
-2. Load the plugin (`orca plugin dev load . --json` from this folder; the first time Orca asks you
-   to approve its access, see [Permissions](#permissions)).
+2. Install the plugin:
+
+   ```sh
+   orca plugin install ngoohebi/orca-auto-handoff
+   ```
+
+   Orca lists the access it asks for and prints the same command with `--approve <fingerprint>`;
+   run that to approve (see [Permissions](#permissions)). To try a local checkout instead, run
+   `orca plugin dev load . --json` from its folder.
 3. Open the **Auto Hand-off** panel. It lists your accounts per service with their usage. That is
    all: the default mode, Smart, needs no settings.
 4. Work as usual. When a session hits a limit, it moves to your next account of the same service
