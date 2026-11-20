@@ -1,5 +1,6 @@
 // The plugin's worker: wires Orca events, the launch hook, commands, the panel and a 30 s tick
 // to the Rotator. A save restarts the worker; everything that must last lives in orca.storage.
+import { existsSync, watch, type FSWatcher } from 'node:fs'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { nodeCli } from './cli'
 import { Rotator, type Deps, type StatusEvent } from './engine'
@@ -213,13 +214,52 @@ export function ticker(o: {
 
 let ticks: ReturnType<typeof ticker> | undefined
 let active: Rotator | undefined
+let liveWatcher: { stop(): void } | undefined
+
+function watchLiveDir(dir: string, onChange: () => void, log: (m: string) => void): { ensure(): void; stop(): void } {
+  let watcher: FSWatcher | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let stopped = false
+  const bump = () => {
+    if (stopped) return
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(() => {
+      timer = undefined
+      if (!stopped) onChange()
+    }, 200)
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+  }
+  const ensure = () => {
+    if (stopped || watcher || !existsSync(dir)) return
+    try {
+      watcher = watch(dir, () => bump())
+      watcher.on('error', () => {
+        watcher?.close()
+        watcher = undefined
+      })
+    } catch (error) {
+      log(`could not watch live usage directory: ${String((error as Error)?.message ?? error)}`)
+    }
+  }
+  ensure()
+  return {
+    ensure,
+    stop() {
+      stopped = true
+      if (timer) clearTimeout(timer)
+      timer = undefined
+      watcher?.close()
+      watcher = undefined
+    }
+  }
+}
 
 export async function activateWith(
   orca: OrcaWorkerApi,
   overrides: Partial<Deps> = {},
   /** `files` defaults to an in-memory stand-in so tests never touch the real home directory;
    *  `activate` passes the real one. `timers`: the clock's timer, for tests that run a tick. */
-  options: { tick?: boolean; files?: Files; timers?: { setTimer: (fn: () => void, ms: number) => unknown; clearTimer: (handle: unknown) => void } } = {}
+  options: { tick?: boolean; files?: Files; watchLive?: boolean; timers?: { setTimer: (fn: () => void, ms: number) => unknown; clearTimer: (handle: unknown) => void } } = {}
 ): Promise<Rotator> {
   const files = options.files ?? memoryFiles()
   /** The 0.2 upgrade could not be done yet (Orca could not be asked): see `upgrade` below. */
@@ -282,9 +322,21 @@ export async function activateWith(
   // One worker, one clock: a worker started again in the same process ends the one before.
   ticks?.stop()
   ticks = undefined
+  liveWatcher?.stop()
+  liveWatcher = undefined
   active?.dispose()
   active = rotator
   await rotator.init()
+  const watcher = options.watchLive
+    ? watchLiveDir(
+        `${files.home}/${DATA_DIR}/${LIVE_DIR}`,
+        () => {
+          void rotator.syncLivePanes(true).catch((error) => orca.log(`live usage sync failed: ${String((error as Error)?.message ?? error)}`))
+        },
+        (m) => orca.log(m)
+      )
+    : undefined
+  liveWatcher = watcher
   // The upgrade from 0.2, once: the 0.2 settings (read by name: Orca no longer returns them with
   // the declared ones) are turned into the new ones, which are then stored, so they are read like
   // any setting from here on and a later choice is never overridden by an old value. A setup that
@@ -334,6 +386,7 @@ export async function activateWith(
           period: async () => tickMs((await readConfig()).pollIntervalSeconds),
           due: () => rotator.countdownDueIn(),
           run: async () => {
+            watcher?.ensure()
             if (upgradePending) await retryUpgrade()
             await rotator.tick()
           },
@@ -398,9 +451,9 @@ export async function activateWith(
     return rotator.state.paused ? 'Automatic hand-off paused' : 'Automatic hand-off resumed'
   })
   register('rotator.refresh', async () => {
-    await rotator.accounts(true)
+    await rotator.accounts(true, true)
     rotator.publishNow()
-    return 'Usage read from Orca. Accounts not in use update when Orca fetches them (its usage view, or right after a hand-off).'
+    return 'Usage refreshed from Orca. Inactive accounts respect Orca\'s rate-limit and token rules.'
   })
   register('rotator.installStatusLine', async () => {
     const said = await consoleLine.install()
@@ -416,7 +469,8 @@ export async function activateWith(
   orca.panels.handle('rotator.snapshot', async ({ refresh }) => {
     // The panel's Refresh button (its own polling asks without `refresh`).
     if (refresh) rotator.notePresence()
-    await Promise.all([rotator.accounts(!!refresh), rotator.refreshFocus()])
+    await Promise.all([rotator.accounts(!!refresh, !!refresh), rotator.refreshFocus()])
+    if (!refresh) await rotator.syncLivePanes(false)
     return rotator.snapshot()
   })
   /** What the panel sends is checked before anything is done with it. */
@@ -598,12 +652,14 @@ export async function activateWith(
 }
 
 export default async function activate(orca: OrcaWorkerApi): Promise<void> {
-  await activateWith(orca, {}, { files: nodeFiles() })
+  await activateWith(orca, {}, { files: nodeFiles(), watchLive: true })
 }
 
 export function deactivate(): void {
   ticks?.stop()
   ticks = undefined
+  liveWatcher?.stop()
+  liveWatcher = undefined
   active?.dispose()
   active = undefined
 }

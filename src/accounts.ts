@@ -12,9 +12,14 @@ function win(value: unknown): UsageWindow | undefined {
   return { usedPercent: v.usedPercent, resetsAt: typeof v.resetsAt === 'number' ? v.resetsAt : null }
 }
 
-function usageFrom(rl: unknown, row?: Json): SeatUsage {
+function usageFrom(rl: unknown, row?: Json, expectedAccountId?: string): SeatUsage {
   if (!rl || typeof rl !== 'object') return { known: false, source: 'unknown', reason: 'not-reported' }
   const r = rl as Json
+  const readingId = typeof r.usageMetadata?.readingAccount?.accountId === 'string' ? r.usageMetadata.readingAccount.accountId : undefined
+  if (expectedAccountId && readingId && readingId !== expectedAccountId) {
+    // Orca's active slot still carries the previous account's numbers right after a switch.
+    return { known: false, source: 'unknown', reason: 'fetching' }
+  }
   const session = win(r.session)
   const weekly = win(r.weekly)
   const known = r.status === 'ok' && !!(session || weekly)
@@ -101,7 +106,7 @@ export function parseAccounts(result: Json): AccountView {
         accountId: a.id,
         label: name(a.email) ?? name(a.workspaceLabel) ?? a.id,
         active: isActive,
-        usage: isActive ? usageFrom(rl[provider]) : inactiveUsage(inactive, a.id)
+        usage: isActive ? usageFrom(rl[provider], undefined, a.id) : inactiveUsage(inactive, a.id)
       }
       // Claude panes report their own usage per profile (live-usage.ts). Only the profile id is
       // taken from the account's home; the path stays out of seats, snapshots and storage.
@@ -118,7 +123,7 @@ export function parseAccounts(result: Json): AccountView {
         accountId: 'system',
         label: systemEmail ? `system (${systemEmail})` : 'system',
         active: activeId === null,
-        usage: activeId === null ? usageFrom(rl[provider]) : { known: false, source: 'unknown', reason: 'not-reported' },
+        usage: activeId === null ? usageFrom(rl[provider], undefined, 'system') : { known: false, source: 'unknown', reason: 'not-reported' },
         ...(provider === 'claude' ? { liveKeys: ['system'] } : {})
       })
     }
@@ -135,7 +140,7 @@ export function parseAccounts(result: Json): AccountView {
       const seat = seats.find((s) => s.key === `${provider}:${twin?.id}`)
       if (seat) {
         seat.active = true
-        seat.usage = usageFrom(rl[provider])
+        seat.usage = usageFrom(rl[provider], undefined, twin?.id)
         active[provider] = seat.key
       }
     }

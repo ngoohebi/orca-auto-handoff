@@ -690,9 +690,9 @@ longer mistaken for a free one.
 account that pane runs on. With the [console status line](#console-status-line) installed, the
 wrapper leaves them in `~/.orca/account-rotator/live/claude-<profile id>.tsv` (`claude-system.tsv`
 for Claude's own login): one line with the time of writing, the 5-hour and 7-day percent used and
-their reset times. Numbers only: no name, email, path or token. The worker reads these files on
-every usage read, so a Claude account that runs in a pane but is not the selected one has current
-numbers too:
+their reset times. Numbers only: no name, email, path or token. The worker watches `live/` and
+re-reads these files on turn ends and periodic ticks (without spawning Orca), so a Claude account
+that runs in a pane but is not the selected one updates right away:
 
 - the newer of Orca's reading and the pane's is used; a pane reading at most 10 minutes old counts
   as live, an older one as a remembered reading;
@@ -766,13 +766,14 @@ never happens, so their rotation is always reactive. Pausing, or switching a ser
 all of the above.
 
 The plugin reads Orca's numbers every *Read usage every*: default 60 seconds,
-range 15–3600. A change applies immediately. Concurrent refreshes share one `orca account list`
+range 15–3600. A change applies immediately. Concurrent background reads share one `accounts.list`
 call. After each account change the plugin makes, it reads again at about 8 and 70 seconds,
 because a change is what makes Orca fetch the accounts not in use. The plugin never reads tokens or
-keychains. It does not force a usage refresh: on this computer it runs `orca account list`, and
-for a project on a paired server it calls that server's `accounts.list` with
-`refreshUsage: false, refreshStaleUsage: true`, which lets that Orca refresh readings it
-considers stale itself, on its own schedule.
+keychains. Background reads call Orca's runtime `accounts.list` with `refreshUsage: false,
+refreshStaleUsage: true` (falling back to `orca account list` when needed), letting Orca refresh
+readings it considers stale on its own schedule; an explicit *Refresh usage* from the panel or
+command passes `refreshUsage: true` so Orca refreshes active usage immediately (inactive accounts
+still follow Orca's 60-second cooldown, `Retry-After` throttles and token rules).
 
 ## Known limitations
 
@@ -829,6 +830,15 @@ the plugin.
   so it always keeps the session where it is, also with *Put unsent text back* on.
 - **The scroll position is not kept.** A session that is handed off starts at the bottom of a new pane; Orca
   does not tell plugins where a pane was scrolled.
+- **A handed-off session opens in a new tab and briefly focuses it on the host.** Orca starts resumed
+  (`agent.resume`) and launched (`agent.launch`) plugin sessions in the background outside any real
+  tab group, which can leave a paired Orca client showing a black pane for the closed tab. To place
+  the new session in a real tab, the plugin runs `orca terminal switch` on it and then switches focus
+  back to the terminal that was in front on the host. The new tab does not keep the old tab's exact
+  position or split layout (Orca offers plugins no way to place a tab without focusing it), and if
+  the host was showing a non-terminal tab (an editor or browser tab), focus stays on the new session's
+  tab. On a paired client, Orca's own tab mirroring still decides whether the new tab appears without
+  a reload.
 - **With unsent text that cannot go along, the panel cannot select an account for new sessions
   only.** *Hand off to this account* then either hands off the session on screen (*Hand off
   anyway*) or changes nothing (*Cancel*). Change tabs, or use Orca's own account switcher, to
@@ -862,9 +872,12 @@ the plugin.
 ## Permissions
 
 Orca asks you to approve the plugin's access. Beyond the host API, the worker runs the `orca` CLI
-(`account select`, `account list`, `terminal close`, `terminal send`, `terminal read`, `terminal list`) and `git status` and
+(`account select`, `account list`, `terminal close`, `terminal switch`, `terminal send`, `terminal read`, `terminal list`) and `git status` and
 `git diff --stat`. It always uses an argument list, never a shell. The CLI is used because the host
 API cannot select accounts, refuses to close or type into panes outside the focused workspace,
+starts resumed and launched sessions in the background without a real tab (and `terminal.focus` in
+the host API would require `workspace:write`, which the plugin does not ask for, so `terminal switch`
+places the new pane into a real tab and returns focus to the terminal that was in front),
 does not say whether a pane's input box holds unsent text (`terminal read` does; only its `draft`
 field is used; that text is shown to you in the panel's second confirmation, put back into the
 session after a hand-off and quoted in the hand-off notification; it is never logged, and only
@@ -900,7 +913,7 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 395 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
+orca plugin test . --json        # 405 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
 npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
 orca plugin validate . --json

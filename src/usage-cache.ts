@@ -54,25 +54,35 @@ export function isLive(seat: Seat, activeSince: Partial<Record<Provider, number>
   return !(since !== undefined && seat.usage.updatedAt !== undefined && seat.usage.updatedAt < since)
 }
 
+function cacheKey(scope: string | undefined, seatKey: string): string {
+  return scope ? `${scope}|${seatKey}` : seatKey
+}
+
+function inScope(scope: string | undefined, key: string): boolean {
+  return scope ? key.startsWith(`${scope}|`) : !key.includes('|')
+}
+
 /** Records every live reading; prunes accounts Orca no longer lists. Returns whether it changed. */
 export function observe(
   cache: UsageCache,
   seats: readonly Seat[],
   now: number,
-  activeSince: Partial<Record<Provider, number>>
+  activeSince: Partial<Record<Provider, number>>,
+  scope?: string
 ): boolean {
   let changed = false
-  const listed = new Set(seats.map((s) => s.key))
+  const listed = new Set(seats.map((s) => cacheKey(scope, s.key)))
   for (const key of Object.keys(cache.seats)) {
-    if (!listed.has(key)) {
+    if (inScope(scope, key) && !listed.has(key)) {
       delete cache.seats[key]
       changed = true
     }
   }
   for (const seat of seats) {
     if (!isLive(seat, activeSince)) continue
+    const key = cacheKey(scope, seat.key)
     const sig = signature(seat.usage)
-    const prev = cache.seats[seat.key]
+    const prev = cache.seats[key]
     if (prev && prev.sig === sig) continue
     const asOf = seat.usage.updatedAt ?? now
     if (prev?.origin === 'pane' && prev.asOf >= asOf) {
@@ -90,7 +100,7 @@ export function observe(
     if (session) entry.session = session
     if (weekly) entry.weekly = weekly
     if (seat.usage.model) entry.model = { ...strip(seat.usage.model)!, name: seat.usage.model.name }
-    cache.seats[seat.key] = entry
+    cache.seats[key] = entry
     changed = true
   }
   return changed
@@ -159,12 +169,15 @@ export function resolve(
   cache: UsageCache,
   now: number,
   maxAgeMs: number,
-  activeSince: Partial<Record<Provider, number>>
+  activeSince: Partial<Record<Provider, number>>,
+  scope?: string
 ): SeatUsage {
   const current = seat.usage
-  const cachedPane = cache.seats[seat.key]?.origin === 'pane' ? cache.seats[seat.key] : undefined
+  const key = cacheKey(scope, seat.key)
+  const cachedEntry = cache.seats[key]
+  const cachedPane = cachedEntry?.origin === 'pane' ? cachedEntry : undefined
   const orcaLive = isLive(seat, activeSince)
-  if (orcaLive && !(cachedPane && cachedPane.asOf > (current.updatedAt ?? Infinity))) {
+  if (orcaLive && !(cachedPane && cachedPane.asOf > (current.updatedAt ?? 0))) {
     const live: SeatUsage = { ...current, known: true, source: 'live' }
     if (current.updatedAt !== undefined) live.asOf = current.updatedAt
     return live
@@ -173,7 +186,7 @@ export function resolve(
   if (current.reason) keep.reason = current.reason
   if (current.detail) keep.detail = current.detail
   if (current.retryAt) keep.retryAt = current.retryAt
-  const cached = cache.seats[seat.key]
+  const cached = cachedEntry
   const paneFresh = !!cachedPane && now - cachedPane.asOf <= LIVE_FRESH_MS
   // Reaching here with Orca live means a newer pane reading stands in for Orca's own.
   const upToDate = orcaLive || paneFresh

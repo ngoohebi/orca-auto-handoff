@@ -81,6 +81,10 @@ function world(options: {
   onListAccounts?: () => Promise<void>
   /** While it returns true, `orca terminal send` fails (live: the pane is gone, or the CLI is). */
   failSend?: () => boolean
+  /** While it returns true for a terminal id, `orca terminal switch` fails (e.g. headless server). */
+  failFocus?: (terminalId: string) => boolean
+  /** Called when `orca terminal switch` runs for a terminal id. */
+  onFocus?: (terminalId: string) => Promise<void> | void
   /** Called while git is read for a hand-off summary (live: a process each, up to seconds). */
   onGit?: () => void
   /** What `orca account list` answers, given what it would have answered (read on every list, so
@@ -151,6 +155,11 @@ function world(options: {
     async closeTerminal(id) {
       cliCalls.push(`close ${id}`)
       act('close', { terminalId: id })
+    },
+    async focusTerminal(terminalId) {
+      if (options.failFocus?.(terminalId)) throw new Error('orca terminal switch: renderer_unavailable')
+      cliCalls.push(`focus ${terminalId}`)
+      await options.onFocus?.(terminalId)
     },
     async activeTerminals() {
       lookups.push('terminals')
@@ -7395,5 +7404,378 @@ test('session on screen, Not now pressed twice: the answer is written once', asy
   await worker.request('rotator.declineHandoff', { terminalId: 't1' })
   assert.equal(saves, 1, 'a second press changes nothing, so nothing is written')
   assert.equal(w.rotator.snapshot().waiting[0]?.declined, true)
+  await worker.deactivate()
+})
+
+test('resumed and launched panes are placed in a real tab, and host focus returns to another shown terminal', async () => {
+  // Background Claude pane hands off while the host window is showing another terminal `t_view`:
+  // `orca terminal switch` adopts `t2` into a real tab, then switches focus right back to `t_view`.
+  let currentContext = ['t_view']
+  let currentActive = ['t_view']
+  let worker!: Awaited<ReturnType<typeof mountWorker>>
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    focusedTerminals: currentContext,
+    activeTerminals: currentActive,
+    settings: { timing: 'early', away_minutes: 10 },
+    onFocus: async (id) => {
+      // Simulate Orca firing `workspace.changed` as focus moves during `moveTo`: must not count as the user.
+      currentContext.splice(0, currentContext.length, id)
+      currentActive.splice(0, currentActive.length, id)
+      await worker.emit('workspace.changed', { context: { workspaceId: 'w1', branch: 'feat/x', displayName: 'w1', terminals: [{ id }] } })
+    }
+  })
+  worker = await w.mount()
+  await w.rotator.refreshFocus()
+  // User has been away for 15 minutes before the hand-off.
+  w.advance(15 * 60_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(
+    w.cliCalls.filter((c) => c.startsWith('focus ')),
+    ['focus t2', 'focus t_view']
+  )
+  // After the hand-off, the plugin's own focus switches must not have counted as user presence.
+  assert.equal(w.rotator.snapshot().userHere, undefined)
+  await worker.deactivate()
+
+  // When the handed-off pane WAS itself shown on the host, the new pane takes its place in focus
+  // and does not try to switch back to the closed pane.
+  const shown = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    focusedTerminals: ['t1'],
+    activeTerminals: ['t1'],
+    settings: { active_terminal: 'now' }
+  })
+  const wShown = await shown.mount()
+  await wShown.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(
+    shown.cliCalls.filter((c) => c.startsWith('focus ')),
+    ['focus t2']
+  )
+  await wShown.deactivate()
+
+  // Summary hand-offs (`agent.launch`, e.g. Codex) also start in the background and are placed
+  // in a real tab the same way, restoring focus to `t_view`.
+  const codex = world({
+    panes: [{ terminalId: 't1', agent: 'codex', state: 'done' }],
+    tails: { t1: fx.CODEX_USAGE_LIMIT },
+    focusedTerminals: ['t_view'],
+    activeTerminals: ['t_view']
+  })
+  const wCodex = await codex.mount()
+  await wCodex.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(
+    codex.cliCalls.filter((c) => c.startsWith('focus ')),
+    ['focus t2', 'focus t_view']
+  )
+  await wCodex.deactivate()
+})
+
+test('tab placement is best-effort: a switch failure never fails the hand-off or cools the target account', async () => {
+  // Initial switch fails (e.g. headless server with no desktop window): no restore attempted,
+  // hand-off still succeeds, first message is still sent, target account is not cooled.
+  const failFirst = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    focusedTerminals: ['t_view'],
+    activeTerminals: ['t_view'],
+    failFocus: () => true
+  })
+  const wf = await failFirst.mount()
+  await wf.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(
+    failFirst.cliCalls.filter((c) => c.startsWith('focus ')),
+    []
+  )
+  assert.equal(stored(failFirst).history.at(-1)?.result, 'resumed')
+  assert.equal(stored(failFirst).health['claude:c2'], undefined)
+  assert.ok(failFirst.typed.some((t) => t.terminalId === 't2' && t.text === 'Continue.'))
+  await wf.deactivate()
+
+  // Restore switch fails (e.g. `t_view` closed mid-handoff): `t2` was placed and hand-off still succeeds.
+  const failRestore = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    focusedTerminals: ['t_view'],
+    activeTerminals: ['t_view'],
+    failFocus: (id) => id === 't_view'
+  })
+  const wr = await failRestore.mount()
+  await wr.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(
+    failRestore.cliCalls.filter((c) => c.startsWith('focus ')),
+    ['focus t2']
+  )
+  assert.equal(stored(failRestore).history.at(-1)?.result, 'resumed')
+  assert.equal(stored(failRestore).health['claude:c2'], undefined)
+  assert.ok(failRestore.typed.some((t) => t.terminalId === 't2' && t.text === 'Continue.'))
+  await wr.deactivate()
+})
+
+test('paired server hand-off passes the server to focusTerminal and never restores a local terminal handle there', async () => {
+  const cliCalls: string[] = []
+  let remoteActive = 'r1'
+  const remotePanes: { terminalId: string; agent: string; state: 'done' | 'waiting'; sessionId: string }[] = [
+    { terminalId: 'tr1', agent: 'claude', state: 'done', sessionId: 'sr1' }
+  ]
+  const cli: Cli = {
+    async listAccounts(server) {
+      cliCalls.push(server ? `list@${server}` : 'list')
+      return server === 'remote-box'
+        ? {
+            claude: {
+              accounts: [
+                { id: 'r1', email: 'r1@example.com' },
+                { id: 'r2', email: 'r2@example.com' }
+              ],
+              activeAccountId: remoteActive
+            },
+            rateLimits: {
+              claude: {
+                r1: { provider: 'claude', session: { usedPercent: 100, resetsAt: null }, weekly: { usedPercent: 20, resetsAt: null } },
+                r2: { provider: 'claude', session: { usedPercent: 10, resetsAt: null }, weekly: { usedPercent: 10, resetsAt: null } }
+              }
+            }
+          }
+        : fx.accountList({ claudeActive: 'c1' })
+    },
+    async select(provider, accountId, server) {
+      cliCalls.push(server ? `select@${server} ${provider} ${accountId}` : `select ${provider} ${accountId}`)
+      if (server === 'remote-box') remoteActive = accountId
+    },
+    async closeTerminal(id, server) {
+      cliCalls.push(server ? `close@${server} ${id}` : `close ${id}`)
+      const i = remotePanes.findIndex((p) => p.terminalId === id)
+      if (i >= 0) remotePanes.splice(i, 1)
+    },
+    async focusTerminal(id, server) {
+      cliCalls.push(server ? `focus@${server} ${id}` : `focus ${id}`)
+    },
+    async activeTerminals(server) {
+      return server === 'remote-box' ? ['tr1'] : ['t_local']
+    },
+    async sendText(id, _text, server) {
+      cliCalls.push(server ? `send@${server} ${id}` : `send ${id}`)
+    },
+    async git() {
+      return ''
+    },
+    async draft() {
+      return ''
+    }
+  }
+  const host = mockHost({
+    settings: { restore_unsent_text: false, active_terminal: 'now' },
+    storage: { 'migrated-manual': true as never } as never,
+    results: {
+      'workspace.list': {
+        workspaces: [
+          { id: 'w_local', kind: 'worktree', name: 'local', path: '/local', branch: 'main', hostId: 'local' },
+          { id: 'w_remote', kind: 'worktree', name: 'remote', path: '/remote', branch: 'main', hostId: 'runtime:remote-box' }
+        ],
+        truncated: false
+      },
+      // Local desktop is currently showing a local terminal `t_local`.
+      'workspace.readContext': () => ({ workspaceId: 'w_local', branch: 'main', displayName: 'local', terminals: [{ id: 't_local' }] }),
+      'agents.list': ({ workspaceId }: { workspaceId?: string } = {}) => ({
+        agents: workspaceId === 'w_remote' ? remotePanes.map((p) => ({ title: null, task: null, stateStartedAt: 1, ...p })) : []
+      }),
+      'terminal.read': () => ({ lines: fx.CLAUDE_SESSION_LIMIT, truncated: false }),
+      'terminal.close': () => {
+        throw Object.assign(new Error('outside focused workspace'), { code: 'action_failed' })
+      },
+      'agent.resume': ({ agent, sessionId }: { agent: string; sessionId: string }) => {
+        remotePanes.push({ terminalId: 'tr2', agent, state: 'waiting', sessionId })
+        return { terminalId: 'tr2', started: true }
+      },
+      'terminal.sendText': () => {
+        throw Object.assign(new Error('outside focused workspace'), { code: 'action_failed' })
+      },
+      'notifications.show': { delivered: true },
+      'statusBar.update': { ok: true }
+    }
+  })
+  const worker = await mountWorker(
+    { default: async (orca: OrcaWorkerApi) => { await activateWith(likeOrca(orca), { cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false }) } },
+    { host }
+  )
+  await worker.emit('agent.status.changed', { workspaceId: 'w_remote', paneKey: 'pk', terminalId: 'tr1', state: 'done', receivedAt: 1_000_000, sessionId: 'sr1' })
+  assert.deepEqual(
+    cliCalls.filter((c) => c.startsWith('focus')),
+    ['focus@remote-box tr2']
+  )
+  await worker.deactivate()
+})
+
+test('external account switch between polls keeps Orca readings fetched after the previous poll and rejects stale ones', async () => {
+  let clock = 1_000_000
+  let claudeActive = 'c1'
+  let updatedAt = 1_000_000
+  let session = 90
+  const cli: Cli = {
+    async listAccounts() {
+      return fx.accountList({ claudeActive, claudeUsage: { session, weekly: 20 }, updatedAt })
+    },
+    async select() {},
+    async closeTerminal() {},
+    async sendText() {},
+    async git() { return '' },
+    async draft() { return '' }
+  }
+  const host = mockHost({
+    settings: {},
+    storage: {},
+    results: { 'agents.list': { agents: [] }, 'workspace.list': { workspaces: [], truncated: false }, 'statusBar.update': { ok: true }, 'notifications.show': { delivered: true } }
+  })
+  let rotator!: Rotator
+  const worker = await mountWorker(
+    { default: async (orca: OrcaWorkerApi) => { rotator = await activateWith(likeOrca(orca), { cli, now: () => clock, sleep: async () => undefined }, { tick: false }) } },
+    { host }
+  )
+  await rotator.accounts(true)
+
+  // User switches to c2 in Orca UI at +10s, and Orca refreshes c2 at +11s (before next 60s poll).
+  claudeActive = 'c2'
+  session = 15
+  updatedAt = 1_011_000
+  clock = 1_060_000
+  const freshView = await rotator.accounts(true)
+  const c2Fresh = freshView.seats.find((s) => s.key === 'claude:c2')!.usage
+  assert.equal(c2Fresh.known, true)
+  assert.equal(c2Fresh.source, 'live')
+  assert.equal(c2Fresh.session?.usedPercent, 15)
+
+  // External switch to c3 where Orca still holds c2's stale timestamp (+11s) -> rejected.
+  claudeActive = 'c3'
+  session = 99
+  updatedAt = 1_011_000
+  clock = 1_120_000
+  const staleView = await rotator.accounts(true)
+  assert.equal(staleView.seats.find((s) => s.key === 'claude:c3')!.usage.known, false)
+  await worker.deactivate()
+})
+
+test('manual refresh requests refreshUsage: true while periodic ticks keep background polling', async () => {
+  const listCalls: Array<{ server?: string; refreshUsage?: boolean }> = []
+  let clock = 1_000_000
+  let gate: Promise<void> | undefined
+  const cli: Cli = {
+    async listAccounts(server, options) {
+      listCalls.push({ ...(server ? { server } : {}), ...(options?.refreshUsage ? { refreshUsage: true } : {}) })
+      if (!options?.refreshUsage && gate) await gate
+      return fx.accountList({ updatedAt: clock })
+    },
+    async select() {},
+    async closeTerminal() {},
+    async sendText() {},
+    async git() { return '' },
+    async draft() { return '' }
+  }
+  const host = mockHost({
+    settings: {},
+    storage: {},
+    results: { 'agents.list': { agents: [] }, 'workspace.list': { workspaces: [], truncated: false }, 'statusBar.update': { ok: true }, 'notifications.show': { delivered: true } }
+  })
+  let rotator!: Rotator
+  const worker = await mountWorker(
+    { default: async (orca: OrcaWorkerApi) => { rotator = await activateWith(likeOrca(orca), { cli, now: () => clock, sleep: async () => undefined }, { tick: false }) } },
+    { host }
+  )
+  await rotator.accounts(true)
+  listCalls.length = 0
+
+  clock += 65_000
+  await rotator.tick()
+  assert.deepEqual(listCalls, [{}])
+
+  listCalls.length = 0
+  await worker.request('rotator.snapshot', { refresh: true })
+  assert.deepEqual(listCalls, [{ refreshUsage: true }])
+
+  listCalls.length = 0
+  await worker.command('rotator.refresh')
+  assert.deepEqual(listCalls, [{ refreshUsage: true }])
+
+  // A manual refresh while a background read is in flight waits and still issues refreshUsage: true.
+  listCalls.length = 0
+  let releaseGate!: () => void
+  gate = new Promise<void>((r) => (releaseGate = r))
+  clock += 65_000
+  const bg = rotator.tick()
+  await new Promise((r) => setTimeout(r, 10))
+  const manual = worker.command('rotator.refresh')
+  releaseGate()
+  await Promise.all([bg, manual])
+  gate = undefined
+  assert.deepEqual(listCalls, [{}, { refreshUsage: true }])
+  await worker.deactivate()
+})
+
+test('paired server usage is cached across errors and projected past reset without colliding with local seats', async () => {
+  let clock = 1_000_000
+  let remoteActive = 'c1'
+  let remoteOk = true
+  const cli: Cli = {
+    async listAccounts(server) {
+      if (server === 'remote-box') {
+        return {
+          claude: {
+            accounts: [
+              { id: 'c1', email: 'remote1@example.test' },
+              { id: 'c2', email: 'remote2@example.test' }
+            ],
+            activeAccountId: remoteActive,
+            systemDefaultHome: null
+          },
+          rateLimits: {
+            claude: remoteOk
+              ? { status: 'ok', updatedAt: clock, session: { usedPercent: 60, resetsAt: 1_000_000 + 3_600_000 }, weekly: { usedPercent: 25, resetsAt: 1_000_000 + 86_400_000 } }
+              : { status: 'error', error: 'Claude usage updates the next time Claude runs.', usageMetadata: { failureKind: 'stale-token' } }
+          }
+        }
+      }
+      return fx.accountList({ claudeActive: 'c1', claudeUsage: { session: 10, weekly: 5 }, updatedAt: clock })
+    },
+    async select() {},
+    async closeTerminal() {},
+    async sendText() {},
+    async git() { return '' },
+    async draft() { return '' }
+  }
+  const host = mockHost({
+    settings: {},
+    storage: {},
+    results: {
+      'workspace.list': { workspaces: [{ id: 'w-r', kind: 'worktree', name: 'r', projectId: 'p-r', path: '/srv/r', branch: 'main', hostId: 'runtime:remote-box' }], truncated: false },
+      'workspace.readContext': { workspaceId: 'w-r', branch: 'main', displayName: 'r', terminals: [] },
+      'agents.list': { agents: [] },
+      'notifications.show': { delivered: true },
+      'statusBar.update': { ok: true }
+    }
+  })
+  const worker = await mountWorker(
+    { default: async (orca: OrcaWorkerApi) => { await activateWith(likeOrca(orca), { cli, now: () => clock, sleep: async () => undefined }, { tick: false }) } },
+    { host }
+  )
+  const first = await worker.request('rotator.snapshot', { refresh: true })
+  assert.equal(first.seats.find((s) => s.key === 'claude:c1')?.usage.session?.usedPercent, 60)
+
+  // Switch active on remote so c1 becomes inactive and stops reporting usage.
+  remoteActive = 'c2'
+  remoteOk = false
+  clock += 10 * MIN
+  const cached = await worker.request('rotator.snapshot', { refresh: true })
+  const c1Cached = cached.seats.find((s) => s.key === 'claude:c1')!.usage
+  assert.equal(c1Cached.source, 'cached')
+  assert.equal(c1Cached.session?.usedPercent, 60)
+
+  // Past c1's 5h reset, remote c1 projects to 0% reset.
+  clock = 1_000_000 + 2 * 3_600_000
+  const projected = await worker.request('rotator.snapshot', { refresh: true })
+  const c1Proj = projected.seats.find((s) => s.key === 'claude:c1')!.usage
+  assert.equal(c1Proj.source, 'projected')
+  assert.deepEqual(c1Proj.session, { usedPercent: 0, resetsAt: null, reset: true })
   await worker.deactivate()
 })

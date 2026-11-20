@@ -58,11 +58,13 @@ import {
 export type HostLike = { call(method: string, params?: unknown): Promise<any> }
 
 export type Cli = {
-  /** `orca account list --json` → its `result` (on `server` when the project runs on a remote Orca server). */
-  listAccounts(server?: string): Promise<Record<string, any>>
+  /** `orca account list --json` (or RuntimeClient `accounts.list`) → its `result`. */
+  listAccounts(server?: string, options?: { refreshUsage?: boolean }): Promise<Record<string, any>>
   select(provider: Provider, accountId: string, server?: string): Promise<void>
   /** `orca terminal close`, which also closes terminals outside the focused workspace. */
   closeTerminal(terminalId: string, server?: string): Promise<void>
+  /** `orca terminal switch`: adopts a background terminal into a real tab and focuses it. */
+  focusTerminal?(terminalId: string, server?: string): Promise<void>
   /** `orca terminal send --enter`, which also reaches terminals outside the focused workspace. */
   sendText(terminalId: string, text: string, server?: string): Promise<void>
   /** `orca terminal send` without `--enter`: the text is written to the pane as it is. */
@@ -268,7 +270,7 @@ function hostFromWorkspaceIdentity(id: string | null | undefined): string | unde
   }
 }
 
-type ServerView = { view: AccountView; at: number; error?: string }
+type ServerView = { view: AccountView; rawSeats?: Seat[]; at: number; error?: string }
 
 /** Orca could not say what a pane's input box holds. Never taken for an empty box: whatever
  *  would close the pane or type into it treats it as unsent text. */
@@ -358,11 +360,11 @@ export class Rotator {
   private usage: UsageCache = emptyUsageCache()
   /** Recent readings per account, for the pace of use; see usage-history.ts. Local accounts only. */
   private samples: UsageSamples = emptyUsageSamples()
-  /** When each provider's active account last changed, so a stale reading is not misattributed. */
-  private activeSince: Partial<Record<Provider, number>> = {}
+  /** When each provider's active account last changed per server, so a stale reading is not misattributed. */
+  private activeSinceByServer = new Map<string, Partial<Record<Provider, number>>>()
   /** One `orca account list` at a time per server: the timer, the panel and commands share the
-   *  one in flight (~3 s). */
-  private listings = new Map<string, Promise<AccountView>>()
+   *  one in flight. */
+  private listings = new Map<string, { promise: Promise<AccountView>; refreshUsage: boolean }>()
   private followUp = 0
   private disposed = false
   /** Moves (and anything else under a provider's lock) running or queued right now. */
@@ -405,13 +407,22 @@ export class Rotator {
       cli: {
         ...deps.cli,
         select: async (provider: Provider, accountId: string, server?: string) => {
-          if (server) return select(provider, accountId, server)
-          await select(provider, accountId)
-          this.activeSince[provider] = this.deps.now()
-          this.readAfterSwitch()
+          await select(provider, accountId, server)
+          this.activeSinceFor(server)[provider] = this.deps.now()
+          if (!server) this.readAfterSwitch()
         }
       }
     }
+  }
+
+  private activeSinceFor(server: string | undefined): Partial<Record<Provider, number>> {
+    const key = server ?? 'local'
+    let map = this.activeSinceByServer.get(key)
+    if (!map) {
+      map = {}
+      this.activeSinceByServer.set(key, map)
+    }
+    return map
   }
 
   async init(): Promise<void> {
@@ -845,13 +856,13 @@ export class Rotator {
     }
   }
 
-  async accounts(force = false): Promise<AccountView> {
+  async accounts(force = false, refreshUsage = false): Promise<AccountView> {
     const server = await this.currentServer()
     this.server = server
-    return this.accountsFor(server, force)
+    return this.accountsFor(server, force, refreshUsage)
   }
 
-  private async accountsFor(server: string | undefined, force = false): Promise<AccountView> {
+  private async accountsFor(server: string | undefined, force = false, refreshUsage = false): Promise<AccountView> {
     const config = await this.config()
     const key = server ?? 'local'
     const current = this.views.get(key)
@@ -864,48 +875,69 @@ export class Rotator {
       }
       return current.view
     }
-    // One `orca account list` per server at a time (~3 s): the timer, the panel and commands share it.
+    // One `orca account list` per server at a time: the timer, the panel and commands share it.
+    // A forced usage refresh waits for an in-flight background read and then runs with `refreshUsage: true`.
     const pending = this.listings.get(key)
-    if (pending) return pending
-    const reading = this.readAccountsFor(server, key, current, config).finally(() => this.listings.delete(key))
-    this.listings.set(key, reading)
-    return reading
+    if (pending) {
+      if (!refreshUsage || pending.refreshUsage) return pending.promise
+      await pending.promise.catch(() => undefined)
+      return this.accountsFor(server, true, true)
+    }
+    const promise = this.readAccountsFor(server, key, current, config, refreshUsage).finally(() => this.listings.delete(key))
+    this.listings.set(key, { promise, refreshUsage })
+    return promise
   }
 
   private async readAccountsFor(
     server: string | undefined,
     key: string,
     current: ServerView | undefined,
-    config: Config
+    config: Config,
+    refreshUsage = false
   ): Promise<AccountView> {
     let nextView = current?.view ?? null
+    let nextRaw = current?.rawSeats
     let nextAt = current?.at ?? 0
     let nextError: string | undefined
     try {
-      const raw = server ? await this.deps.cli.listAccounts(server) : await this.deps.cli.listAccounts()
+      const raw = refreshUsage
+        ? await this.deps.cli.listAccounts(server, { refreshUsage: true })
+        : server
+          ? await this.deps.cli.listAccounts(server)
+          : await this.deps.cli.listAccounts()
       const parsed = parseAccounts(raw)
       const now = this.deps.now()
-      if (!server) {
-        // The last-known usage cache covers this machine's accounts (see usage-cache.ts).
-        // A switch made outside the plugin (Orca's own switcher) also starts a new active period.
-        if (current?.view) {
-          for (const [provider, seatKey] of Object.entries(parsed.active) as [Provider, string][]) {
-            if (current.view.active[provider] && current.view.active[provider] !== seatKey) this.activeSince[provider] = now
+      const rawSeats = parsed.seats.map((s) => ({ ...s, usage: { ...s.usage } }))
+      const activeSince = this.activeSinceFor(server)
+      // A switch made outside the plugin (Orca's own switcher) also starts a new active period,
+      // anchored to the previous poll / previous account reading so genuine readings fetched
+      // between polls are kept while stale readings from before the switch are rejected.
+      if (current?.view) {
+        for (const [provider, seatKey] of Object.entries(parsed.active) as [Provider, string][]) {
+          const prevKey = current.view.active[provider]
+          if (prevKey && prevKey !== seatKey) {
+            const prevUpdatedAt =
+              current.rawSeats?.find((s) => s.key === prevKey)?.usage.updatedAt ??
+              current.view.seats.find((s) => s.key === prevKey)?.usage.updatedAt
+            activeSince[provider] = Math.max(current.at, prevUpdatedAt ?? 0) + 1
           }
         }
-        let changed = observe(this.usage, parsed.seats, now, this.activeSince)
-        if (await this.observePanes(parsed.seats, now)) changed = true
-        const maxAgeMs = config.usageCacheMaxAgeHours * 3_600_000
-        for (const seat of parsed.seats) seat.usage = resolve(seat, this.usage, now, maxAgeMs, this.activeSince)
-        if (changed) await this.deps.saveUsage(this.usage).catch(() => undefined)
-        // Observe only: the pace of use, for the runway the panel shows.
+      }
+      let changed = observe(this.usage, parsed.seats, now, activeSince, server)
+      if (!server && (await this.observePanes(parsed.seats, now))) changed = true
+      const maxAgeMs = config.usageCacheMaxAgeHours * 3_600_000
+      for (const seat of parsed.seats) seat.usage = resolve(seat, this.usage, now, maxAgeMs, activeSince, server)
+      if (changed) await this.deps.saveUsage(this.usage).catch(() => undefined)
+      if (!server) {
+        // Observe only: the pace of use, for the runway the panel shows (local accounts only).
         let sampled = pruneSamples(this.samples, parsed.seats.map((s) => s.key))
         for (const seat of parsed.seats) if (addSample(this.samples, seat, now)) sampled = true
         if (sampled) await this.deps.saveSamples(this.samples).catch(() => undefined)
-        const freed = this.clearLeftLow(parsed.seats, now, server)
-        if (this.clearStrikesByReading(parsed.seats, now) || freed) await this.save()
-      } else if (this.clearLeftLow(parsed.seats, now, server)) await this.save()
+      }
+      const freed = this.clearLeftLow(parsed.seats, now, server)
+      if (this.clearStrikesByReading(parsed.seats, now, server) || freed) await this.save()
       nextView = parsed
+      nextRaw = rawSeats
       nextAt = now
       nextError = undefined
     } catch (error) {
@@ -913,7 +945,7 @@ export class Rotator {
       this.deps.log(nextError)
       if (!nextView) nextView = { seats: [], active: {} }
     }
-    const entry: ServerView = { view: nextView, at: nextAt }
+    const entry: ServerView = { view: nextView, ...(nextRaw ? { rawSeats: nextRaw } : {}), at: nextAt }
     if (nextError) entry.error = nextError
     this.views.set(key, entry)
     if (server === this.server) {
@@ -922,6 +954,42 @@ export class Rotator {
       this.viewError = nextError
     }
     return nextView
+  }
+
+  /** Re-reads local per-pane live files (`live/claude-*.tsv`) and re-projects cached/live reset
+   *  windows without spawning an Orca CLI call. Publishes when any seat's resolved usage changes. */
+  async syncLivePanes(publishIfChanged = true): Promise<boolean> {
+    const pending = this.listings.get('local')?.promise
+    if (pending) await pending.catch(() => undefined)
+    const current = this.views.get('local')
+    if (!current || !current.rawSeats || current.rawSeats.length === 0) return false
+    const config = await this.config()
+    const now = this.deps.now()
+    const observed = await this.observePanes(current.rawSeats, now)
+    const maxAgeMs = config.usageCacheMaxAgeHours * 3_600_000
+    const activeSince = this.activeSinceFor(undefined)
+    const nextSeats = current.rawSeats.map((rawSeat) => ({
+      ...rawSeat,
+      usage: resolve(rawSeat, this.usage, now, maxAgeMs, activeSince)
+    }))
+    const changed =
+      observed ||
+      nextSeats.some((nextSeat, i) => {
+        const prevSeat = current.view.seats[i]
+        return !prevSeat || prevSeat.key !== nextSeat.key || JSON.stringify(prevSeat.usage) !== JSON.stringify(nextSeat.usage)
+      })
+    if (!changed) return false
+    const nextView: AccountView = { ...current.view, seats: nextSeats }
+    current.view = nextView
+    if (!this.server) this.view = nextView
+    if (observed) await this.deps.saveUsage(this.usage).catch(() => undefined)
+    let sampled = false
+    for (const seat of nextSeats) if (addSample(this.samples, seat, now)) sampled = true
+    if (sampled) await this.deps.saveSamples(this.samples).catch(() => undefined)
+    const freed = this.clearLeftLow(nextSeats, now, undefined)
+    if (this.clearStrikesByReading(nextSeats, now, undefined) || freed) await this.save()
+    if (publishIfChanged && !this.server) this.publishNow()
+    return true
   }
 
   /** Takes in what Claude panes reported about their own accounts (live-usage.ts). Passive: it
@@ -944,16 +1012,17 @@ export class Rotator {
 
   /** A current reading (Orca's or a pane's: anything resolved as `live`) that is newer than
    *  the last strike and shows room clears the seat's strikes. Remembered numbers never do. */
-  private clearStrikesByReading(seats: readonly Seat[], now: number): boolean {
+  private clearStrikesByReading(seats: readonly Seat[], now: number, server?: string): boolean {
     let changed = false
     for (const seat of seats) {
-      const h = this.state.health[seat.key]
+      const key = scopedKey(server, seat.key)
+      const h = this.state.health[key]
       if (!h || strikesOf(h, now) === 0) continue
       const u = seat.usage
       if (!u.known || (u.source !== undefined && u.source !== 'live')) continue
       if (u.asOf !== undefined && u.asOf <= (h.strikeAt ?? 0)) continue
       if (exhausted(seat, now)) continue
-      this.dropStrikes(seat.key)
+      this.dropStrikes(key)
       changed = true
     }
     return changed
@@ -1145,6 +1214,7 @@ export class Rotator {
       if (event.state === 'working' && (before === 'waiting' || before === 'done' || before === 'blocked') && !byPlugin && onScreen) this.notePresence()
     }
     if (await this.refreshFocus()) this.publishNow()
+    if (!this.server && (event.state === 'done' || event.state === 'waiting')) await this.syncLivePanes(true)
     await this.look(event)
   }
 
@@ -2342,6 +2412,9 @@ export class Rotator {
           return 'The session on screen waits for you.'
         }
       }
+      // Note the terminal shown on the host before closing `pane`, so after placing the new
+      // background terminal into a real tab below, focus can return to what the user was viewing.
+      const restoreTo = await this.focusBefore(pane)
       let newTerminal: string
       if (canResume) {
         // agent.resume refuses while the session still runs, so the old pane goes first.
@@ -2366,6 +2439,10 @@ export class Rotator {
         closing = true
         await this.closePane(pane)
       }
+      // Orca's `agent.resume` and `agent.launch` start the new pane with `presentation: 'background'`,
+      // leaving it headless outside any real tab group (which can leave a paired client showing a
+      // black pane for the closed tab). Adopt it into a real tab now, then restore host focus.
+      await this.placePane(newTerminal, restoreTo, pane.server)
       // The resumed session redraws the same transcript, old banner included, possibly a while
       // after it starts: carry what this pane had already handled over to the new one.
       // With a session id the record is per session and carries over by itself.
@@ -2691,6 +2768,46 @@ export class Rotator {
     this.deps.log(`could not close ${pane.terminalId}${failure ? `: ${failure}` : ''}`)
   }
 
+  /** The active terminal shown in the focused workspace right before a hand-off, when it is not
+   *  the pane being handed off. After `placePane` adopts the new pane into a real tab via
+   *  `orca terminal switch`, focus returns here so the host window stays where the user left it. */
+  private async focusBefore(pane: PaneInfo): Promise<string | undefined> {
+    if (!this.deps.cli.focusTerminal) return undefined
+    const [context, active] = await Promise.all([
+      this.deps.host.call('workspace.readContext').catch(() => null),
+      this.activeTerminalsRead(pane.server)
+    ])
+    if (!context || !active) return undefined
+    const shown = context.terminals
+      .map((t: { id: string }) => t.id)
+      .filter((id: string) => active.includes(id))
+    // When the handed-off pane was itself shown, the new pane takes its place in focus.
+    if (shown.includes(pane.terminalId)) return undefined
+    return shown[0]
+  }
+
+  /** Adopts a background resumed/launched terminal into a real desktop tab via `orca terminal
+   *  switch` (which invokes `terminal.focus` without requiring the `workspace:write` host
+   *  capability), then returns focus to `restoreTo` if the host was viewing another terminal.
+   *  Best-effort: a failure (e.g. a headless server with no window) never fails the hand-off. */
+  private async placePane(terminalId: string, restoreTo: string | undefined, server?: string): Promise<void> {
+    const focus = this.deps.cli.focusTerminal
+    if (!focus) return
+    try {
+      await (server ? focus.call(this.deps.cli, terminalId, server) : focus.call(this.deps.cli, terminalId))
+    } catch (error) {
+      this.deps.log(`could not place ${terminalId} in a tab: ${String((error as Error)?.message ?? error)}`)
+      return
+    }
+    if (restoreTo && restoreTo !== terminalId) {
+      try {
+        await (server ? focus.call(this.deps.cli, restoreTo, server) : focus.call(this.deps.cli, restoreTo))
+      } catch (error) {
+        this.deps.log(`could not restore focus to ${restoreTo}: ${String((error as Error)?.message ?? error)}`)
+      }
+    }
+  }
+
   private async waitReady(terminalId: string, workspaceId: string): Promise<void> {
     for (let i = 0; i < 60; i++) {
       await this.deps.sleep(1000)
@@ -2765,11 +2882,13 @@ export class Rotator {
 
   // ---- periodic -------------------------------------------------------------------------
 
-  /** Runs every 30 s: refresh usage, wake parked sessions, expire cooldowns. */
+  /** Runs every 30 s: refresh usage, sync live pane files, wake parked sessions, expire cooldowns. */
   async tick(): Promise<void> {
     const config = await this.config()
     this.noteConfig(config)
-    const view = await this.accounts()
+    const listed = await this.accounts()
+    if (!this.server) await this.syncLivePanes(false)
+    const view = (!this.server ? this.views.get('local')?.view : undefined) ?? listed
     const now = this.deps.now()
     let changed = this.pruneHistory()
     for (const [key, h] of Object.entries(this.state.health)) {

@@ -21,6 +21,8 @@ declare module 'node:fs' {
   export function readdirSync(path: string): string[]
   export function symlinkSync(target: string, path: string): void
   export function statSync(path: string): { mode: number }
+  export type FSWatcher = { close(): void; on(event: string, cb: () => void): unknown }
+  export function watch(path: string, listener: () => void): FSWatcher
 }
 declare module 'node:os' {
   export function homedir(): string

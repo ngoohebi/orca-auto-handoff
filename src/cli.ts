@@ -57,13 +57,35 @@ function openRuntimeClient(cliPath: string, server: string | null, timeoutMs = 3
   return new RuntimeClient(undefined, timeoutMs, null, server)
 }
 
-export async function remoteListAccounts(cliPath: string, server: string): Promise<Record<string, any>> {
-  const client = openRuntimeClient(cliPath, server)
+async function callListAccounts(client: any, refreshUsage: boolean): Promise<Record<string, any>> {
   const [response, antigravity] = await Promise.all([
-    client.call('accounts.list', { refreshUsage: false, refreshStaleUsage: true }),
+    client.call('accounts.list', { refreshUsage, refreshStaleUsage: true }),
     client.call('accounts.antigravityList', { runtime: 'host' }).then((r: any) => r?.result ?? null, () => null)
   ])
   return antigravity ? { ...response.result, antigravity } : response.result
+}
+
+export async function remoteListAccounts(cliPath: string, server: string, refreshUsage = false): Promise<Record<string, any>> {
+  return callListAccounts(openRuntimeClient(cliPath, server), refreshUsage)
+}
+
+export async function localListAccounts(cliPath: string, refreshUsage = false): Promise<Record<string, any>> {
+  let client: any
+  try {
+    client = openRuntimeClient(cliPath, null)
+  } catch {
+    // Fall back to the CLI when the unpacked RuntimeClient isn't available on this install.
+    return orcaJson(cliPath, ['account', 'list'])
+  }
+  try {
+    return await callListAccounts(client, refreshUsage)
+  } catch (error) {
+    const code = (error as { code?: string })?.code
+    if (code === 'incompatible_runtime' || code === 'invalid_params') {
+      return orcaJson(cliPath, ['account', 'list'])
+    }
+    throw error
+  }
 }
 
 export async function remoteSelectAccount(cliPath: string, provider: Provider, accountId: string, server: string): Promise<void> {
@@ -189,10 +211,11 @@ function envArgs(server?: string): string[] {
 
 export function nodeCli(getPath: () => Promise<string>): Cli {
   return {
-    async listAccounts(server?: string) {
+    async listAccounts(server?: string, options?: { refreshUsage?: boolean }) {
       const cli = resolveOrcaCli(await getPath())
-      if (server) return remoteListAccounts(cli, server)
-      return orcaJson(cli, ['account', 'list'])
+      const refreshUsage = !!options?.refreshUsage
+      if (server) return remoteListAccounts(cli, server, refreshUsage)
+      return localListAccounts(cli, refreshUsage)
     },
     async select(provider: Provider, accountId: string, server?: string) {
       const cli = resolveOrcaCli(await getPath())
@@ -204,6 +227,9 @@ export function nodeCli(getPath: () => Promise<string>): Cli {
     },
     async closeTerminal(terminalId: string, server?: string) {
       await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'close', '--terminal', terminalId, ...envArgs(server)])
+    },
+    async focusTerminal(terminalId: string, server?: string) {
+      await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'switch', '--terminal', terminalId, ...envArgs(server)])
     },
     async sendText(terminalId: string, text: string, server?: string) {
       // `--text=…`: as a word of its own, a text that starts with `--` is read as another flag

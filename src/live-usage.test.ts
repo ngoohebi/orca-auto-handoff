@@ -347,3 +347,41 @@ test('worker: a pane reading survives a restart as a remembered one', async () =
     await second.worker.deactivate()
   }
 })
+
+test('resolve prefers a pane reading when Orca omits updatedAt', () => {
+  const cache = emptyUsageCache()
+  const noStamp = { ...orca(20, 10, T0), active: true }
+  delete noStamp.usage.updatedAt
+  observe(cache, [noStamp], T0, {})
+  observeLive(cache, KEY, pane(55, 15, T0 + MIN), T0 + MIN)
+  const u = resolve(noStamp, cache, T0 + 2 * MIN, WEEK, {})
+  assert.deepEqual([u.source, u.origin, u.session?.usedPercent], ['live', 'pane', 55])
+})
+
+test('worker: syncLivePanes picks up pane live files without spawning listAccounts', async () => {
+  let clock = T0
+  const m = await mount({ result: () => accountList({ claudeActive: 'c1', updatedAt: clock }), now: () => clock })
+  try {
+    await m.rotator().accounts(true)
+    const listsAfterInit = m.calls.length
+    assert.equal(usageOf(m.rotator().snapshot().seats, 'claude:c2').known, false)
+
+    // A pane on inactive c2 writes its live file while Orca poll interval has not elapsed.
+    clock += 10_000
+    m.live('c2', row(Math.floor(clock / 1000), 48, Math.floor((clock + 3600_000) / 1000), 17, Math.floor((clock + 86_400_000) / 1000)))
+    assert.equal(await m.rotator().syncLivePanes(true), true)
+    assert.equal(m.calls.length, listsAfterInit, 'no CLI call needed to sync live pane files')
+
+    const c2 = usageOf(m.rotator().snapshot().seats, 'claude:c2')
+    assert.deepEqual([c2.known, c2.source, c2.origin, c2.session?.usedPercent, c2.weekly?.usedPercent], [true, 'live', 'pane', 48, 17])
+
+    // Once the 5h window resets, tick projects it even without re-polling Orca (poll_interval_seconds = 60).
+    clock += 3600_000 + 5_000
+    assert.equal(await m.rotator().syncLivePanes(false), true)
+    const afterReset = usageOf(m.rotator().snapshot().seats, 'claude:c2')
+    assert.equal(afterReset.source, 'projected')
+    assert.deepEqual(afterReset.session, { usedPercent: 0, resetsAt: null, reset: true })
+  } finally {
+    await m.worker.deactivate()
+  }
+})

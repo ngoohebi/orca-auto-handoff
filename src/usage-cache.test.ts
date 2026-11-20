@@ -210,3 +210,28 @@ test('after the plugin switches accounts it reads usage again (Orca refreshes in
   assert.ok(calls.filter((c) => c === 'list').length >= before + 2, calls.join(','))
   await worker.deactivate()
 })
+
+test('parseAccounts rejects an active reading whose readingAccount belongs to a different account', () => {
+  const result = accountList({ claudeActive: 'c2', claudeUsage: { session: 88, weekly: 44 }, updatedAt: T0 })
+  result.rateLimits.claude.usageMetadata = { readingAccount: { accountId: 'c1' } }
+  const c2 = parseAccounts(result).seats.find((s) => s.key === 'claude:c2')!
+  assert.equal(c2.usage.known, false)
+  assert.equal(c2.usage.reason, 'fetching')
+
+  result.rateLimits.claude.usageMetadata = { readingAccount: { accountId: 'c2' } }
+  const matched = parseAccounts(result).seats.find((s) => s.key === 'claude:c2')!
+  assert.equal(matched.usage.known, true)
+  assert.equal(matched.usage.session?.usedPercent, 88)
+})
+
+test('scoped cache isolates paired servers from local seats and prunes per scope', () => {
+  const cache = emptyUsageCache()
+  observe(cache, [live(25, 10, T0)], T0, {})
+  observe(cache, [live(75, 40, T0)], T0, {}, 'remote-box')
+  assert.equal(resolve(gone(), cache, T0 + 60_000, WEEK, {}).session?.usedPercent, 25)
+  assert.equal(resolve(gone(), cache, T0 + 60_000, WEEK, {}, 'remote-box').session?.usedPercent, 75)
+  // Pruning remote-box must not touch local, and vice versa.
+  observe(cache, [], T0 + 60_000, {}, 'remote-box')
+  assert.equal(resolve(gone(), cache, T0 + 60_000, WEEK, {}).session?.usedPercent, 25)
+  assert.equal(resolve(gone(), cache, T0 + 60_000, WEEK, {}, 'remote-box').known, false)
+})
