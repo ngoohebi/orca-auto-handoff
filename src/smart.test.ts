@@ -16,7 +16,7 @@ import {
   type SmartContext
 } from './smart'
 import { pickNext } from './selector'
-import { DEFAULT_CONFIG, SMART_CONFIG, type Config, type Seat, type SeatHealth } from './types'
+import { SMART_CONFIG, type Config, type Seat, type SeatHealth } from './types'
 import type { DailySample, Sample } from './usage-history'
 
 const T0 = 1_800_000_000_000
@@ -64,8 +64,6 @@ test('assess: Out when cooling down or at 100 %; Unknown without numbers; OK wit
   assert.equal(ok.runwayMs, null)
   // A window whose reset time has passed no longer counts as full.
   assert.equal(assess(seat('a', { s: 100, w: 20, sReset: T0 - 1 }), undefined, [], cfg(), T0).state, 'ok')
-  // A configured cap below 100 (a legacy threshold kept by `auto`) also means Out.
-  assert.equal(assess(seat('a', { s: 60, w: 20 }), undefined, [], cfg({ thresholdFiveHour: 50 }), T0).state, 'out')
 })
 
 test('assess: Low when the pace runs out within the horizon, from a reading at most 10 minutes old', () => {
@@ -224,24 +222,24 @@ test('explain: one line with the reason, the levels and the reset when it is nea
   const personal = { label: 'personal', usage: seat('p', { s: 12, w: 40, wReset: T0 + 9 * HOUR }).usage }
   assert.equal(
     explain('low', work, personal, T0),
-    'work had about 6 min left at this pace (5h 94 %, week 30 %); moved to personal (5h 12 %, week 40 %, weekly resets in 9 h)'
+    'work had about 6 min left at this pace (5h 94 %, week 30 %); handed off to personal (5h 12 %, week 40 %, weekly resets in 9 h)'
   )
   const level = { label: 'work', usage: seat('w', { s: 98, w: 30 }).usage, assessment: assess(seat('w', { s: 98, w: 30 }), undefined, [], cfg(), T0) }
   assert.equal(
     explain('low', level, personal, T0, { selectionOnly: true }),
-    'work is nearly at the end of its 5h window (5h 98 %, week 30 %); new launches use personal (5h 12 %, week 40 %, weekly resets in 9 h)'
+    'work is nearly at the end of its 5h window (5h 98 %, week 30 %); new sessions start on personal (5h 12 %, week 40 %, weekly resets in 9 h)'
   )
   assert.equal(
     explain('expiring', work, personal, T0, { idle: true }),
-    'idle session; personal has weekly quota that would expire unused (5h 12 %, week 40 %, weekly resets in 9 h); moved there from work'
+    'idle session; personal has weekly quota that would expire unused (5h 12 %, week 40 %, weekly resets in 9 h); handed off there from work'
   )
   const out = { label: 'work', usage: seat('w', { s: 100, w: 30 }).usage, assessment: assess(seat('w', { s: 100, w: 30 }), undefined, [], cfg(), T0) }
-  assert.equal(explain('out', out, { label: 'spare', usage: { known: false } }, T0, { selectionOnly: true }), 'work is used up (5h 100 %, week 30 %); new launches use spare (no usage numbers yet)')
+  assert.equal(explain('out', out, { label: 'spare', usage: { known: false } }, T0, { selectionOnly: true }), 'work is used up (5h 100 %, week 30 %); new sessions start on spare (no usage numbers yet)')
   const cooling = { label: 'work', usage: seat('w', { s: 40, w: 30 }).usage, assessment: assess(seat('w', { s: 40, w: 30 }), { cooldownUntil: T0 + MIN }, [], cfg(), T0) }
-  assert.match(explain('out', cooling, personal, T0), /^work is cooling down after a limit \(5h 40 %, week 30 %\); moved to personal/)
+  assert.match(explain('out', cooling, personal, T0), /^work is cooling down after a limit \(5h 40 %, week 30 %\); handed off to personal/)
 })
 
-test('shouldLeave: at a limit or Low; the legacy settings leave exactly when over the threshold', () => {
+test('shouldLeave: at a limit or Low', () => {
   const leave = (r: Reading, config: Config, samples: Sample[] = [], health?: SeatHealth) => shouldLeave(seat('a', r), health, samples, config, T0).leave
   assert.equal(leave({ s: 100, w: 20 }, cfg()), true)
   assert.equal(leave({ s: 97, w: 20 }, cfg()), true)
@@ -249,16 +247,11 @@ test('shouldLeave: at a limit or Low; the legacy settings leave exactly when ove
   assert.equal(leave({ s: 60, w: 20 }, cfg()), false)
   // A cooldown alone is no reason: the turn that just ended there shows the account works.
   assert.equal(leave({ s: 60, w: 20 }, cfg(), [], { cooldownUntil: T0 + MIN }), false)
-  // "Only at a limit" / "New launches only": never, for a running session.
+  // A full weekly window too; a window whose reset time has passed is no longer full.
+  assert.equal(leave({ s: 20, w: 100 }, cfg()), true)
+  assert.equal(leave({ s: 100, w: 20, sReset: T0 - 1 }, cfg()), false)
+  // "At limit": never, for a running session.
   assert.equal(leave({ s: 100, w: 20 }, cfg({ autoSwitchOnThreshold: false })), false)
-  // Legacy (custom): the threshold, and nothing else, whatever the pace.
-  const legacy = DEFAULT_CONFIG
-  assert.equal(leave({ s: 99, w: 99 }, legacy, rising([87, 91, 95, 99], T0)), false)
-  assert.equal(leave({ s: 100, w: 20 }, legacy), true)
-  assert.equal(leave({ s: 20, w: 100 }, legacy), true)
-  assert.equal(leave({ s: 100, w: 20, sReset: T0 - 1 }, legacy), false)
-  assert.equal(leave({ s: 60, w: 20 }, { ...legacy, thresholdFiveHour: 50 }), true)
-  assert.equal(leave({ s: 60, w: 20 }, { ...legacy, thresholdFiveHour: 50, autoSwitchOnThreshold: false }), false)
 })
 
 test('shortWait: within 5 minutes; or sooner than a short-lived target would last', () => {

@@ -1,10 +1,10 @@
 import { assert, test } from 'orca/testing'
 import { parseAccounts } from './accounts'
-import { accountList } from './fixtures'
+import { accountList, likeOrca } from './fixtures'
 import { buildChain, pickNext } from './selector'
 import { DEFAULT_CONFIG, type Seat } from './types'
 import { emptyUsageCache, isLive, loadedUsageCache, observe, resolve } from './usage-cache'
-import { statusText, tickMs } from './worker'
+import { tickMs } from './worker'
 
 const T0 = 1_000_000
 const HOUR = 3_600_000
@@ -102,10 +102,10 @@ test('Orca\'s reasons are parsed from the account list', () => {
   assert.equal(seats.find((s) => s.key === 'claude:c1')!.usage.source, 'live')
 })
 
-test('the selector skips a remembered over-threshold seat, and takes it once its window has reset', () => {
-  const cfg = { ...DEFAULT_CONFIG, thresholdFiveHour: 80, strategy: 'priority' as const }
+test('the selector skips a remembered used-up seat, and takes it once its window has reset', () => {
+  const cfg = DEFAULT_CONFIG
   const cache = emptyUsageCache()
-  observe(cache, [live(90, 10, T0)], T0, {})
+  observe(cache, [live(100, 10, T0)], T0, {})
   const view = parseAccounts(accountList({ claudeActive: 'c1', claudeUsage: { session: 10, weekly: 10 } }))
   const now = T0 + 10 * 60_000
   const resolved = (at: number) =>
@@ -114,22 +114,6 @@ test('the selector skips a remembered over-threshold seat, and takes it once its
   assert.equal(pickNext(chain, 'claude:c1', {}, cfg, now)?.key, 'claude:c3')
   const later = T0 + 2 * HOUR
   assert.equal(pickNext(buildChain(resolved(later), 'claude', cfg), 'claude:c1', {}, cfg, later)?.key, 'claude:c2')
-})
-
-test('the status bar marks remembered numbers with ~ and gives their age in the tooltip', () => {
-  const s = statusText({
-    paused: false,
-    updatedAt: 0,
-    services: { claude: true, codex: true, antigravity: true, opencode: true, devin: true },
-    waiting: [],
-    history: [],
-    seats: [
-      { key: 'claude:a', provider: 'claude', accountId: 'a', label: 'a', active: false, usage: { known: false } },
-      { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'b', active: true, usage: { known: true, source: 'cached', asOf: T0, session: { usedPercent: 40, resetsAt: null }, weekly: { usedPercent: 20, resetsAt: null } } }
-    ]
-  } as never)
-  assert.equal(s.text, 'Claude 2/2 · ~40%·20%')
-  assert.match(s.tooltip, /last reading/)
 })
 
 test('the tick follows the read period, between 15 and 30 s', () => {
@@ -170,7 +154,7 @@ async function mountWith(cli: Cli, storage: Record<string, never> = {}, now = ()
   const host = mockHost({ storage, results: { 'statusBar.update': { ok: true }, 'notifications.show': { delivered: true } } })
   let rotator!: Rotator
   const worker = await mountWorker(
-    { default: async (orca: OrcaWorkerApi) => void (rotator = await activateWith(orca, { cli, now, sleep: async () => undefined }, { tick: false })) },
+    { default: async (orca: OrcaWorkerApi) => void (rotator = await activateWith(likeOrca(orca), { cli, now, sleep: async () => undefined }, { tick: false })) },
     { host }
   )
   return { host, worker, rotator: () => rotator }

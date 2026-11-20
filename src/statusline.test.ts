@@ -12,14 +12,20 @@ import {
   STATUSLINE_COMMAND,
   displayLabels,
   installIntoSettings,
+  needsUpgrade,
   renderStatusFile,
   uninstallFromSettings
 } from './statusline'
 import { ConsoleStatusLine, memoryFiles, nodeFiles } from './statusline-files'
 import type { Snapshot } from './types'
+import { likeOrca } from './fixtures'
 import { activateWith } from './worker'
 
 const NOW = 1_800_000_000_000
+/** How long the limited account's cooldown lasts: 80 minutes and half a minute, so the wrapper
+ *  script (which takes the time from the shell's own clock, a moment later) still reads "1h20m"
+ *  when a run is slow. */
+const COOL_MS = 80 * 60_000 + 30_000
 const seat = (
   provider: 'claude' | 'codex',
   accountId: string,
@@ -39,7 +45,7 @@ const snapshot = (now = NOW): Snapshot => ({
   updatedAt: now,
   seats: [
     seat('claude', 'aaa', 'me@example.com', { active: true, usage: { known: true, session: { usedPercent: 42.4, resetsAt: null }, weekly: { usedPercent: 18, resetsAt: null }, model: { name: 'fable', usedPercent: 94, resetsAt: null } } }),
-    seat('claude', 'bbb', 'other@example.com', { cooldownUntil: now + 80 * 60_000, cooldownReason: 'rate_limit', usage: { known: true, session: { usedPercent: 100, resetsAt: null }, weekly: { usedPercent: 60, resetsAt: null } } }),
+    seat('claude', 'bbb', 'other@example.com', { cooldownUntil: now + COOL_MS, cooldownReason: 'rate_limit', usage: { known: true, session: { usedPercent: 100, resetsAt: null }, weekly: { usedPercent: 60, resetsAt: null } } }),
     seat('claude', 'system', 'system (third@example.com)', { usage: { known: false } }),
     seat('codex', 'x1', 'team@example.com', { active: true })
   ],
@@ -58,7 +64,7 @@ test('status file: one seat row per account, short labels, cooldowns as epoch se
   // order: the account in use, usable standbys, then the limited and drained ones.
   assert.equal(rows[4], `seat\tclaude\taaa\tme\t1\t42\t18\t0\t94\tfable`)
   assert.equal(rows[5], `seat\tclaude\tsystem\tsystem (third)\t0\t-\t-\t0\t-\t-`)
-  assert.equal(rows[6], `seat\tclaude\tbbb\tother\t0\t100\t60\t${Math.ceil((NOW + 80 * 60_000) / 1000)}\t-\t-`)
+  assert.equal(rows[6], `seat\tclaude\tbbb\tother\t0\t100\t60\t${Math.ceil((NOW + COOL_MS) / 1000)}\t-\t-`)
   assert.equal(rows[7], `seat\tcodex\tx1\tteam\t1\t42\t18\t0\t-\t-`)
   assert.ok(renderStatusFile(snapshot(), '', NOW).includes('format\t\nwidth'), 'no header by default')
   assert.ok(renderStatusFile(snapshot(), '', NOW, 12).includes('width\t12'))
@@ -110,7 +116,7 @@ test('settings.local.json: install keeps an earlier statusLine aside, uninstall 
   const fresh = installIntoSettings(null)
   assert.equal(fresh.replaced, false)
   const parsed = JSON.parse(fresh.text)
-  assert.deepEqual(parsed.statusLine, { type: 'command', command: STATUSLINE_COMMAND, padding: 0 })
+  assert.deepEqual(parsed.statusLine, { type: 'command', command: STATUSLINE_COMMAND, padding: 0, refreshInterval: 10 })
 
   const theirs = JSON.stringify({ permissions: { allow: ['Bash(ls)'] }, statusLine: { type: 'command', command: 'my-line' } })
   const merged = installIntoSettings(theirs)
@@ -131,10 +137,22 @@ test('settings.local.json: install keeps an earlier statusLine aside, uninstall 
   assert.throws(() => installIntoSettings('[]'))
 })
 
+test('settings.local.json: a wrapper installed without a refresh interval is upgraded, others are left alone', () => {
+  const old = JSON.stringify({ statusLine: { type: 'command', command: STATUSLINE_COMMAND, padding: 0 } })
+  assert.equal(needsUpgrade(old), true)
+  assert.equal(needsUpgrade(installIntoSettings(old).text), false)
+  assert.equal(JSON.parse(installIntoSettings(old).text).statusLine.refreshInterval, 10)
+  assert.equal(needsUpgrade(JSON.stringify({ statusLine: { type: 'command', command: 'my-line' } })), false)
+  // One that has the interval is left as it is, whatever else was changed in it since.
+  assert.equal(needsUpgrade(JSON.stringify({ statusLine: { type: 'command', command: STATUSLINE_COMMAND, padding: 2, refreshInterval: 30 } })), false)
+  assert.equal(needsUpgrade(null), false)
+  assert.equal(needsUpgrade('{ not json'), false)
+})
+
 type Run = { stdout: string; stderr: string; code: number }
-function sh(script: string, stdin: string, env: Record<string, string>, cwd?: string): Promise<Run> {
+function sh(script: string, stdin: string, env: Record<string, string>, cwd?: string, shell = '/bin/sh'): Promise<Run> {
   return new Promise((resolve) => {
-    const child = execFile('/bin/sh', [script], { env, timeout: 5000, maxBuffer: 1 << 20, ...(cwd ? { cwd } : {}) }, (error, stdout, stderr) =>
+    const child = execFile(shell, [script], { env, timeout: 5000, maxBuffer: 1 << 20, ...(cwd ? { cwd } : {}) }, (error, stdout, stderr) =>
       resolve({ stdout, stderr, code: error ? Number((error as { code?: number }).code ?? 1) : 0 })
     ) as { stdin: { end(text: string): void } }
     child.stdin.end(stdin)
@@ -153,6 +171,19 @@ function fakeHome(): { home: string; hookOut: string; cleanup(): void } {
   writeFileSync(join(home, '.orca/agent-hooks/claude-statusline.sh'), `#!/bin/sh\ncat > "${hookOut}"\n`)
   chmodSync(join(home, '.orca/agent-hooks/claude-statusline.sh'), 0o755)
   return { home, hookOut, cleanup: () => rmSync(home, { recursive: true, force: true }) }
+}
+
+/** What Orca's own hook was given. It runs in the background after the script has answered, so
+ *  the file is looked at until it is whole (a few seconds at most), not once after a fixed wait. */
+async function hookGot(path: string): Promise<string> {
+  const { existsSync, readFileSync } = await import('node:fs')
+  let got = ''
+  for (let i = 0; i < 100; i++) {
+    got = existsSync(path) ? readFileSync(path, 'utf8') : ''
+    if (got === PAYLOAD) break
+    await new Promise((r) => setTimeout(r, 50))
+  }
+  return got
 }
 
 const nowSec = Math.floor(Date.now() / 1000)
@@ -178,18 +209,18 @@ test('wrapper script: a header and one gauge row per account of the service, thi
     assert.equal(run.code, 0, run.stderr)
     const lines = plain(run.stdout).split('\n')
     assert.deepEqual(lines, [
-      // No header by default. The next-launch account (aaa) keeps the file's numbers; the pane's
-      // own (bbb) shows the live 85 % / 20 % used as 14 % / 80 % left, and its cooldown. The model
+      // No header by default. Every row shows the file's numbers, as the panel does, the pane's
+      // own (bbb) too: not its payload's 85 % / 20 % used; and its cooldown. The model
       // column is headed by the window's name from Orca (fable), `model` where unknown. Rows are
       // in the panel's order: the account in use, standbys, then the limited one last.
       `· ${pad('me', 14)}  5h █████░░░  58%  7d ███████░  82%  fable █░░░░░░░   6%`,
       `· ${pad('system (third)', 14)}  5h ········  n/a  7d ········  n/a  model ········  n/a`,
-      `▶ ${pad('other', 14)}  5h █░░░░░░░  14%  7d ██████░░  80%  model ········  n/a  ⏸1h20m`,
+      `▶ ${pad('other', 14)}  5h ░░░░░░░░   0%  7d ███░░░░░  40%  model ········  n/a  ⏸1h20m`,
       ''
     ])
     assert.ok(!run.stdout.includes('team'), 'codex seats are not shown in a Claude pane')
-    // Colors: 15 % left is red, 82 % green, 0 would be bold red; the pane label is bold.
-    assert.ok(run.stdout.includes('\u001b[31m█\u001b[0m\u001b[2m░░░░░░░\u001b[0m \u001b[31m 14%\u001b[0m'))
+    // Colors: 40 % left is yellow, 82 % green, 0 is bold red; the pane label is bold.
+    assert.ok(run.stdout.includes('\u001b[33m███\u001b[0m\u001b[2m░░░░░\u001b[0m \u001b[33m 40%\u001b[0m'))
     assert.ok(run.stdout.includes('\u001b[32m███████\u001b[0m\u001b[2m░\u001b[0m \u001b[32m 82%\u001b[0m'))
     assert.ok(run.stdout.includes(`\u001b[1m${pad('other', 14)}\u001b[0m`))
     assert.ok(run.stdout.includes('\u001b[2m·\u001b[0m me '), 'other accounts get a dim dot')
@@ -198,9 +229,7 @@ test('wrapper script: a header and one gauge row per account of the service, thi
     assert.ok(lines.filter(Boolean).every((l) => !l.startsWith(' ')), 'no row starts with a space')
 
     // Orca's hook got the payload unchanged (it runs in the background; give it a moment).
-    await new Promise((r) => setTimeout(r, 300))
-    const { readFileSync } = await import('node:fs')
-    assert.equal(readFileSync(fx.hookOut, 'utf8'), PAYLOAD)
+    assert.equal(await hookGot(fx.hookOut), PAYLOAD)
 
     // A header when the format is set, paused; pane on the system login; 0 % left is bold red; a
     // longer model name widens that column for every row.
@@ -213,10 +242,10 @@ test('wrapper script: a header and one gauge row per account of the service, thi
     writeFileSync(join(fx.home, '.orca/account-rotator/status.tsv'), renderStatusFile(paused, '{model}', Date.now()))
     const sys = await sh(script, PAYLOAD, { HOME: fx.home, PATH: env.PATH })
     assert.deepEqual(plain(sys.stdout).split('\n'), [
-      'Opus 4.1 │ ⏸ switching paused',
+      'Opus 4.1 │ ⏸ automatic hand-off paused',
       `· ${pad('me@example.com', 15)}  5h █████░░░  58%  7d ███████░  82%  mythos █░░░░░░░   6%`,
       `· ${pad('me@other.org', 15)}  5h ░░░░░░░░   0%  7d ███░░░░░  40%  model  ········  n/a  ⏸1h20m`,
-      '▶ system (averyv…  5h █░░░░░░░  14%  7d ██████░░  80%  model  ········  n/a',
+      '▶ system (averyv…  5h ░░░░░░░░   0%  7d ░░░░░░░░   0%  model  ········  n/a',
       ''
     ])
     assert.ok(sys.stdout.includes('\u001b[1;31m\u001b[0m\u001b[2m░░░░░░░░\u001b[0m \u001b[1;31m  0%\u001b[0m'))
@@ -225,7 +254,7 @@ test('wrapper script: a header and one gauge row per account of the service, thi
     rmSync(join(fx.home, '.orca/account-rotator/status.tsv'))
     const bare = await sh(script, PAYLOAD, env)
     assert.deepEqual(plain(bare.stdout).split('\n'), [
-      `▶ ${pad('this pane', 9)}  5h █░░░░░░░  14%  7d ██████░░  80%  model ········  n/a  no rotator status yet`,
+      `▶ ${pad('this session', 12)}  5h █░░░░░░░  14%  7d ██████░░  80%  model ········  n/a  no Auto Hand-off status yet`,
       ''
     ])
 
@@ -254,7 +283,7 @@ test('wrapper script: without jq the sed fallback reads the same fields', async 
     const run = await sh(script, withoutCtxPercent, { HOME: fx.home, PATH: bin, CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/aaa/home` })
     assert.equal(run.code, 0, run.stderr)
     assert.equal(plain(run.stdout).split('\n')[0], 'Opus 4.1|60|14|80|fable', run.stderr)
-    assert.equal(plain(run.stdout).split('\n')[1], `▶ ${pad('me', 14)}  5h █░░░░░░░  14%  7d ██████░░  80%  fable █░░░░░░░   6%`)
+    assert.equal(plain(run.stdout).split('\n')[1], `▶ ${pad('me', 14)}  5h █████░░░  58%  7d ███████░  82%  fable █░░░░░░░   6%`)
   } finally {
     fx.cleanup()
   }
@@ -313,7 +342,7 @@ test('wrapper script: no live file for an unknown config dir, a background job, 
     const quiet = async (payload: string, env: Record<string, string>, why: string) => {
       const run = await sh(script, payload, { ...base, ...env })
       assert.equal(run.code, 0, run.stderr)
-      assert.ok(plain(run.stdout).startsWith('▶ this pane'), `${why}: the line still prints`)
+      assert.ok(plain(run.stdout).startsWith('▶ this session'), `${why}: the line still prints`)
       assert.equal(existsSync(live), false, why)
     }
     await quiet(PAYLOAD, { CLAUDE_CONFIG_DIR: '/somewhere/else/.claude' }, 'a config dir that is no Orca profile')
@@ -481,12 +510,11 @@ test('wrapper script: a live dir that cannot be written still prints the line an
     assert.equal(run.code, 0, run.stderr)
     assert.equal(run.stderr, '')
     assert.deepEqual(plain(run.stdout).split('\n'), [
-      `▶ ${pad('this pane', 9)}  5h █░░░░░░░  14%  7d ██████░░  80%  model ········  n/a  no rotator status yet`,
+      `▶ ${pad('this session', 12)}  5h █░░░░░░░  14%  7d ██████░░  80%  model ········  n/a  no Auto Hand-off status yet`,
       ''
     ])
     assert.equal(readFileSync(join(fx.home, '.orca/account-rotator/live'), 'utf8'), 'in the way\n')
-    await new Promise((r) => setTimeout(r, 300))
-    assert.equal(readFileSync(fx.hookOut, 'utf8'), PAYLOAD)
+    assert.equal(await hookGot(fx.hookOut), PAYLOAD)
 
     // A read-only directory (skipped for root, who can write anywhere).
     rmSync(join(fx.home, '.orca/account-rotator/live'))
@@ -495,7 +523,7 @@ test('wrapper script: a live dir that cannot be written still prints the line an
     const locked = await sh(script, PAYLOAD, env)
     assert.equal(locked.code, 0, locked.stderr)
     assert.equal(locked.stderr, '')
-    assert.ok(plain(locked.stdout).startsWith('▶ this pane'))
+    assert.ok(plain(locked.stdout).startsWith('▶ this session'))
     if (process.env.USER !== 'root') assert.equal(existsSync(liveFile(fx.home, 'bbb')), false)
     chmodSync(join(fx.home, '.orca/account-rotator/live'), 0o755)
   } finally {
@@ -529,9 +557,10 @@ test('wrapper script: unchanged numbers are rewritten at most once a minute, cha
     const changed = await stampAfter(`1\t${t - 5}\t84\t${FIVE_RESET}\t19.9\t${WEEK_RESET}\n`)
     assert.ok(Number(changed.split('\t')[1]) >= t && changed.endsWith(`\t${same}\n`), changed)
     // A stamp from the future, another version, or junk never blocks a write.
+    // (The new stamp is the time of the run: well before the future one, however slow the machine.)
     for (const odd of [`1\t${t + 500}\t${same}\n`, `2\t${t - 5}\t${same}\n`, 'junk\n', '']) {
       const fixed = await stampAfter(odd)
-      assert.ok(fixed.startsWith('1\t') && Number(fixed.split('\t')[1]) >= t && Number(fixed.split('\t')[1]) <= t + 5 && fixed.endsWith(`\t${same}\n`), JSON.stringify([odd, fixed]))
+      assert.ok(fixed.startsWith('1\t') && Number(fixed.split('\t')[1]) >= t && Number(fixed.split('\t')[1]) < t + 300 && fixed.endsWith(`\t${same}\n`), JSON.stringify([odd, fixed]))
     }
     // Two runs in a row: the second leaves the first's file as it is.
     const first = await stampAfter('')
@@ -556,8 +585,7 @@ test('worker: install and uninstall edit the focused workspace, the status file 
   })
   const mod = {
     default: async (orca: OrcaWorkerApi) => {
-      await activateWith(
-        orca,
+      await activateWith(likeOrca(orca),
         {
           cli: {
             listAccounts: async () => ({ claude: { accounts: [{ id: 'aaa', email: 'me@example.com' }, { id: 'bbb', email: 'other@example.com' }], activeAccountId: 'aaa' }, rateLimits: {} }),
@@ -642,8 +670,7 @@ test('worker: when the focused workspace changes, the panel is told the status l
   })
   const mod = {
     default: async (orca: OrcaWorkerApi) => {
-      await activateWith(
-        orca,
+      await activateWith(likeOrca(orca),
         {
           cli: { listAccounts: async () => ({ claude: { accounts: [{ id: 'aaa', email: 'me@example.com' }], activeAccountId: 'aaa' }, rateLimits: {} }), select: async () => undefined, closeTerminal: async () => undefined, sendText: async () => undefined, git: async () => '', draft: async () => '' },
           now: () => NOW,
@@ -692,8 +719,7 @@ test('worker: the console status line is not installed for a workspace on anothe
     })
     const mod = {
       default: async (orca: OrcaWorkerApi) => {
-        await activateWith(
-          orca,
+        await activateWith(likeOrca(orca),
           {
             cli: { listAccounts: async () => ({ claude: { accounts: [{ id: 'aaa', email: 'me@example.com' }], activeAccountId: 'aaa' }, rateLimits: {} }), select: async () => undefined, closeTerminal: async () => undefined, sendText: async () => undefined, git: async () => '', draft: async () => '' },
             now: () => NOW,
@@ -786,5 +812,69 @@ test('private files: the wrapper script writes a live file as 0600 and makes its
     assert.equal(modeOf(join(fx.home, '.orca/account-rotator/live')), 0o700)
   } finally {
     fx.cleanup()
+  }
+})
+
+test('wrapper script: quotes, backslashes, $( ), backticks, % and escape sequences in a name, the header or the model are printed as text and never run, in sh and in dash', async () => {
+  const { existsSync } = await fs()
+  // A home folder with a space and a quote in its name, as the settings command quotes it.
+  const base = mkdtempSync(join(tmpdir(), "rotator's home "))
+  const home = join(base, 'ho me')
+  mkdirSync(join(home, '.orca/account-rotator'), { recursive: true })
+  const script = join(home, '.orca/account-rotator/claude-statusline.sh')
+  writeFileSync(script, SCRIPT, { mode: 0o755 })
+  const marker = join(base, 'ran')
+  try {
+    const nasty = [
+      `$(touch '${marker}')`,
+      `\`touch '${marker}'\``,
+      `'; touch '${marker}'; '`,
+      `"; touch '${marker}'; "`,
+      `a\\b\\n\\c %s %d %n \\033[31m`,
+      `x[$(touch '${marker}')]`,
+      '-n -e --',
+      '*',
+      '{model}{best}{5h}'
+    ]
+    const shells = ['/bin/sh', ...(existsSync('/bin/dash') ? ['/bin/dash'] : [])]
+    for (const text of nasty) {
+      const snap = snapshot(Date.now())
+      // Both accounts carry it (two different names, so neither is shortened to nothing).
+      snap.seats[0]!.label = `${text}@a.example.com`
+      snap.seats[1]!.label = `z${text}`
+      snap.seats[0]!.usage.model = { name: text, usedPercent: 10, resetsAt: null }
+      // As the worker writes it, with an escape sequence and a line break in the name too: they are taken out.
+      snap.seats[2]!.label = `sys\u001b[2J\u001b]0;title\u0007\ntem`
+      const status = renderStatusFile(snap, `${text} {model} {best}`, Date.now())
+      assert.equal(/[\u0000-\u0008\u000b-\u001f\u007f]/.test(status), false, 'no control character but tab and line break in the file')
+      assert.equal(status.split('\n').filter((l) => l.startsWith('seat\t')).length, 4)
+      writeFileSync(join(home, '.orca/account-rotator/status.tsv'), status)
+      const payload = JSON.stringify({ model: { display_name: text }, rate_limits: { five_hour: { used_percentage: 10, resets_at: nowSec + 60 } } })
+      for (const shell of shells) {
+        const env = { HOME: home, PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CONFIG_DIR: `${home}/claude-profiles/aaa/home` }
+        const run = await sh(script, payload, env, undefined, shell)
+        const what = `${shell} ${JSON.stringify(text)}`
+        assert.equal(run.code, 0, `${what}: ${run.stderr}`)
+        assert.equal(run.stderr, '', what)
+        assert.equal(existsSync(marker), false, `${what} ran a command`)
+        const lines = plain(run.stdout).split('\n')
+        // The header is the text as it is, with the model put in once (a name that holds a placeholder is not expanded again).
+        assert.ok(lines[0]!.startsWith(`${text} ${text} `) || text.includes('{'), `${what}: ${lines[0]}`)
+        // One row per Claude account, none of them empty, the pane's own marked.
+        assert.equal(lines.filter((l) => l.startsWith('▶ ') || l.startsWith('· ')).length, 3, `${what}: ${run.stdout}`)
+        assert.equal(lines.filter((l) => l.startsWith('▶ ')).length, 1, what)
+        assert.ok(lines.some((l) => l.includes('sys') && !/\u001b\]/.test(l)), what)
+      }
+      // A file anyone may have left: the same text in every cell of a row, raw.
+      writeFileSync(join(home, '.orca/account-rotator/status.tsv'), `format\t${text}\nwidth\t${text}\npaused\t${text}\n${text}\t${text}\n${['seat', 'claude', text, text, text, text, text, text, text, text].join('\t')}\n`)
+      for (const shell of shells) {
+        const run = await sh(script, payload, { HOME: home, PATH: process.env.PATH ?? '/usr/bin:/bin' }, undefined, shell)
+        assert.equal(run.code, 0, `${shell} raw ${JSON.stringify(text)}: ${run.stderr}`)
+        assert.equal(run.stderr, '', `${shell} raw ${JSON.stringify(text)}`)
+        assert.equal(existsSync(marker), false, `${shell} raw ${JSON.stringify(text)} ran a command`)
+      }
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true })
   }
 })

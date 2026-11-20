@@ -4,7 +4,7 @@ import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { parseAccounts } from './accounts'
 import type { Cli, Rotator } from './engine'
-import { accountList } from './fixtures'
+import { accountList, likeOrca } from './fixtures'
 import { LIVE_KEY, liveFileName, liveKeyOfHome, parseLive } from './live-usage'
 import { memoryFiles } from './statusline-files'
 import type { Seat } from './types'
@@ -258,7 +258,7 @@ async function mount(options: { result: () => Record<string, any>; settings?: Re
   const worker = await mountWorker(
     {
       default: async (orca: OrcaWorkerApi) =>
-        void (rotator = await activateWith(orca, { cli: cliFor(options.result, calls), now: options.now ?? (() => T0), sleep: async () => undefined }, { tick: false, files }))
+        void (rotator = await activateWith(likeOrca(orca), { cli: cliFor(options.result, calls), now: options.now ?? (() => T0), sleep: async () => undefined }, { tick: false, files }))
     },
     { host }
   )

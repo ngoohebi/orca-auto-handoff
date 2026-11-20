@@ -54,11 +54,19 @@ function usageFrom(rl: unknown, row?: Json): SeatUsage {
 
 function inactiveUsage(list: unknown, accountId: string): SeatUsage {
   if (!Array.isArray(list)) return { known: false, source: 'unknown', reason: 'not-reported' }
-  const row = list.find((r: Json) => r?.accountId === accountId)
+  const row = list.find((r: Json) => r && typeof r === 'object' && r.accountId === accountId)
   return row ? usageFrom(row.rateLimits, row) : { known: false, source: 'unknown', reason: 'not-reported' }
 }
 
 const lower = (s: unknown) => (typeof s === 'string' ? s.toLowerCase() : undefined)
+/** A name to show, when it is one: text, not empty. */
+const name = (s: unknown) => (typeof s === 'string' && s.trim() ? s : undefined)
+/** A block of the answer, when it is one (`{}` otherwise, which lists no accounts). */
+const block_ = (v: unknown): Json => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Json) : {})
+/** The accounts of a block that can be named and selected: rows with an id. Anything else (a
+ *  broken row) is left out rather than become an account nobody can switch to. */
+const rows = (v: unknown): Json[] => (Array.isArray(v) ? v.filter((a) => a && typeof a === 'object' && typeof a.id === 'string' && a.id !== '') : [])
+const idOf = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null)
 
 export type AccountView = {
   seats: Seat[]
@@ -67,15 +75,20 @@ export type AccountView = {
 }
 
 export function parseAccounts(result: Json): AccountView {
+  // An answer that names no service at all (empty, or not what `orca account list` gives) is no
+  // answer: it must not pass for "there are no accounts", which would forget every account's
+  // history and leave waiting sessions with nowhere to go. The caller keeps what it last read.
+  const answered = !!result && typeof result === 'object' && !Array.isArray(result) && (['claude', 'codex', 'antigravity', 'opencode', 'devin'] as const).some((p) => result[p] && typeof result[p] === 'object')
+  if (!answered) throw new Error('the answer lists no service')
   const seats: Seat[] = []
   const active: Partial<Record<Provider, string>> = {}
-  const rl: Json = result?.rateLimits ?? {}
+  const rl: Json = block_(result.rateLimits)
 
   // Claude and Codex: managed accounts plus the provider's own (system) login.
   for (const provider of ['claude', 'codex'] as const) {
-    const block: Json = result?.[provider] ?? {}
-    const accounts: Json[] = Array.isArray(block.accounts) ? block.accounts : []
-    const activeId: string | null = block.activeAccountId ?? null
+    const block: Json = block_(result[provider])
+    const accounts: Json[] = rows(block.accounts)
+    const activeId: string | null = idOf(block.activeAccountId)
     const inactive = provider === 'claude' ? rl.inactiveClaudeAccounts : rl.inactiveCodexAccounts
     const systemEmail = lower(provider === 'claude' ? block.systemDefaultEmail : block.systemDefault?.email)
     const hasSystem = provider === 'claude' ? !!block.systemDefaultHome : !!block.systemDefault?.hasAuth
@@ -86,7 +99,7 @@ export function parseAccounts(result: Json): AccountView {
         key: `${provider}:${a.id}`,
         provider,
         accountId: a.id,
-        label: a.email ?? a.workspaceLabel ?? a.id,
+        label: name(a.email) ?? name(a.workspaceLabel) ?? a.id,
         active: isActive,
         usage: isActive ? usageFrom(rl[provider]) : inactiveUsage(inactive, a.id)
       }
@@ -131,16 +144,16 @@ export function parseAccounts(result: Json): AccountView {
   // Antigravity: managed accounts, plus the host's own login when no managed account is selected.
   // Orca reports that login as `currentAccount` (often without an email) and polls its usage.
   {
-    const block: Json = result?.antigravity ?? {}
-    const accounts: Json[] = Array.isArray(block.accounts) ? block.accounts : []
-    const activeId: string | null = block.selectedAccountId ?? block.activeAccountId ?? null
+    const block: Json = block_(result.antigravity)
+    const accounts: Json[] = rows(block.accounts)
+    const activeId: string | null = idOf(block.selectedAccountId) ?? idOf(block.activeAccountId)
     for (const a of accounts) {
       const isActive = activeId === a.id
       seats.push({
         key: `antigravity:${a.id}`,
         provider: 'antigravity',
         accountId: a.id,
-        label: a.email ?? a.label ?? a.id,
+        label: name(a.email) ?? name(a.label) ?? a.id,
         active: isActive,
         usage: isActive ? usageFrom(rl.antigravity) : { known: false, source: 'unknown', reason: 'not-reported' }
       })
@@ -165,16 +178,16 @@ export function parseAccounts(result: Json): AccountView {
 
   // OpenCode and Devin: profiles, no usage numbers (reactive only).
   for (const provider of ['opencode', 'devin'] as const) {
-    const block: Json = result?.[provider] ?? {}
-    const accounts: Json[] = Array.isArray(block.accounts) ? block.accounts : []
+    const block: Json = block_(result[provider])
+    const accounts: Json[] = rows(block.accounts)
     if (accounts.length === 0) continue
-    const activeId: string | null = block.activeAccountId ?? null
+    const activeId: string | null = idOf(block.activeAccountId)
     for (const a of accounts) {
       seats.push({
         key: `${provider}:${a.id}`,
         provider,
         accountId: a.id,
-        label: a.label ?? a.email ?? a.id,
+        label: name(a.label) ?? name(a.email) ?? a.id,
         active: activeId === a.id,
         usage: { known: false, source: 'unknown', reason: 'no-usage-api' }
       })

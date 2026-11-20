@@ -1,7 +1,7 @@
 // Account labels as the panel and the console status line show them: when every account of a
 // service shares one email domain the domain is dropped (`me`, `system (third)`); otherwise the
 // labels stay whole.
-import type { Provider, Seat, Snapshot, SwapReason } from './types'
+import type { Held, Provider, Seat, Snapshot, SwapReason, SwapResult } from './types'
 
 type SeatRow = Snapshot['seats'][number]
 
@@ -12,6 +12,67 @@ export const PROVIDER_NAME: Record<Provider, string> = {
   antigravity: 'Antigravity',
   opencode: 'OpenCode',
   devin: 'Devin'
+}
+
+/** Why nothing is handed off automatically although no service was turned off (`Config.held`), as
+ *  the panel's callout says it. Both end by themselves: the worker asks Orca again at every tick
+ *  and settings change. */
+export const HELD_WORDS: Record<Held, { title: string; body: string }> = {
+  settings: {
+    title: "Auto Hand-off is waiting for Orca's settings",
+    body: 'Orca could not be asked for your settings yet, so nothing is handed off or resumed automatically. It tries again by itself. Hand off to this account still works.'
+  },
+  upgrade: {
+    title: 'Auto Hand-off is finishing the upgrade',
+    body: 'Your settings from the earlier version are not carried over yet, so nothing is handed off or resumed automatically. It tries again by itself. Hand off to this account still works.'
+  }
+}
+
+/** Why a History entry happened, in the words the panel shows (not the stored code). */
+export const REASON_WORDS: Record<SwapReason | 'api_error', string> = {
+  rate_limit: 'Limit reached',
+  threshold: 'Running low',
+  switch_back: 'Back to preferred',
+  model_cap: 'Model limit',
+  expiring: 'Expiring quota',
+  idle: 'Idle',
+  manual: 'By hand',
+  reset: 'Account free again',
+  api_error: 'API error',
+  auth: 'Sign-in needed'
+}
+
+/** What came of it, as the panel's History badge says it. */
+export const RESULT_WORDS: Record<SwapResult, string> = {
+  resumed: 'resumed',
+  handoff: 'new session',
+  selected: 'new sessions only',
+  waiting: 'waiting',
+  failed: 'failed',
+  model: 'model changed',
+  retried: 'retried',
+  closed: 'closed'
+}
+
+/** The History badge of one entry. A waiting session that went on in the pane it was in, once its
+ *  own account had room again, was not "retried" (that is an API error's word): it stayed. */
+export function resultWords(entry: { reason: string; result: SwapResult }): string {
+  if (entry.reason === 'reset' && entry.result === 'retried') return 'same account'
+  return RESULT_WORDS[entry.result] ?? entry.result
+}
+
+/** A time in the words of a clock, local time: `3:00 pm` today, `Thu 3:00 pm` within the week
+ *  ahead or behind, else `Nov 27, 3:00 pm`. */
+export function clockWords(at: number, now: number): string {
+  const d = new Date(at)
+  const h = d.getHours()
+  const time = `${h % 12 === 0 ? 12 : h % 12}:${String(d.getMinutes()).padStart(2, '0')} ${h < 12 ? 'am' : 'pm'}`
+  const n = new Date(now)
+  if (d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate()) return time
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+  if (Math.abs(at - now) < 6 * 86_400_000) return `${days[d.getDay()]} ${time}`
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  return `${months[d.getMonth()]} ${d.getDate()}, ${time}`
 }
 
 /** The email in a label: `me@x.y` or `system (me@x.y)`. */
@@ -92,7 +153,7 @@ export function whyMove(
   options: { selectionOnly?: boolean; model?: string } = {}
 ): string {
   const level = (seat: Named | undefined) => (levelWords(seat) ? ` (${levelWords(seat)})` : '')
-  const arrived = `${options.selectionOnly ? 'new launches use' : 'moved to'} ${to.label}${level(to)}`
+  const arrived = `${options.selectionOnly ? 'new sessions start on' : 'handed off to'} ${to.label}${level(to)}`
   const source = from?.label ?? 'another account'
   switch (reason) {
     case 'rate_limit':
@@ -102,15 +163,15 @@ export function whyMove(
     case 'auth':
       return `${source} needs sign-in; ${arrived}`
     case 'threshold':
-      return `${source} is over its usage threshold${level(from)}; ${arrived}`
+      return `${source} is running low${level(from)}; ${arrived}`
     case 'idle':
-      return `idle session on ${source}, which is over its usage threshold${level(from)}; ${arrived}`
+      return `idle session on ${source}, which is running low${level(from)}; ${arrived}`
     case 'switch_back':
-      return `${to.label} is available again${level(to)}; ${options.selectionOnly ? 'new launches use it' : `moved back from ${source}`}`
+      return `${to.label} is available again${level(to)}; ${options.selectionOnly ? 'new sessions start on it' : `handed off from ${source}`}`
     case 'reset':
-      return `a limit has reset; ${options.selectionOnly ? `new launches use ${to.label}` : `resumed on ${to.label}`}${level(to)}`
+      return `a limit has reset; ${options.selectionOnly ? `new sessions start on ${to.label}` : `resumed on ${to.label}`}${level(to)}`
     case 'expiring':
-      return `${to.label} has weekly quota that would expire unused${level(to)}; ${options.selectionOnly ? 'new launches use it' : `moved there from ${source}`}`
+      return `${to.label} has weekly quota that would expire unused${level(to)}; ${options.selectionOnly ? 'new sessions start on it' : `handed off there from ${source}`}`
     case 'manual':
       return `chosen by hand; ${arrived}`
   }

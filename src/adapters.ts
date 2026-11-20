@@ -1,5 +1,5 @@
 // Per-provider readers of an agent terminal's tail: rate limit, model cap, API error or auth.
-// Patterns are deliberately specific (cux / codex-auto lesson): only genuine limit banners in the
+// Patterns are deliberately specific (codex-auto lesson): only genuine limit banners in the
 // last few lines count, never a conversation that merely mentions "rate limit".
 import type { Provider, Signal, SignalKind } from './types'
 

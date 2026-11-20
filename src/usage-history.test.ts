@@ -2,8 +2,8 @@
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
 import type { Cli, Rotator } from './engine'
-import { accountList } from './fixtures'
-import { levelWords, runwayWords, whyMove } from './labels'
+import { accountList, likeOrca } from './fixtures'
+import { clockWords, levelWords, runwayWords, whyMove } from './labels'
 import { memoryFiles } from './statusline-files'
 import type { RotatorState, Seat } from './types'
 import {
@@ -235,16 +235,16 @@ test('wording: the runway, an account\'s level, and the reason for a move', () =
   const blank = { label: 'spare', usage: { known: false } }
   assert.equal(levelWords(work), 'used 97 % of 5h, 40 % of the week')
   assert.equal(levelWords(blank), '')
-  assert.equal(whyMove('threshold', work, personal), 'work is over its usage threshold (used 97 % of 5h, 40 % of the week); moved to personal (used 12 % of 5h)')
-  assert.equal(whyMove('rate_limit', work, blank), 'work hit a usage limit; moved to spare')
-  assert.equal(whyMove('rate_limit', undefined, personal), 'another account hit a usage limit; moved to personal (used 12 % of 5h)')
-  assert.equal(whyMove('model_cap', work, personal, { model: 'fable' }), 'work hit its fable limit; moved to personal (used 12 % of 5h)')
-  assert.equal(whyMove('idle', work, personal), 'idle session on work, which is over its usage threshold (used 97 % of 5h, 40 % of the week); moved to personal (used 12 % of 5h)')
-  assert.equal(whyMove('switch_back', personal, work), 'work is available again (used 97 % of 5h, 40 % of the week); moved back from personal')
-  assert.equal(whyMove('switch_back', personal, blank, { selectionOnly: true }), 'spare is available again; new launches use it')
+  assert.equal(whyMove('threshold', work, personal), 'work is running low (used 97 % of 5h, 40 % of the week); handed off to personal (used 12 % of 5h)')
+  assert.equal(whyMove('rate_limit', work, blank), 'work hit a usage limit; handed off to spare')
+  assert.equal(whyMove('rate_limit', undefined, personal), 'another account hit a usage limit; handed off to personal (used 12 % of 5h)')
+  assert.equal(whyMove('model_cap', work, personal, { model: 'fable' }), 'work hit its fable limit; handed off to personal (used 12 % of 5h)')
+  assert.equal(whyMove('idle', work, personal), 'idle session on work, which is running low (used 97 % of 5h, 40 % of the week); handed off to personal (used 12 % of 5h)')
+  assert.equal(whyMove('switch_back', personal, work), 'work is available again (used 97 % of 5h, 40 % of the week); handed off from personal')
+  assert.equal(whyMove('switch_back', personal, blank, { selectionOnly: true }), 'spare is available again; new sessions start on it')
   assert.equal(whyMove('reset', work, personal), 'a limit has reset; resumed on personal (used 12 % of 5h)')
-  assert.equal(whyMove('manual', work, personal, { selectionOnly: true }), 'chosen by hand; new launches use personal (used 12 % of 5h)')
-  assert.equal(whyMove('auth', work, personal, { selectionOnly: true }), 'work needs sign-in; new launches use personal (used 12 % of 5h)')
+  assert.equal(whyMove('manual', work, personal, { selectionOnly: true }), 'chosen by hand; new sessions start on personal (used 12 % of 5h)')
+  assert.equal(whyMove('auth', work, personal, { selectionOnly: true }), 'work needs sign-in; new sessions start on personal (used 12 % of 5h)')
 })
 
 // ---- through the worker -----------------------------------------------------------------------
@@ -276,7 +276,7 @@ async function mount(options: { usage: () => { session: number; weekly: number }
   const files = memoryFiles('/home/u')
   let rotator!: Rotator
   const worker = await mountWorker(
-    { default: async (orca: OrcaWorkerApi) => void (rotator = await activateWith(orca, { cli, now: options.now, sleep: async () => undefined }, { tick: false, files })) },
+    { default: async (orca: OrcaWorkerApi) => void (rotator = await activateWith(likeOrca(orca), { cli, now: options.now, sleep: async () => undefined }, { tick: false, files })) },
     { host }
   )
   return { calls, files, host, worker, rotator: () => rotator }
@@ -342,4 +342,12 @@ test('worker: the history survives a restart, is read while paused, and is fed b
   } finally {
     await second.worker.deactivate()
   }
+})
+
+test('clockWords: a time in local clock words, with the day when it is not today', () => {
+  const now = new Date(2026, 10, 19, 10, 0).getTime()
+  assert.equal(clockWords(new Date(2026, 10, 19, 15, 0).getTime(), now), '3:00 pm')
+  assert.equal(clockWords(new Date(2026, 10, 19, 0, 5).getTime(), now), '12:05 am')
+  assert.equal(clockWords(new Date(2026, 10, 20, 12, 30).getTime(), now), 'Fri 12:30 pm')
+  assert.equal(clockWords(new Date(2026, 11, 2, 9, 0).getTime(), now), 'Dec 2, 9:00 am')
 })

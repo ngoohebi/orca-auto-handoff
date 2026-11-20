@@ -15,7 +15,8 @@ import {
   installIntoSettings,
   renderStatusFile,
   uninstallFromSettings,
-  isInstalledIn
+  isInstalledIn,
+  needsUpgrade
 } from './statusline'
 import type { ConsoleLineState } from './protocol'
 import type { Snapshot } from './types'
@@ -125,6 +126,7 @@ export class ConsoleStatusLine {
   async format(): Promise<{ format: string; barWidth: number }> {
     const s = await this.ctx.settings()
     const format = typeof s.console_statusline_format === 'string' ? s.console_statusline_format.trim() : ''
+    // The bar width is no setting any more (0.3); a value an older version stored still counts.
     const barWidth = typeof s.console_statusline_bar_width === 'number' ? s.console_statusline_bar_width : DEFAULT_BAR_WIDTH
     return { format: format || DEFAULT_FORMAT, barWidth }
   }
@@ -166,7 +168,10 @@ export class ConsoleStatusLine {
     if (typeof target === 'string') return { installed: false, reason: target }
     let installed = false
     try {
-      installed = isInstalledIn(this.files.read(target.file))
+      const text = this.files.read(target.file)
+      installed = isInstalledIn(text)
+      // A wrapper installed by an earlier version gets the refresh interval.
+      if (installed && needsUpgrade(text)) this.files.write(target.file, installIntoSettings(text).text)
     } catch {
       installed = false
     }
@@ -190,7 +195,7 @@ export class ConsoleStatusLine {
     return (
       `Console status line installed for ${target.name} (.claude/settings.local.json)` +
       (result.replaced ? '; the previous statusLine is kept in the file and restored on uninstall' : '') +
-      '. Claude panes pick it up at their next status refresh or launch.'
+      '. Claude sessions pick it up at their next status refresh or start.'
     )
   }
 

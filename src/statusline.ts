@@ -21,11 +21,18 @@ export const LIVE_DIR = 'live'
 export const STATUSLINE_COMMAND = `/bin/sh "$HOME/${DATA_DIR}/${SCRIPT_NAME}"`
 /** The optional header line; empty = account rows only. */
 export const DEFAULT_FORMAT = ''
-export const HEADER_EXAMPLE = '{model} │ ctx {ctxbar} │ 5h reset {reset} │ best={best}'
+/** Seconds between Claude's re-runs of the status line besides its own events, so a pane that
+ *  sits idle still picks up the numbers the panel shows (Claude Code 2.1+; older ones ignore it). */
+export const REFRESH_SECONDS = 10
+/** The `statusLine` value the plugin installs. */
+export const WRAPPER_SETTING = { type: 'command', command: STATUSLINE_COMMAND, padding: 0, refreshInterval: REFRESH_SECONDS }
 /** Key under which an earlier `statusLine` is kept so uninstall can put it back. */
 const PREVIOUS_KEY = 'accountRotatorPreviousStatusLine'
 
-const clean = (s: string) => s.replace(/[\t\r\n]+/g, ' ').trim()
+/** One cell of the status file: no tab or line break (they would start another cell or row), and
+ *  no other control character (the script prints names to the terminal as they are, so an escape
+ *  sequence in an account's name would be run by it). */
+const clean = (s: unknown) => String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim()
 const pct = (n: number | undefined) => (typeof n === 'number' ? String(Math.round(n)) : '-')
 
 export const DEFAULT_BAR_WIDTH = 8
@@ -50,7 +57,7 @@ export function renderStatusFile(snapshot: Snapshot, format: string, now: number
         [
           'seat',
           seat.provider,
-          seat.accountId,
+          clean(seat.accountId),
           clean(labels.get(seat.key) ?? seat.label),
           seat.active ? 1 : 0,
           // An account Orca has no fresh numbers for (it has not run yet) is unknown, not 0 % used.
@@ -99,8 +106,19 @@ export function installIntoSettings(text: string | null): { text: string; replac
   const previous = settings.statusLine
   const replaced = previous !== undefined && !isOurs(previous)
   if (replaced) settings[PREVIOUS_KEY] = previous
-  settings.statusLine = { type: 'command', command: STATUSLINE_COMMAND, padding: 0 }
+  settings.statusLine = WRAPPER_SETTING
   return { text: JSON.stringify(settings, null, 2) + '\n', replaced }
+}
+
+/** Whether an installed wrapper setting is older than `WRAPPER_SETTING`: it has no refresh
+ *  interval. One that has (whatever else the user changed in it since) is left as it is. */
+export function needsUpgrade(text: string | null): boolean {
+  try {
+    const current = parseSettings(text).statusLine
+    return isOurs(current) && (current as SettingsJson).refreshInterval === undefined
+  } catch {
+    return false
+  }
 }
 
 /** Removes the wrapper and restores what was there; `null` text means the file can be deleted. */
@@ -320,9 +338,10 @@ if [ -r "$status" ]; then
       mark='▶'
       name="@{bold}$name@{off}"
       [ "$mname" != - ] && best=$mname
-      # Live numbers from this pane beat the file's last poll.
-      [ "$five" != - ] && s=$five
-      [ "$seven" != - ] && w=$seven
+      # Every row shows the file's numbers, the same ones the panel shows: the plugin has already
+      # merged this pane's own reading into them. The pane's numbers only fill a gap.
+      [ "$s" = - ] && [ "$five" != - ] && s=$five
+      [ "$w" = - ] && [ "$seven" != - ] && w=$seven
     fi
     [ "$best" = '?' ] && [ "$mname" != - ] && best=$mname
     cool_text=$(until_text "$cool")
@@ -336,9 +355,9 @@ if [ -r "$status" ]; then
 fi
 case "$best" in -|'') best=? ;; esac
 if [ -z "$rows" ]; then
-  labelw=9
-  rows="▶ $(label 'this pane')  5h $(bar "$five")  7d $(bar "$seven")  model $(bar -)"
-  [ -r "$status" ] || rows="$rows  @{dim}no rotator status yet@{off}"
+  labelw=12
+  rows="▶ $(label 'this session')  5h $(bar "$five")  7d $(bar "$seven")  model $(bar -)"
+  [ -r "$status" ] || rows="$rows  @{dim}no Auto Hand-off status yet@{off}"
 fi
 
 # {placeholder} substitution in the header, every occurrence, no eval.
@@ -359,8 +378,8 @@ subst '{5h}' "$five"
 subst '{7d}' "$seven"
 subst '{reset}' "@{reset_text:-now}"
 subst '{best}' "$best"
-[ -r "$status" ] || line="$line │ no rotator status yet"
-[ "$paused" = 1 ] && line="$line │ @{alert}⏸ switching paused@{off}"
+[ -r "$status" ] || line="$line │ no Auto Hand-off status yet"
+[ "$paused" = 1 ] && line="$line │ @{alert}⏸ automatic hand-off paused@{off}"
 # The header is optional (the format setting); by default only the account rows print.
 [ -n "$format" ] && printf '%s\n' "$line"
 printf '%s\n' "$rows"

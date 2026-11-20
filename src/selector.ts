@@ -1,4 +1,4 @@
-// Which seat comes next: the chain, eligibility, strategies, switch-back, earliest reset.
+// Which seat comes next: the chain, eligibility, Smart or the account order, switch-back, earliest reset.
 import { NO_CONTEXT, candidateOf, headroom, rank, type SmartContext, type Tier } from './smart'
 import { BLIND_COOLDOWN_CAP_MINUTES, STRIKE_TTL_MS, type Config, type Provider, type Seat, type SeatHealth } from './types'
 
@@ -13,7 +13,16 @@ function tokens(list: string): string[] {
 
 function matches(seat: Seat, token: string): boolean {
   if (token.endsWith(':*')) return seat.provider === token.slice(0, -2)
-  return seat.key.toLowerCase() === token || seat.label.toLowerCase() === token
+  if (seat.key.toLowerCase() === token || seat.label.toLowerCase() === token) return true
+  // `provider:account`, e.g. `claude:work@example.com`: that service's account by its label.
+  const colon = token.indexOf(':')
+  return colon > 0 && seat.provider === token.slice(0, colon) && seat.label.toLowerCase() === token.slice(colon + 1)
+}
+
+/** Does an entry of an account list name one of these seats? */
+export function namesAny(seats: readonly Seat[], token: string): boolean {
+  const t = token.trim().toLowerCase()
+  return seats.some((s) => matches(s, t))
 }
 
 /**
@@ -37,24 +46,16 @@ export function isExcluded(seat: Seat, config: Config): boolean {
   return tokens(config.exclude).some((t) => matches(seat, t))
 }
 
-function over(window: { usedPercent: number; resetsAt: number | null } | undefined, limit: number, now: number) {
+function full(window: { usedPercent: number; resetsAt: number | null } | undefined, now: number) {
   if (!window) return false
   if (window.resetsAt !== null && window.resetsAt <= now) return false // already reset
-  return window.usedPercent >= Math.min(limit, 100)
+  return window.usedPercent >= 100
 }
 
-/** Over a configured threshold (or exhausted) by the numbers Orca reports. */
-export function overThreshold(seat: Seat, config: Config, now: number): boolean {
-  if (!seat.usage.known) return false
-  return (
-    over(seat.usage.session, config.thresholdFiveHour, now) ||
-    over(seat.usage.weekly, config.thresholdSevenDay, now)
-  )
-}
-
-export function isEligible(seat: Seat, health: SeatHealth | undefined, config: Config, now: number): boolean {
+/** Not cooling down, and not known to be used up. */
+export function isEligible(seat: Seat, health: SeatHealth | undefined, now: number): boolean {
   if (health?.cooldownUntil && health.cooldownUntil > now) return false
-  return !overThreshold(seat, config, now)
+  return !exhausted(seat, now)
 }
 
 /** Strikes that still count: they lapse 24 h after the last one. */
@@ -73,16 +74,16 @@ export function blindCooldownMs(config: Config, strikes: number): number {
 
 /**
  * How much the plugin knows about a seat it could switch to:
- * - `A`: usage is known (live, or a remembered reading) and under the thresholds;
+ * - `A`: usage is known (live, or a remembered reading) and not used up;
  * - `B+`: no numbers, but a cooldown that ended at a real reset time has expired and the seat has
  *   no strikes, so it is presumed reset;
  * - `B`: no numbers at all;
- * - null: cooling down or over a threshold, so not a target.
+ * - null: cooling down or used up, so not a target.
  */
 const RANK: Record<Tier, number> = { A: 0, 'B+': 1, B: 2 }
 
-export function tier(seat: Seat, health: SeatHealth | undefined, config: Config, now: number): Tier | null {
-  if (!isEligible(seat, health, config, now)) return null
+export function tier(seat: Seat, health: SeatHealth | undefined, now: number): Tier | null {
+  if (!isEligible(seat, health, now)) return null
   if (seat.usage.known) return 'A'
   const expired = health?.freedAt !== undefined || health?.cooldownUntil !== undefined
   return health?.resetKnown && expired && strikesOf(health, now) === 0 ? 'B+' : 'B'
@@ -90,10 +91,10 @@ export function tier(seat: Seat, health: SeatHealth | undefined, config: Config,
 
 /** Known to be at 100 % in a window that has not reset yet. */
 export function exhausted(seat: Seat, now: number): boolean {
-  return seat.usage.known && (over(seat.usage.session, 100, now) || over(seat.usage.weekly, 100, now))
+  return seat.usage.known && (full(seat.usage.session, now) || full(seat.usage.weekly, now))
 }
 
-/** Lower is better. Unknown usage counts as the middle; since tiers, that only orders a manual pick. */
+/** Lower is better (the headroom gap). Unknown usage counts as the middle. */
 export function load(seat: Seat): number {
   if (!seat.usage.known) return 50
   return Math.max(seat.usage.weekly?.usedPercent ?? 0, (seat.usage.session?.usedPercent ?? 0) / 2)
@@ -105,7 +106,7 @@ export function load(seat: Seat): number {
  * exhausted seat (100 %) may always leave. A target without numbers is never "clearly better":
  * only a seat known to be at 100 % may move onto it.
  *
- * `low`: the seat is being left because it is about to run out (Smart, Follow my order). It then
+ * `low`: the seat is being left because it is about to run out (Auto, Custom order). It then
  * counts as having no room left, and the target needs the gap as room in its fullest window.
  * `load` halves 5-hour use, so a seat at 97 % of its 5-hour window would otherwise fail the gap
  * against any target with moderate weekly use, and never leave before the limit.
@@ -123,15 +124,11 @@ export function enoughGap(from: Seat | undefined, to: Seat, config: Config, low 
   return load(from) - load(to) >= config.minHeadroomGap
 }
 
-/** When a seat's weekly window resets; Infinity when unknown (sorted last). */
-function weeklyReset(seat: Seat): number {
-  return seat.usage.weekly?.resetsAt ?? Number.POSITIVE_INFINITY
-}
-
 export type PickOptions = {
   /**
    * - `hard` (default): a limit was hit. Known seats first, then presumed-reset ones, then seats
-   *   without numbers (fewest strikes first); the strategy orders seats within one tier.
+   *   without numbers (fewest strikes first); Smart or the account order picks within one tier
+   *   (the account order: the highest known or presumed-reset seat, else the next in turn).
    * - `advisory`: a threshold or idle move. Only a known seat, unless the source is known to be
    *   at 100 % and no known seat exists.
    * - `manual`: the user asked. Tiers are ignored; every eligible seat competes as before.
@@ -156,7 +153,6 @@ export function pickNext(
   now: number,
   options: PickOptions = {}
 ): Seat | null {
-  if (config.strategy === 'manual') return null
   const mode = options.mode ?? 'hard'
   const tiers = new Map<Seat, Tier>()
   const smart = config.strategy === 'smart' ? (options.smart ?? NO_CONTEXT) : null
@@ -165,7 +161,7 @@ export function pickNext(
     if (s.key === currentKey || isExcluded(s, config)) continue
     if (options.only && !options.only.has(s.key)) continue
     if (mode === 'advisory' && options.avoid?.has(s.key)) continue
-    const t = tier(s, health[s.key], config, now)
+    const t = tier(s, health[s.key], now)
     if (!t) continue
     if (smart) {
       const at = chain.findIndex((x) => x.key === currentKey)
@@ -184,7 +180,7 @@ export function pickNext(
   if (tiers.size === 0) return null
   let pool = [...tiers.keys()]
   if (mode !== 'manual') {
-    // The best tier that has a seat; the strategy only chooses within it.
+    // The best tier that has a seat; Smart or the account order only chooses within it.
     const best = Math.min(...pool.map((s) => RANK[tiers.get(s)!]))
     if (mode === 'advisory' && best > RANK.A && !options.sourceExhausted) return null
     pool = pool.filter((s) => RANK[tiers.get(s)!] === best)
@@ -193,32 +189,25 @@ export function pickNext(
       pool = pool.filter((s) => strikesOf(health[s.key], now) === fewest)
     }
   }
-  switch (config.strategy) {
-    case 'smart':
-      return rank(pool.map((s) => candidates.get(s)!), config)[0]!.seat
-    case 'balanced':
-      return [...pool].sort((a, b) => load(a) - load(b))[0]!
-    case 'soonest-reset':
-      // Spend the usage that expires first (Orca PR #42856 / cswap `weekly-first`).
-      return [...pool].sort((a, b) => weeklyReset(a) - weeklyReset(b) || load(a) - load(b))[0]!
-    case 'priority':
-      return pool[0]!
-    case 'drain':
-    default: {
-      // The next seat after the current one in chain order, wrapping around.
-      const at = chain.findIndex((s) => s.key === currentKey)
-      for (let i = 1; i <= chain.length; i++) {
-        const s = chain[(at + i + chain.length) % chain.length]!
-        if (pool.includes(s)) return s
-      }
-      return pool[0]!
-    }
+  if (smart) return rank(pool.map((s) => candidates.get(s)!), config)[0]!.seat
+  // The account order is a ranking: the highest account in it that is known to have room, or is
+  // presumed reset (the same accounts a running session goes back to, `preferredOver`). So a
+  // session on the second account goes to the first when that is free again, not on to the third
+  // (after which new sessions would be sent back to the first anyway: two selection changes).
+  if (mode !== 'manual' && RANK[tiers.get(pool[0]!)!] < RANK.B) return pool[0]!
+  // Accounts without numbers, and the next-account command: the next seat after the current one
+  // in chain order, wrapping around, so each is tried in turn.
+  const at = chain.findIndex((s) => s.key === currentKey)
+  for (let i = 1; i <= chain.length; i++) {
+    const s = chain[(at + i + chain.length) % chain.length]!
+    if (pool.includes(s)) return s
   }
+  return pool[0]!
 }
 
 /**
  * Switch-back: the first usable seat *ahead* of `currentKey` in the chain, when the chain is a
- * priority order (drain, priority) and `switch_back` is on. Null when the current seat is already
+ * priority order (Custom order, which turns `switchBack` on). Null when the current seat is already
  * the best one, or nothing ahead of it qualifies.
  *
  * - `pane`: a running session would be closed and resumed there, so the seat must be known (A) or
@@ -233,16 +222,15 @@ export function preferredOver(
   config: Config,
   now: number,
   scope: 'pane' | 'launch' = 'launch',
-  /** Accounts not to go back to yet: left as Low, or Low now (never set in `custom` mode). */
+  /** Accounts not to go back to yet: left as Low, or Low now. */
   avoid?: ReadonlySet<string>
 ): Seat | null {
-  if (!config.switchBack) return null
-  if (config.strategy !== 'drain' && config.strategy !== 'priority') return null
+  if (!config.switchBack || config.strategy !== 'drain') return null
   const at = chain.findIndex((s) => s.key === currentKey)
   if (at <= 0) return null
   for (const s of chain.slice(0, at)) {
     if (isExcluded(s, config) || avoid?.has(s.key)) continue
-    const t = tier(s, health[s.key], config, now)
+    const t = tier(s, health[s.key], now)
     if (t === 'A' || t === 'B+') return s
     if (t === 'B' && scope === 'launch' && strikesOf(health[s.key], now) === 0) return s
   }

@@ -4,209 +4,255 @@ import type { OrcaWorkerApi } from 'orca/worker'
 import { nodeCli } from './cli'
 import { Rotator, type Deps, type StatusEvent } from './engine'
 import { PROVIDER_NAME } from './labels'
+import { ALL_SETTINGS, checked, LEGACY_KEYS, settingValues, upgradedValues, wasManual, type SettingValues } from './settings'
 import { LIVE_KEY, liveFileName } from './live-usage'
 import { DATA_DIR, LIVE_DIR } from './statusline'
 import { ConsoleStatusLine, nodeFiles, memoryFiles, type Files } from './statusline-files'
-import { DEFAULT_CONFIG, PROVIDERS, type Config, type Mode, type Provider, type RotatorState, type Snapshot } from './types'
+import { DEFAULT_CONFIG, PROVIDERS, type Config, type Held, type Provider, type RotatorState } from './types'
 import './protocol'
 
 const STATE_KEY = 'state'
 const USAGE_KEY = 'usage'
 const SAMPLES_KEY = 'usage-samples'
+/** The one-time pause for an older "manual" setting was done. */
+const MANUAL_KEY = 'migrated-manual'
+/** The one-time upgrade of 0.2 settings was done. */
+const UPGRADE_KEY = 'upgraded-0.3'
 
 /** The tick follows the usage read period but never runs slower than 30 s, so parked sessions and
  *  cooldowns stay on time; the CLI is still called only once per read period. */
+const MAX_TICK_MS = 30_000
 export function tickMs(pollIntervalSeconds: number): number {
-  return Math.min(30, Math.max(15, pollIntervalSeconds)) * 1000
+  return Math.min(MAX_TICK_MS, Math.max(15_000, pollIntervalSeconds * 1000))
 }
 
-const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
-
-/** The legacy decision settings and their defaults. Outside `custom` mode they are not read:
- *  the four knobs decide. */
-const LEGACY_DEFAULTS: Record<string, string | number | boolean> = {
-  switch_back: DEFAULT_CONFIG.switchBack,
-  switch_cooldown_minutes: DEFAULT_CONFIG.switchCooldownMinutes,
-  min_headroom_gap: DEFAULT_CONFIG.minHeadroomGap,
-  auto_swap_idle_after_seconds: DEFAULT_CONFIG.autoSwapIdleAfterSeconds,
-  auto_switch_on_rate_limit: DEFAULT_CONFIG.autoSwitchOnRateLimit,
-  auto_switch_on_threshold: DEFAULT_CONFIG.autoSwitchOnThreshold,
-  auto_resume: DEFAULT_CONFIG.autoResume,
-  wait_for_reset: DEFAULT_CONFIG.waitForReset
+/** When the next tick runs: after `period`, or sooner when a countdown for the session on screen
+ *  runs out before that (`due` ms from now; engine.ts `countdownDueIn`), so the hand-off comes
+ *  when the countdown said and not up to a tick later. Never sooner than a second. */
+export function nextTickMs(period: number, due: number | undefined): number {
+  return due === undefined ? period : Math.min(period, Math.max(1000, due + 250))
 }
 
-const MODES = ['smart', 'my-order', 'manual', 'custom'] as const
-const EARLY = ['just-before', 'earlier', 'at-limit'] as const
-const RUNNING = ['move', 'limit', 'launches'] as const
-
-export type ResolvedMode = {
-  mode: Mode
-  /** `auto` chose the mode from the earlier settings. */
-  auto: boolean
-  switchEarly: (typeof EARLY)[number]
-  /** The stored thresholds (below 100) stay as a hard cap. */
-  keepThresholds: boolean
-}
-
-/**
- * Resolves the `mode` setting. `auto` (the default) reads the earlier settings each time, since a
- * plugin cannot tell a stored value from a default:
- * - `strategy` manual → manual;
- * - every legacy setting at its default → smart, or my-order when an account order (`chain`) is set;
- * - `strategy` priority with an account order, the rest at their defaults → my-order;
- * - anything else → custom: the earlier settings, read exactly as before.
- * Thresholds below 100 are no reason for `custom`: they select "Earlier" and stay as a hard cap.
- */
-export function resolveMode(s: Record<string, unknown>): ResolvedMode {
-  const pick = <T extends string>(key: string, allowed: readonly T[], fallback: T): T =>
-    typeof s[key] === 'string' && (allowed as readonly string[]).includes(s[key] as string) ? (s[key] as T) : fallback
-  const early = pick('switch_early', EARLY, 'just-before')
-  const stored = typeof s.mode === 'string' ? s.mode : 'auto'
-  if ((MODES as readonly string[]).includes(stored)) return { mode: stored as Mode, auto: false, switchEarly: early, keepThresholds: false }
-  const strategy = typeof s.strategy === 'string' ? s.strategy : DEFAULT_CONFIG.strategy
-  if (strategy === 'manual') return { mode: 'manual', auto: true, switchEarly: early, keepThresholds: false }
-  const untouched = Object.entries(LEGACY_DEFAULTS).every(([key, value]) => s[key] === undefined || s[key] === value)
-  const ordered = typeof s.chain === 'string' && s.chain.trim() !== ''
-  const mode: Mode = !untouched ? 'custom' : strategy === 'drain' ? (ordered ? 'my-order' : 'smart') : strategy === 'priority' && ordered ? 'my-order' : 'custom'
-  if (mode === 'custom') return { mode, auto: true, switchEarly: early, keepThresholds: false }
-  const capped = [s.thresholds_five_hour, s.thresholds_seven_day].some((n) => typeof n === 'number' && n < 100)
-  return { mode, auto: true, switchEarly: capped && early === 'just-before' ? 'earlier' : early, keepThresholds: capped }
-}
-
-const CUSTOM_NOTICE =
-  'Your earlier switching settings are kept exactly as they were (Auto-switch: custom). To try the new automatic mode, set Auto-switch to smart in Settings.'
-
-export async function readConfig(orca: Pick<OrcaWorkerApi, 'settings'>): Promise<Config> {
-  const s = (await orca.settings.get().catch(() => ({}))) as Record<string, unknown>
-  const num = (k: string, d: number) => (typeof s[k] === 'number' ? (s[k] as number) : d)
-  const bool = (k: string, d: boolean) => (typeof s[k] === 'boolean' ? (s[k] as boolean) : d)
-  const str = (k: string, d: string) => (typeof s[k] === 'string' ? (s[k] as string) : d)
-  const strategy = str('strategy', DEFAULT_CONFIG.strategy)
-  const d = DEFAULT_CONFIG
-  // The settings as stored: what `custom` mode runs, exactly as before the modes existed.
-  const stored: Config = {
-    ...d,
-    thresholdFiveHour: num('thresholds_five_hour', d.thresholdFiveHour),
-    thresholdSevenDay: num('thresholds_seven_day', d.thresholdSevenDay),
-    strategy: (['drain', 'balanced', 'priority', 'soonest-reset', 'manual'].includes(strategy) ? strategy : d.strategy) as Config['strategy'],
-    autoSwitchOnThreshold: bool('auto_switch_on_threshold', d.autoSwitchOnThreshold),
-    switchBack: bool('switch_back', d.switchBack),
-    switchCooldownMinutes: num('switch_cooldown_minutes', d.switchCooldownMinutes),
-    minHeadroomGap: num('min_headroom_gap', d.minHeadroomGap),
-    autoSwapIdleAfterSeconds: num('auto_swap_idle_after_seconds', d.autoSwapIdleAfterSeconds),
-    exclude: str('exclude', d.exclude),
-    autoSwitchOnRateLimit: bool('auto_switch_on_rate_limit', d.autoSwitchOnRateLimit),
-    autoResume: bool('auto_resume', d.autoResume),
-    autoMessage: str('auto_message', d.autoMessage),
-    waitForReset: bool('wait_for_reset', d.waitForReset),
-    retryOnApiError: bool('retry_on_api_error', d.retryOnApiError),
-    maxApiRetries: num('max_api_retries', d.maxApiRetries),
-    chain: str('chain', d.chain),
-    modelFallback: str('model_fallback', d.modelFallback),
-    defaultCooldownMinutes: num('default_cooldown_minutes', d.defaultCooldownMinutes),
-    pollIntervalSeconds: clamp(num('poll_interval_seconds', d.pollIntervalSeconds), 15, 3600),
-    usageCacheMaxAgeHours: clamp(num('usage_cache_max_age_hours', d.usageCacheMaxAgeHours), 0, 720),
-    handoffMaxChars: num('handoff_max_chars', d.handoffMaxChars),
-    orcaCliPath: str('orca_cli_path', d.orcaCliPath),
-    services: Object.fromEntries(
-      PROVIDERS.map((p) => [p, bool(`service_${p}`, d.services[p])])
-    ) as Config['services']
+/** The plugin's stored settings, with the 0.2 ones the upgrade reads. Orca's `settings.get()`
+ *  returns only the settings orca-plugin.json declares (live: an old `switch_early` was missing
+ *  from it), so each 0.2 key is asked for by name; one Orca does not have stays absent. Fails
+ *  when Orca cannot be asked: the upgrade must not take "could not read" for "nothing stored". */
+export async function storedSettings(orca: Pick<OrcaWorkerApi, 'settings'>): Promise<Record<string, unknown>> {
+  const s = { ...((await orca.settings.get()) as Record<string, unknown>) }
+  for (const key of LEGACY_KEYS) {
+    if (s[key] !== undefined) continue
+    const value = await orca.settings.get(key)
+    if (value !== undefined && value !== null) s[key] = value
   }
-  return applyMode(stored, resolveMode(s), s)
+  return s
+}
+
+/** Every service's Automatic hand-off off: what runs while the settings cannot be trusted. */
+const ALL_OFF: Record<string, unknown> = Object.fromEntries(PROVIDERS.map((p) => [`service_${p}`, false]))
+
+/**
+ * Reads the settings for the engine, failing closed: when Orca cannot be asked, the settings as
+ * last read stay in effect, and before any were read (or while `held()` says so: the 0.2 upgrade
+ * is not done) every service's Automatic hand-off counts as off, so nothing is handed off or
+ * resumed by itself on settings nobody chose. The config then says why (`held`), for the panel.
+ * Every read asks Orca again, so the hold ends with the first read that works.
+ * What the worker itself stores is told to it (`wrote`), so "as last read" never lags behind a
+ * change made in the panel.
+ */
+export function configReader(
+  orca: Pick<OrcaWorkerApi, 'settings'>,
+  held: () => boolean = () => false,
+  log: (message: string) => void = () => undefined
+): (() => Promise<Config>) & { wrote(key: string, value: unknown): void } {
+  let last: Record<string, unknown> | undefined
+  let failed = false
+  const read = async (): Promise<Config> => {
+    try {
+      last = (await orca.settings.get()) as Record<string, unknown>
+      failed = false
+    } catch (error) {
+      if (!failed) log(`could not read the settings: ${String((error as Error)?.message ?? error)}`)
+      failed = true
+    }
+    const why: Held | undefined = !last ? 'settings' : held() ? 'upgrade' : undefined
+    return why ? { ...configFrom({ ...last, ...ALL_OFF }), held: why } : configFrom(last!)
+  }
+  return Object.assign(read, {
+    /** A setting the worker itself just stored: it counts at once, also when the next read fails
+     *  (a service turned off in the panel must not stay on because Orca could not be asked). */
+    wrote(key: string, value: unknown): void {
+      if (last) last = { ...last, [key]: value }
+    }
+  })
 }
 
 /**
- * The settings the engine runs. In `custom` they are the stored ones. In every other mode the
- * legacy decision settings are replaced by what the four knobs say:
- * - Switch early: just before the limit (10 min ahead; 5h 97 %, week 99 %), earlier (25 min;
- *   5h 90 %, week 97 %), or only at the limit;
- * - Running sessions: move when idle or between turns, only at a limit, or new launches only;
+ * What the engine runs, from the settings (settings.ts):
+ * - Pick the next account: Auto ranks by room and pace; Custom order follows the account order
+ *   set with the panel's arrows and goes back to an earlier account once it is free.
+ * - When to hand off: Early when away leaves an account shortly before it runs out
+ *   (`early_minutes` at its pace, or at 97 % of the 5-hour window and 99 % of the week when the
+ *   pace is unknown), between turns, moves idle sessions and spends expiring weekly quota, once
+ *   the user has been away `away_minutes` (engine.ts `config`); At limit moves a session only
+ *   when it hits one.
  * - When everything is used up: wait and resume, or stop.
+ * - Session on screen: how the session in the tab Orca shows is handled at a limit.
  */
-export function applyMode(stored: Config, resolved: ResolvedMode, s: Record<string, unknown>): Config {
-  if (resolved.mode === 'custom') return resolved.auto ? { ...stored, mode: 'custom', notice: CUSTOM_NOTICE } : { ...stored, mode: 'custom' }
+export function configFrom(s: Record<string, unknown>): Config {
+  const v = settingValues(s)
   const d = DEFAULT_CONFIG
-  const running = typeof s.running_sessions === 'string' && (RUNNING as readonly string[]).includes(s.running_sessions) ? (s.running_sessions as Config['runningSessions']) : 'move'
-  const early = { 'just-before': [10, 97, 99], earlier: [25, 90, 97], 'at-limit': [0, 100, 100] }[resolved.switchEarly] as [number, number, number]
+  const num = (k: string) => v[k] as number
+  const str = (k: string) => v[k] as string
+  const early = v.timing === 'early'
+  const ordered = v.pick === 'my-order'
   return {
-    ...stored,
-    mode: resolved.mode,
-    strategy: resolved.mode === 'smart' ? 'smart' : resolved.mode === 'manual' ? 'manual' : stored.strategy === 'priority' ? 'priority' : 'drain',
-    switchBack: resolved.mode === 'my-order',
-    switchCooldownMinutes: d.switchCooldownMinutes,
+    ...d,
+    mode: ordered ? 'my-order' : 'smart',
+    strategy: ordered ? 'drain' : 'smart',
+    switchBack: ordered,
+    horizonMinutes: early ? num('early_minutes') : 0,
+    lowFiveHour: early ? 97 : 100,
+    floorFiveHour: early && num('early_percent_left') > 0 ? 100 - num('early_percent_left') : 100,
+    lowSevenDay: early ? 99 : 100,
+    runningSessions: early ? 'move' : 'limit',
+    autoSwitchOnThreshold: early,
+    autoSwapIdleAfterSeconds: early ? num('idle_minutes') * 60 : 0,
+    waitForReset: v.when_all_used !== 'stop',
+    switchCooldownMinutes: num('switch_cooldown_minutes'),
     minHeadroomGap: d.minHeadroomGap,
-    autoSwitchOnRateLimit: true,
-    autoSwitchOnThreshold: running === 'move',
-    autoSwapIdleAfterSeconds: running === 'move' ? d.autoSwapIdleAfterSeconds : 0,
-    autoResume: running !== 'launches',
-    runningSessions: running,
-    waitForReset: s.when_all_used !== 'stop',
-    thresholdFiveHour: resolved.keepThresholds ? stored.thresholdFiveHour : 100,
-    thresholdSevenDay: resolved.keepThresholds ? stored.thresholdSevenDay : 100,
-    horizonMinutes: early[0],
-    lowFiveHour: early[1],
-    lowSevenDay: early[2]
+    exclude: str('exclude'),
+    autoMessage: str('auto_message'),
+    retryOnApiError: num('max_api_retries') > 0,
+    maxApiRetries: num('max_api_retries'),
+    // The account order counts only for Custom order: Auto ranks by room alone, even when an
+    // order was arranged earlier.
+    chain: ordered && typeof s.chain === 'string' ? s.chain : d.chain,
+    modelFallback: str('model_fallback'),
+    defaultCooldownMinutes: num('default_cooldown_minutes'),
+    pollIntervalSeconds: num('poll_interval_seconds'),
+    usageCacheMaxAgeHours: d.usageCacheMaxAgeHours,
+    handoffMaxChars: num('handoff_max_chars'),
+    orcaCliPath: str('orca_cli_path'),
+    activeTerminal: v.active_terminal as Config['activeTerminal'],
+    countdownSeconds: num('active_countdown_seconds'),
+    presenceSeconds: num('active_presence_seconds'),
+    reminderMinutes: num('active_reminder_minutes'),
+    restoreUnsent: v.restore_unsent_text as boolean,
+    awayMinutes: num('away_minutes'),
+    services: Object.fromEntries(PROVIDERS.map((p) => [p, typeof s[`service_${p}`] === 'boolean' ? s[`service_${p}`] : d.services[p]])) as Config['services']
   }
 }
 
-/** `Claude 2/3 · 7%·18% | Codex 1/3 · 0%` — only providers with more than one seat. */
-export function statusText(snapshot: Snapshot): { text: string; tone: 'neutral' | 'warning' | 'danger'; tooltip: string } {
-  const parts: string[] = []
-  const remembered: string[] = []
-  let tone: 'neutral' | 'warning' | 'danger' = 'neutral'
-  for (const provider of PROVIDERS) {
-    const seats = snapshot.seats.filter((s) => s.provider === provider)
-    if (seats.length < 2) continue
-    if (snapshot.services?.[provider] === false) {
-      parts.push(`${PROVIDER_NAME[provider]} off`)
-      continue
+/**
+ * The worker's clock: runs `run` (the engine's tick), then again after `period()` ms, or sooner
+ * when `due()` says a countdown runs out before that (`nextTickMs`).
+ * - `schedule()` sets the next tick afresh (a changed read period, a countdown that began).
+ * - One tick at a time: a tick that comes due while one runs waits for it and runs after it (two
+ *   that come due meanwhile share that one run), so two ticks never look at the waiting sessions
+ *   at once.
+ * - `stop()` ends it for good: no timer is left, and a tick or a `schedule()` under way sets none.
+ */
+export function ticker(o: {
+  period(): Promise<number>
+  due(): number | undefined
+  run(): Promise<void>
+  log(message: string): void
+  setTimer?: (fn: () => void, ms: number) => unknown
+  clearTimer?: (handle: unknown) => void
+}): { schedule(): Promise<void>; now(): Promise<void>; stop(): void } {
+  const setTimer = o.setTimer ?? ((fn, ms) => setTimeout(fn, ms))
+  const clearTimer = o.clearTimer ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>))
+  let generation = 0
+  let timer: unknown
+  let stopped = false
+  let running: Promise<void> | undefined
+  let queued: Promise<void> | undefined
+  const now = (): Promise<void> => {
+    if (stopped) return Promise.resolve()
+    if (!running) {
+      const run: Promise<void> = o
+        .run()
+        .catch((error) => o.log(`tick failed: ${String((error as Error)?.message ?? error)}`))
+        .finally(() => {
+          if (running === run) running = undefined
+        })
+      running = run
+      return run
     }
-    const index = seats.findIndex((s) => s.active)
-    const seat = seats[index]
-    const pct = [seat?.usage.session?.usedPercent, seat?.usage.weekly?.usedPercent]
-      .filter((n): n is number => typeof n === 'number')
-      .map((n) => `${Math.round(n)}%`)
-      .join('·')
-    // `~`: remembered numbers, not Orca's live ones (the age is in the tooltip).
-    const approx = seat && seat.usage.source !== undefined && seat.usage.source !== 'live' && pct ? '~' : ''
-    if (approx && seat?.usage.asOf) {
-      remembered.push(`${PROVIDER_NAME[provider]}: last reading ${new Date(seat.usage.asOf).toLocaleString()}`)
-    }
-    parts.push(`${PROVIDER_NAME[provider]} ${index + 1}/${seats.length}${pct ? ` · ${approx}${pct}` : ''}`)
-    const worst = Math.max(seat?.usage.session?.usedPercent ?? 0, seat?.usage.weekly?.usedPercent ?? 0)
-    if (worst >= 80 && tone === 'neutral') tone = 'warning'
+    queued ??= running.then(() => {
+      queued = undefined
+      return now()
+    })
+    return queued
   }
-  if (snapshot.waiting.length > 0) tone = 'danger'
-  const text = (snapshot.paused ? 'paused · ' : '') + (parts.join(' | ') || 'Auto Hand-off')
-  const tooltip = snapshot.waiting.length
-    ? `${snapshot.waiting.length} session(s) waiting for a limit to reset`
-    : snapshot.paused
-      ? 'Automatic hand-off is paused'
-      : 'Automatic hand-off is on. Click to hand Claude off to the next account.'
-  return { text, tone, tooltip: remembered.length ? `${tooltip}\n${remembered.join('\n')}` : tooltip }
+  const schedule = async (): Promise<void> => {
+    if (stopped) return
+    const mine = ++generation
+    if (timer !== undefined) clearTimer(timer)
+    timer = undefined
+    const usual = await o.period()
+    if (stopped || mine !== generation) return
+    timer = setTimer(() => {
+      timer = undefined
+      void now().then(() => {
+        if (!stopped && mine === generation) void schedule()
+      })
+    }, nextTickMs(usual, o.due()))
+  }
+  return {
+    schedule,
+    now,
+    stop() {
+      stopped = true
+      generation++
+      if (timer !== undefined) clearTimer(timer)
+      timer = undefined
+    }
+  }
 }
 
-let timer: ReturnType<typeof setTimeout> | undefined
+let ticks: ReturnType<typeof ticker> | undefined
 let active: Rotator | undefined
 
 export async function activateWith(
   orca: OrcaWorkerApi,
   overrides: Partial<Deps> = {},
   /** `files` defaults to an in-memory stand-in so tests never touch the real home directory;
-   *  `activate` passes the real one. */
-  options: { tick?: boolean; files?: Files } = {}
+   *  `activate` passes the real one. `timers`: the clock's timer, for tests that run a tick. */
+  options: { tick?: boolean; files?: Files; timers?: { setTimer: (fn: () => void, ms: number) => unknown; clearTimer: (handle: unknown) => void } } = {}
 ): Promise<Rotator> {
-  let lastStatus = ''
   const files = options.files ?? memoryFiles()
+  /** The 0.2 upgrade could not be done yet (Orca could not be asked): see `upgrade` below. */
+  let upgradePending = false
+  const readConfig = configReader(orca, () => upgradePending, (m) => orca.log(m))
+  /** Stores a setting chosen in the panel, and tells the reader (`configReader`). */
+  const store = async (key: string, value: string | number | boolean): Promise<void> => {
+    await orca.settings.set(key, value)
+    readConfig.wrote(key, value)
+  }
+  /** The status line's settings as last read. */
+  let lineSettings: Record<string, unknown> = {}
   const consoleLine = new ConsoleStatusLine(files, {
     host: orca.host as unknown as Deps['host'],
-    settings: () => orca.settings.get().catch(() => ({})) as Promise<Record<string, unknown>>,
+    settings: async () => {
+      try {
+        const s = { ...((await orca.settings.get()) as Record<string, unknown>) }
+        // The bar width is no declared setting any more, so Orca leaves it out above: a width an
+        // older version stored is asked for by name.
+        const width = await orca.settings.get('console_statusline_bar_width')
+        if (typeof width === 'number') s.console_statusline_bar_width = width
+        lineSettings = s
+      } catch {
+        // Orca cannot be asked: the header as last read stays, rather than the default one.
+      }
+      return lineSettings
+    },
     log: (m) => orca.log(m),
     now: () => overrides.now?.() ?? Date.now()
   })
   const deps: Deps = {
     host: orca.host as unknown as Deps['host'],
-    cli: nodeCli(async () => (await readConfig(orca)).orcaCliPath),
+    cli: nodeCli(async () => (await readConfig()).orcaCliPath),
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     loadState: async () => (await orca.storage.get(STATE_KEY)) as RotatorState | null,
@@ -216,29 +262,99 @@ export async function activateWith(
     loadSamples: () => orca.storage.get(SAMPLES_KEY),
     saveSamples: (samples) => orca.storage.set(SAMPLES_KEY, samples as never),
     readLive: async (liveKey) => (LIVE_KEY.test(liveKey) ? files.read(`${files.home}/${DATA_DIR}/${LIVE_DIR}/${liveFileName(liveKey)}`) : null),
-    config: () => readConfig(orca),
+    config: readConfig,
     log: (message) => orca.log(message),
     notify: async (title, body) => {
       await orca.host.call('notifications.show', { title, body }).catch(() => undefined)
     },
     publish: (snapshot) => {
-      orca.panels.post('rotator.changed', snapshot as never)
+      // Fire and forget: a post Orca refuses (too large, too many) must not fail what published.
+      try {
+        orca.panels.post('rotator.changed', snapshot as never)
+      } catch (error) {
+        orca.log(`could not tell the panel: ${String((error as Error)?.message ?? error)}`)
+      }
       void consoleLine.writeStatus(snapshot)
-      const status = statusText(snapshot)
-      const key = JSON.stringify(status)
-      if (key === lastStatus) return
-      lastStatus = key
-      void orca.host
-        .call('statusBar.update', { id: 'seat', text: status.text, tone: status.tone, tooltip: status.tooltip, icon: snapshot.paused ? 'pause' : 'gauge' })
-        .catch(() => undefined)
     },
     ...overrides
   }
   const rotator = new Rotator(deps)
+  // One worker, one clock: a worker started again in the same process ends the one before.
+  ticks?.stop()
+  ticks = undefined
+  active?.dispose()
   active = rotator
   await rotator.init()
+  // The upgrade from 0.2, once: the 0.2 settings (read by name: Orca no longer returns them with
+  // the declared ones) are turned into the new ones, which are then stored, so they are read like
+  // any setting from here on and a later choice is never overridden by an old value. A setup that
+  // did not hand sessions off by itself (settings.ts `wasManual`) has no setting for that any more:
+  // automatic hand-off is paused instead, and the user is told.
+  // It counts as done only when everything was read and written. Until then (Orca could not be
+  // asked) every service counts as off (`configReader`), and it is tried again at each tick and
+  // settings change, and at the next start.
+  const upgrade = async (): Promise<void> => {
+    try {
+      if (await orca.storage.get(UPGRADE_KEY)) {
+        upgradePending = false
+        return
+      }
+      const stored = await storedSettings(orca)
+      // A 0.2 setup: any 0.2 setting stored, or an account order (0.2 followed it by default; in 0.3
+      // it is set only by the panel's arrows, so at the first start it can only come from 0.2).
+      const ordered = typeof stored.chain === 'string' && stored.chain.trim() !== ''
+      if (ordered || LEGACY_KEYS.some((key) => stored[key] !== undefined)) {
+        // The pause first: it is the part that keeps sessions from being handed off.
+        if (wasManual(stored) && !(await orca.storage.get(MANUAL_KEY))) {
+          await rotator.setPaused(true)
+          await orca.storage.set(MANUAL_KEY, true as never)
+          await orca.host
+            .call('notifications.show', { title: 'Auto Hand-off', body: 'Your earlier settings kept Auto Hand-off from handing sessions off by itself. Those settings are gone, so automatic hand-off is paused instead; turn Automatic hand-off on in the panel when you want it.' })
+            .catch(() => undefined)
+        }
+        for (const [key, value] of Object.entries(upgradedValues(stored))) {
+          if (value !== undefined) await orca.settings.set(key, value)
+        }
+      }
+      await orca.storage.set(UPGRADE_KEY, true as never)
+      upgradePending = false
+    } catch (error) {
+      if (!upgradePending) orca.log(`could not carry the earlier settings over yet; automatic hand-off waits: ${String((error as Error)?.message ?? error)}`)
+      upgradePending = true
+    }
+  }
+  await upgrade()
+  // What the panel shows of the settings (the mode, the services) follows what was just written.
+  await rotator.refreshServices(false)
+  // Self-rescheduling, so a changed `poll_interval_seconds` takes effect without a restart.
+  const clock =
+    options.tick === false
+      ? undefined
+      : ticker({
+          period: async () => tickMs((await readConfig()).pollIntervalSeconds),
+          due: () => rotator.countdownDueIn(),
+          run: async () => {
+            if (upgradePending) await retryUpgrade()
+            await rotator.tick()
+          },
+          log: (m) => orca.log(m),
+          ...options.timers
+        })
+  ticks = clock
+  /** One retry at a time: the settings it writes are themselves settings changes. */
+  let retrying: Promise<void> | undefined
+  const retryUpgrade = (): Promise<void> =>
+    (retrying ??= (async () => {
+      await upgrade()
+      if (!upgradePending) await rotator.refreshServices()
+    })().finally(() => {
+      retrying = undefined
+    }))
   // Load accounts now so the launch hook (2 s budget, no CLI) can record seats from the start.
-  void rotator.accounts().then(() => rotator.publishNow())
+  void rotator
+    .accounts()
+    .then(() => rotator.publishNow())
+    .catch((error) => orca.log(`first account read failed: ${String((error as Error)?.message ?? error)}`))
 
   // An open panel's Status line switch follows the focused workspace and the install and remove commands.
   const tellConsoleLine = () =>
@@ -246,7 +362,14 @@ export async function activateWith(
       .status()
       .then((state) => orca.panels.post('rotator.consoleLine', state))
       .catch(() => undefined)
-  orca.events.on('agent.status.changed', (payload) => rotator.onAgentStatus(payload as StatusEvent))
+  orca.events.on('agent.status.changed', async (payload) => {
+    await rotator.onAgentStatus(payload as StatusEvent)
+    // A limit in the session on screen may have started a countdown: when it runs out before the
+    // next tick would come, the tick is set to then (`schedule`). Only then, so that events never
+    // put the tick off by more than one period.
+    const due = rotator.countdownDueIn()
+    if (due !== undefined && due < MAX_TICK_MS) void clock?.schedule()
+  })
   // The panel lists the service of the agent in the focused workspace first.
   orca.events.on('workspace.changed', async () => {
     // The panel's Status line switch is per workspace: tell it the state of the one in focus now.
@@ -258,67 +381,130 @@ export async function activateWith(
     rotator.noteLaunch(event.agent, event.terminalId, event.workspaceId)
   })
 
-  orca.commands.register('rotator.next', async (args) => {
+  // Running a command is a sign that the user is at Orca, as using the panel is.
+  const register: typeof orca.commands.register = (id, run) =>
+    orca.commands.register(id, ((...args: unknown[]) => {
+      rotator.notePresence()
+      return (run as (...a: unknown[]) => unknown)(...args)
+    }) as typeof run)
+  register('rotator.next', async (args) => {
     const provider = (typeof args === 'string' ? args : 'claude') as Provider
     return rotator.selectNext(PROVIDERS.includes(provider) ? provider : 'claude')
   })
-  orca.commands.register('rotator.nextCodex', () => rotator.selectNext('codex'))
-  orca.commands.register('rotator.swapThisPane', () => rotator.swapFocused())
-  orca.commands.register('rotator.togglePause', async () => {
+  register('rotator.nextCodex', () => rotator.selectNext('codex'))
+  register('rotator.swapThisPane', () => rotator.swapFocused())
+  register('rotator.togglePause', async () => {
     await rotator.setPaused(!rotator.state.paused)
     return rotator.state.paused ? 'Automatic hand-off paused' : 'Automatic hand-off resumed'
   })
-  orca.commands.register('rotator.refresh', async () => {
+  register('rotator.refresh', async () => {
     await rotator.accounts(true)
     rotator.publishNow()
-    return 'Usage read from Orca. Accounts not in use update when Orca fetches them (its usage view, or right after a switch).'
+    return 'Usage read from Orca. Accounts not in use update when Orca fetches them (its usage view, or right after a hand-off).'
   })
-  orca.commands.register('rotator.installStatusLine', async () => {
+  register('rotator.installStatusLine', async () => {
     const said = await consoleLine.install()
     await tellConsoleLine()
     return said
   })
-  orca.commands.register('rotator.uninstallStatusLine', async () => {
+  register('rotator.uninstallStatusLine', async () => {
     const said = await consoleLine.uninstall()
     await tellConsoleLine()
     return said
   })
 
   orca.panels.handle('rotator.snapshot', async ({ refresh }) => {
+    // The panel's Refresh button (its own polling asks without `refresh`).
+    if (refresh) rotator.notePresence()
     await Promise.all([rotator.accounts(!!refresh), rotator.refreshFocus()])
     return rotator.snapshot()
   })
+  /** What the panel sends is checked before anything is done with it. */
+  const invalid = (message: string) => Object.assign(new Error(message), { code: 'invalid_params' })
   orca.panels.handle('rotator.pause', async ({ paused }) => {
+    // Anything but a yes or no changes nothing: a request without `paused` must not turn
+    // automatic hand-off back on.
+    if (typeof paused !== 'boolean') throw invalid('paused (true or false) is required')
+    // Using the panel is a sign the user is at Orca (see the session-on-screen hold).
+    rotator.notePresence()
     await rotator.setPaused(paused)
     return { paused }
   })
   orca.panels.handle('rotator.setService', async ({ provider, enabled }) => {
     if (!PROVIDERS.includes(provider as Provider)) {
-      throw Object.assign(new Error(`Unknown service ${provider}`), { code: 'invalid_params' })
+      throw invalid(`Unknown service ${provider}`)
     }
-    await orca.settings.set(`service_${provider}`, enabled)
+    // A value that is no yes or no would be stored and then read as "on" (the default).
+    if (typeof enabled !== 'boolean') throw invalid('enabled (true or false) is required')
+    rotator.notePresence()
+    await store(`service_${provider}`, enabled)
     await rotator.refreshServices()
     return { services: rotator.services }
   })
+  // The panel's Settings tab: every shown setting (settings.ts), each value checked against it.
+  // Fails when Orca cannot be asked: the tab must not show the defaults as if they were chosen
+  // (the panel keeps what it had, and asks again).
+  const panelSettings = async (): Promise<SettingValues> => settingValues((await orca.settings.get()) as Record<string, unknown>)
+  orca.panels.handle('rotator.settings', async ({ key, value }) => {
+    if (key !== undefined) {
+      rotator.notePresence()
+      const spec = ALL_SETTINGS.find((x) => x.key === key)
+      const ok = spec ? checked(spec, value) : undefined
+      if (!spec || ok === undefined) {
+        throw invalid(`Unknown setting value ${String(key)}=${String(value)}`)
+      }
+      await store(key, ok)
+      // The badge and the account order follow the settings as the engine last read them.
+      await rotator.refreshServices()
+      void clock?.schedule()
+    }
+    return panelSettings()
+  })
+  /** The order and the Skip list are each one setting that is read, changed and written back: one
+   *  such change at a time, so two quick presses never start from the same list and lose one. */
+  let listChange: Promise<unknown> = Promise.resolve()
+  const inTurn = <T>(change: () => Promise<T>): Promise<T> => {
+    const run = listChange.then(change, change)
+    listChange = run.catch(() => undefined)
+    return run
+  }
+  /** Custom order: moves an account up or down in its service's order (the `chain` setting). */
+  orca.panels.handle('rotator.moveSeat', async ({ seatKey, by }) => {
+    if (typeof seatKey !== 'string' || (by !== -1 && by !== 1)) throw invalid('seatKey and by (-1 or 1) are required')
+    rotator.notePresence()
+    await inTurn(async () => {
+      const chain = await rotator.orderMoved(seatKey, by)
+      await store('chain', chain)
+      // The panel draws the order from the settings as the engine last read them: read them again
+      // before it is told, so it never shows the order as it was.
+      await rotator.refreshServices()
+    })
+    return { ok: true as const }
+  })
   // Changing it in Orca's Settings takes effect at once too.
   orca.settings.onDidChange(() => {
+    if (upgradePending) void retryUpgrade()
+    void panelSettings().then((values) => orca.panels.post('rotator.settings', values), () => undefined)
     void rotator.refreshServices()
     // The console status line format lives in the status file.
     consoleLine.invalidate()
     rotator.publishNow()
     // A new usage read period applies at once.
-    if (options.tick !== false) void schedule()
+    void clock?.schedule()
   })
 
   orca.panels.handle('rotator.consoleLine', async ({ enabled }) => {
     if (typeof enabled !== 'boolean') return consoleLine.status()
+    rotator.notePresence()
     const message = enabled ? await consoleLine.install() : await consoleLine.uninstall()
     return { ...(await consoleLine.status()), message }
   })
   orca.panels.handle('rotator.switchTo', async ({ seatKey, acceptDraft, draft: shown }) => {
-    // A manual choice must not be undone by the rotator: automatic hand-off for the service
-    // stops as soon as the account is selected (before any automatic move that waits behind the
-    // switch can run), and the user turns it on again when they want rotation back.
+    if (typeof seatKey !== 'string') throw invalid('seatKey is required')
+    // A choice made by hand must not be undone by the plugin: automatic hand-off for the service
+    // stops as soon as the account is selected (before any automatic move that waits behind it
+    // can run), and the user turns it on again when they want automatic hand-offs back.
+    rotator.notePresence()
     let turnedOff = false
     // Unsent text is given up only by the panel's second confirmation, which names the text it
     // showed: `acceptDraft` must be exactly `true`, and without the text nothing is accepted.
@@ -326,34 +512,67 @@ export async function activateWith(
     const { message, switched, provider, draft } = await rotator.forceTo(
       seatKey,
       async (chosen) => {
-        if (rotator.services[chosen] === false) return
-        await orca.settings.set(`service_${chosen}`, false)
+        if (rotator.held) {
+          // Every service only counts as off (the settings are held): the choice is still kept
+          // for when the hold ends, as far as Orca takes it. The hand-off by hand goes on either way.
+          try {
+            if ((await orca.settings.get(`service_${chosen}`)) === false) return
+            await store(`service_${chosen}`, false)
+          } catch {
+            return
+          }
+        } else {
+          if (rotator.services[chosen] === false) return
+          await store(`service_${chosen}`, false)
+        }
         await rotator.refreshServices(false)
         turnedOff = true
       },
       accepted
     )
-    // The pane shows unsent text: nothing was switched, the panel asks.
+    // The pane shows unsent text that cannot go along: nothing was handed off, the panel asks.
     if (draft !== undefined) return { message, draft }
     if (!switched || !turnedOff) return { message }
     rotator.publishNow()
-    const name = PROVIDER_NAME[provider]
-    void orca.host.call('notifications.show', { title: 'Auto Hand-off', body: `${name}: automatic hand-off is off after your manual switch. Turn Auto hand-off ${name} on to resume.` }).catch(() => undefined)
-    return { message: `${message}. Automatic hand-off for ${name} is now off; turn Auto hand-off ${name} on again to resume` }
+    const off = `${PROVIDER_NAME[provider]}: automatic hand-off is now off, because you chose an account yourself. Turn it on again in the panel.`
+    void orca.host.call('notifications.show', { title: 'Auto Hand-off', body: off }).catch(() => undefined)
+    return { message: `${message}. ${off}` }
   })
   orca.panels.handle('rotator.focus', async () => {
     if (await rotator.refreshFocus()) rotator.publishNow()
     return rotator.focused ? { focused: rotator.focused } : {}
   })
-  orca.panels.handle('rotator.dismissNotice', async () => {
-    await rotator.dismissNotice()
-    return { ok: true as const }
-  })
   orca.panels.handle('rotator.cancelWaiting', async ({ terminalId }) => {
+    if (typeof terminalId !== 'string') throw invalid('terminalId is required')
+    rotator.notePresence()
     await rotator.cancelWaiting(terminalId)
     return { ok: true as const }
   })
+  orca.panels.handle('rotator.handoffNow', async ({ terminalId }) => {
+    if (typeof terminalId !== 'string') throw invalid('terminalId is required')
+    rotator.notePresence()
+    const message = await rotator.handoffNow(terminalId)
+    return message ? { ok: true as const, message } : { ok: true as const }
+  })
+  orca.panels.handle('rotator.setExcluded', async ({ seatKey, excluded }) => {
+    if (typeof seatKey !== 'string' || typeof excluded !== 'boolean') throw invalid('seatKey and excluded are required')
+    rotator.notePresence()
+    await inTurn(async () => {
+      await store('exclude', await rotator.excludedChanged(seatKey, excluded))
+      // As for the order: the Skip switch is drawn from the settings as the engine last read them.
+      await rotator.refreshServices()
+    })
+    return { ok: true as const }
+  })
+  orca.panels.handle('rotator.declineHandoff', async ({ terminalId }) => {
+    if (typeof terminalId !== 'string') throw invalid('terminalId is required')
+    rotator.notePresence()
+    await rotator.declineHandoff(terminalId)
+    return { ok: true as const }
+  })
   orca.panels.handle('rotator.clearCooldown', async ({ seatKey }) => {
+    if (typeof seatKey !== 'string') throw invalid('seatKey is required')
+    rotator.notePresence()
     await rotator.clearCooldown(seatKey)
     return { ok: true as const }
   })
@@ -364,24 +583,16 @@ export async function activateWith(
       .call('workspace.list')
       .then((r) => r.workspaces.map((w) => ({ id: w.id, path: w.path })))
       .catch((e: Error) => ({ error: e.message }))
-    return JSON.parse(JSON.stringify({ events: rotator.recentEvents, focused, workspaces }))
+    // What Orca hands back for the 0.2 settings the upgrade reads (by name), for checking the upgrade live.
+    const legacy = Object.fromEntries(
+      await Promise.all(LEGACY_KEYS.map((k) => orca.settings.get(k).then((v) => [k, v ?? null], (e: Error) => [k, `error: ${e.message}`])))
+    )
+    return JSON.parse(JSON.stringify({ events: rotator.recentEvents, focused, workspaces, legacy }))
   })
 
-  // Self-rescheduling so a changed `poll_interval_seconds` takes effect without a restart.
-  let generation = 0
-  const schedule = async (): Promise<void> => {
-    const mine = ++generation
-    if (timer) clearTimeout(timer)
-    const period = tickMs((await readConfig(orca)).pollIntervalSeconds)
-    if (mine !== generation) return
-    timer = setTimeout(async () => {
-      await rotator.tick().catch((error) => orca.log(`tick failed: ${String(error?.message ?? error)}`))
-      if (mine === generation) void schedule()
-    }, period)
-  }
-  if (options.tick !== false) {
-    void rotator.tick().catch((error) => orca.log(`tick failed: ${String(error?.message ?? error)}`))
-    void schedule()
+  if (clock) {
+    void clock.now()
+    void clock.schedule()
   }
   return rotator
 }
@@ -391,8 +602,8 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
 }
 
 export function deactivate(): void {
-  if (timer) clearTimeout(timer)
-  timer = undefined
+  ticks?.stop()
+  ticks = undefined
   active?.dispose()
   active = undefined
 }

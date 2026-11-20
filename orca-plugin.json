@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "auto-handoff",
   "name": "Auto Hand-off",
-  "version": "0.2.1",
-  "description": "Automatic account switching for Orca agents. Pools the managed accounts per provider (Claude, Codex, Antigravity, OpenCode, Devin). Smart mode looks ahead: a Claude session leaves an account shortly before it runs out and is resumed, as the same session, on the next Claude account. Codex, Antigravity, OpenCode and Devin sessions move only at a real limit and start a new session from a summary on the next account of the same provider. To reach panes outside the focused workspace it also runs the orca CLI (account select, terminal close/send).",
+  "version": "0.3.0",
+  "description": "Automatic account hand-off for Orca agents. Pools the accounts Orca manages per service (Claude, Codex, Antigravity, OpenCode, Devin). When a session hits a usage limit it is handed off to another account of the same service: a Claude session resumes as itself, and with Early when away it hands off shortly before an account runs out, once you have been away a while. Codex, Antigravity, OpenCode and Devin sessions hand off only at a limit and start a new session from a summary. To reach sessions outside the focused workspace it also runs the orca CLI (account select, terminal close/send).",
   "author": {
     "name": "ngoohebi",
     "url": "https://github.com/ngoohebi"
@@ -29,15 +29,15 @@
     "commands": [
       {
         "id": "rotator.next",
-        "title": "Auto Hand-off: Switch Claude to the next account"
+        "title": "Auto Hand-off: Start new Claude sessions on the next account"
       },
       {
         "id": "rotator.nextCodex",
-        "title": "Auto Hand-off: Switch Codex to the next account"
+        "title": "Auto Hand-off: Start new Codex sessions on the next account"
       },
       {
         "id": "rotator.swapThisPane",
-        "title": "Auto Hand-off: Move this workspace's agent to another account"
+        "title": "Auto Hand-off: Hand off this workspace's session to another account"
       },
       {
         "id": "rotator.togglePause",
@@ -70,88 +70,63 @@
         "onError": "pass"
       }
     ],
-    "statusBarItems": [
-      {
-        "id": "seat",
-        "text": "Auto Hand-off",
-        "icon": "gauge",
-        "tooltip": "Auto Hand-off",
-        "command": "rotator.next"
-      }
-    ],
     "settings": [
       {
         "key": "service_claude",
-        "title": "Auto hand-off Claude accounts",
+        "title": "Automatic hand-off: Claude",
         "type": "boolean",
         "default": true,
-        "description": "Off: Claude panes are never switched or resumed automatically (manual switching still works)."
+        "description": "Off: Claude sessions are never handed off or resumed automatically (Hand off to this account still works)."
       },
       {
         "key": "service_codex",
-        "title": "Auto hand-off Codex accounts",
+        "title": "Automatic hand-off: Codex",
         "type": "boolean",
         "default": true,
-        "description": "Off: Codex panes are never switched or resumed automatically (manual switching still works)."
+        "description": "Off: Codex sessions are never handed off or resumed automatically (Hand off to this account still works)."
       },
       {
         "key": "service_antigravity",
-        "title": "Auto hand-off Antigravity accounts",
+        "title": "Automatic hand-off: Antigravity",
         "type": "boolean",
         "default": true,
-        "description": "Off: Antigravity panes are never switched or resumed automatically (manual switching still works)."
+        "description": "Off: Antigravity sessions are never handed off or resumed automatically (Hand off to this account still works)."
       },
       {
         "key": "service_opencode",
-        "title": "Auto hand-off OpenCode accounts",
+        "title": "Automatic hand-off: OpenCode",
         "type": "boolean",
         "default": true,
-        "description": "Off: OpenCode panes are never switched or resumed automatically (manual switching still works)."
+        "description": "Off: OpenCode sessions are never handed off or resumed automatically (Hand off to this account still works)."
       },
       {
         "key": "service_devin",
-        "title": "Auto hand-off Devin accounts",
+        "title": "Automatic hand-off: Devin",
         "type": "boolean",
         "default": true,
-        "description": "Off: Devin panes are never switched or resumed automatically (manual switching still works)."
+        "description": "Off: Devin sessions are never handed off or resumed automatically (Hand off to this account still works)."
       },
       {
-        "key": "mode",
-        "title": "Auto-switch",
+        "key": "pick",
+        "title": "Pick the next account",
         "type": "string",
-        "default": "auto",
+        "default": "smart",
         "enum": [
-          "auto",
           "smart",
-          "my-order",
-          "manual",
-          "custom"
+          "my-order"
         ],
-        "description": "smart (recommended): looks ahead. It leaves an account shortly before it runs out, picks the next one by how long it will last, and uses weekly quota that is about to expire first. my-order: follows your account order (Account order below) and goes back to an earlier account when it is free again. manual: never switches by itself. custom: uses the Advanced settings below exactly as they are set. auto (default): smart, unless you had changed the Advanced settings in an earlier version; those are then kept (an account order gives my-order, strategy manual gives manual, anything else custom)."
+        "description": "Which account a session is handed off to. smart (Auto, default): Picks the account with the most room, judged by how fast each one is being used. my-order (Custom order): Your ranking, set with the arrows in the Accounts tab. Goes back to a higher account once it is free again."
       },
       {
-        "key": "switch_early",
-        "title": "Switch early",
+        "key": "timing",
+        "title": "When to hand off",
         "type": "string",
-        "default": "just-before",
+        "default": "early",
         "enum": [
-          "just-before",
-          "earlier",
+          "early",
           "at-limit"
         ],
-        "description": "When to leave an account that is running out. just-before: about 10 minutes before the limit at the current pace (or at 97 % of the 5-hour window, 99 % of the week, when the pace is unknown). earlier: about 25 minutes before (or at 90 % and 97 %). at-limit: only when the limit is reached. Not used when Auto-switch is custom."
-      },
-      {
-        "key": "running_sessions",
-        "title": "Running sessions",
-        "type": "string",
-        "default": "move",
-        "enum": [
-          "move",
-          "limit",
-          "launches"
-        ],
-        "description": "move: a session moves to another account between turns or when it sits idle, never in the middle of a turn and never with unsent text in its input box. limit: a session moves only when it hits a limit. launches: running sessions are never moved; only new sessions start on another account. Not used when Auto-switch is custom."
+        "description": "When sessions are handed off to another account. early (Early when away, default): Once you have been away a while, Claude sessions hand off shortly before an account runs out, so work does not stop at a limit. While you are using Orca, sessions hand off only at a limit. Other services always hand off only at a limit. at-limit (At limit): A session hands off only when it hits a limit. Each account is used to the end."
       },
       {
         "key": "when_all_used",
@@ -162,202 +137,153 @@
           "wait",
           "stop"
         ],
-        "description": "wait: the session waits for the first account to reset and then resumes by itself. stop: the session stops and you are told. Not used when Auto-switch is custom."
+        "description": "When no account of the service has room. wait (Wait and resume, default): The session waits for the first account to reset, then continues by itself. stop (Stop): The session stops and you are told."
       },
       {
-        "key": "chain",
-        "title": "Account order",
+        "key": "active_terminal",
+        "title": "Session on screen",
         "type": "string",
-        "default": "",
-        "description": "Your own order of accounts within each service, comma-separated: emails, seat keys (claude:<id>, codex:system) or provider:*. Example: me@example.com, claude:*. Empty = Orca's order. Switching never leaves the agent's own service."
-      },
-      {
-        "key": "exclude",
-        "title": "Never switch to",
-        "type": "string",
-        "default": "",
-        "description": "Comma-separated accounts that automatic hand-off never picks (emails, seat keys, or provider:*). Picking them from the panel still works."
-      },
-      {
-        "key": "auto_message",
-        "title": "First message after a switch",
-        "type": "string",
-        "default": "Continue.",
-        "description": "Typed after a move that a limit or API error caused, or when a waiting session wakes; not after an early, idle or manual move. Empty = resume silently."
-      },
-      {
-        "key": "retry_on_api_error",
-        "title": "Retry on API errors",
-        "type": "boolean",
-        "default": true,
-        "description": "Types the first message again after a Fibonacci backoff (5 s … 120 s)."
-      },
-      {
-        "key": "max_api_retries",
-        "title": "Maximum API error retries",
-        "type": "integer",
-        "default": 6,
-        "minimum": 0,
-        "maximum": 50
-      },
-      {
-        "key": "model_fallback",
-        "title": "Model fallback",
-        "type": "string",
-        "default": "",
-        "description": "Models to try on the same account when one model's limit is hit, e.g. claude=sonnet,haiku; codex=gpt-5-mini"
-      },
-      {
-        "key": "default_cooldown_minutes",
-        "title": "Default cooldown (minutes)",
-        "type": "integer",
-        "default": 60,
-        "minimum": 1,
-        "maximum": 10080,
-        "description": "Used when neither the message nor Orca says when a limit resets."
-      },
-      {
-        "key": "poll_interval_seconds",
-        "title": "Read usage from Orca every (seconds)",
-        "type": "integer",
-        "default": 60,
-        "minimum": 15,
-        "maximum": 3600,
-        "description": "How often the plugin reads Orca's usage numbers (15–3600). Orca itself refreshes the account in use about every 5 minutes while its window is open, and accounts not in use only when its usage view opens or right after an account switch, so a shorter period only picks those up sooner."
-      },
-      {
-        "key": "usage_cache_max_age_hours",
-        "title": "Remember usage of accounts not in use for (hours)",
-        "type": "integer",
-        "default": 168,
-        "minimum": 0,
-        "maximum": 720,
-        "description": "When Orca has no current numbers for an account, the plugin uses its last reading, shown with its age; windows whose reset time has passed count as reset. 0 = only Orca's current numbers."
-      },
-      {
-        "key": "handoff_max_chars",
-        "title": "Handoff prompt size limit",
-        "type": "integer",
-        "default": 6000,
-        "minimum": 500,
-        "maximum": 50000
-      },
-      {
-        "key": "orca_cli_path",
-        "title": "Orca CLI path",
-        "type": "string",
-        "default": "",
-        "description": "Empty = detect (ORCA_CLI_COMMAND, the app bundle, then orca)."
-      },
-      {
-        "key": "console_statusline_format",
-        "title": "Console status line header",
-        "type": "string",
-        "default": "",
-        "description": "Optional line above the account rows of the console status line; empty = rows only. Placeholders: {model}, {ctxbar} context-left gauge, {ctx} context left %, {5h} and {7d} this pane's % left, {reset} time until the 5-hour window resets, {best} the best-model window's name. Example: {model} │ ctx {ctxbar} │ 5h reset {reset} │ best={best}"
-      },
-      {
-        "key": "console_statusline_bar_width",
-        "title": "Console status line bar width",
-        "type": "integer",
-        "default": 8,
-        "minimum": 4,
-        "maximum": 30,
-        "description": "Cells per gauge. 8 keeps a row with three gauges and a cooldown inside 80 columns."
-      },
-      {
-        "key": "strategy",
-        "title": "Advanced: Strategy",
-        "type": "string",
-        "default": "drain",
+        "default": "ask",
         "enum": [
-          "drain",
-          "balanced",
-          "priority",
-          "soonest-reset",
-          "manual"
+          "ask",
+          "careful",
+          "wait",
+          "now"
         ],
-        "description": "Only used when Auto-switch is custom. drain: stay on an account until it is limited, then take the next in chain order. balanced: the account with the most room. priority: always the first healthy account in the chain. soonest-reset: the account whose weekly window resets first, so expiring usage is spent first. manual: never switch automatically."
+        "description": "The session in the tab Orca is showing. You may be reading or typing in it, so it gets extra care. ask (Ask me first, default): Never handed off early. At a limit the Auto Hand-off panel asks whether to hand it off now. If you do not answer, it waits while you are using Orca, then counts down. Not now: it waits until you switch tabs. careful (Wait, then count down): Never handed off early. At a limit it waits while you are using Orca, then hands off after a short countdown that you can cancel. wait (Wait for me): Stays until you switch to another tab or press Hand off now. now (Move right away): No waiting: it hands off as soon as it is between turns, early hand-offs included, like sessions in other tabs."
       },
       {
-        "key": "switch_back",
-        "title": "Advanced: Switch back when a higher-priority account resets",
-        "type": "boolean",
-        "default": true,
-        "description": "Only used when Auto-switch is custom. drain and priority only: once an account earlier in the chain is healthy again, new launches use it and sessions on lower accounts move back when they finish a turn (or sit idle, see below)."
+        "key": "away_minutes",
+        "title": "Advanced: Start early hand-offs after you've been away",
+        "type": "number",
+        "default": 10,
+        "description": "Early hand-offs start only once there has been no sign of you this long (sending or answering a prompt, typing in a waiting session, switching tabs, using the Auto Hand-off panel or one of its commands). 0 = always, even while you are here. 0 to 240 min."
+      },
+      {
+        "key": "early_minutes",
+        "title": "Advanced: Hand off this long before running out",
+        "type": "number",
+        "default": 10,
+        "description": "Hand off when an account would run out within this many minutes at its current pace. 1 to 120 min."
+      },
+      {
+        "key": "early_percent_left",
+        "title": "Advanced: Always hand off below (% left)",
+        "type": "number",
+        "default": 1,
+        "description": "Also hand off when less than this much of the 5-hour window is left, however slowly it is being used. 1 % by default: an account at 99 % is left whatever its pace, since one big turn could use the rest. 0 = by pace only. 0 to 50 %."
+      },
+      {
+        "key": "idle_minutes",
+        "title": "Advanced: Hand off idle sessions after",
+        "type": "number",
+        "default": 15,
+        "description": "A session idle this long is handed off from an account that is about to run out, or to an account whose weekly quota would expire unused. 0 = never: idle sessions stay, and expiring quota is spent only by new sessions. 0 to 1440 min."
       },
       {
         "key": "switch_cooldown_minutes",
-        "title": "Advanced: Minimum minutes between automatic selection changes",
-        "type": "integer",
+        "title": "Advanced: Minimum time between early hand-offs",
+        "type": "number",
         "default": 5,
-        "minimum": 0,
-        "maximum": 1440,
-        "description": "Only used when Auto-switch is custom (otherwise 5). Applies to threshold, switch-back and idle moves, so two accounts near the line never ping-pong. Rate limits and auth failures ignore it."
+        "description": "Early hand-offs never change the account more often than this. A limit always hands off. 0 to 240 min."
       },
       {
-        "key": "min_headroom_gap",
-        "title": "Advanced: Minimum headroom gap for a threshold move (%)",
-        "type": "integer",
+        "key": "active_countdown_seconds",
+        "title": "Advanced: Countdown for the session on screen",
+        "type": "number",
+        "default": 60,
+        "description": "How long the countdown lasts before the session on screen hands off anyway. 10 to 3600 s."
+      },
+      {
+        "key": "active_presence_seconds",
+        "title": "Advanced: Keep the session on screen waiting after your last activity",
+        "type": "number",
+        "default": 300,
+        "description": "You count as using Orca for this long after your last activity (sending or answering a prompt, typing in a waiting session, switching tabs, using the Auto Hand-off panel or one of its commands). 10 to 3600 s."
+      },
+      {
+        "key": "active_reminder_minutes",
+        "title": "Advanced: Remind me when the session on screen has waited",
+        "type": "number",
         "default": 10,
-        "minimum": 0,
-        "maximum": 100,
-        "description": "Only used when Auto-switch is custom (otherwise 10). A threshold move needs a target with at least this many points more room than the current account (when both are known). An exhausted account may always leave."
+        "description": "One reminder when the session on screen has waited this long to hand off. 0 = none. 0 to 1440 min."
       },
       {
-        "key": "auto_swap_idle_after_seconds",
-        "title": "Advanced: Move idle sessions after (seconds)",
-        "type": "integer",
-        "default": 900,
-        "minimum": 0,
-        "maximum": 86400,
-        "description": "Only used when Auto-switch is custom (otherwise 900, see Running sessions). A session idle this long on an over-threshold account, or on a lower account while a higher-priority one is healthy, is moved. 0 = off. Sessions with unsent text in the input box are left alone."
-      },
-      {
-        "key": "auto_switch_on_rate_limit",
-        "title": "Advanced: Switch on rate limit",
+        "key": "restore_unsent_text",
+        "title": "Advanced: Put unsent text back after a hand-off",
         "type": "boolean",
         "default": true,
-        "description": "Only used when Auto-switch is custom."
+        "description": "Claude: text typed and not sent goes back, unsent, into the session after a hand-off. Off, and for other services: the session waits until the text is sent or cleared. Pasted images or blocks, queued messages, and text over 4,000 characters always wait."
       },
       {
-        "key": "auto_switch_on_threshold",
-        "title": "Advanced: Switch at usage threshold",
-        "type": "boolean",
-        "default": true,
-        "description": "Only used when Auto-switch is custom (see Running sessions). Checked when an agent finishes a turn."
+        "key": "auto_message",
+        "title": "Advanced: First message after a limit",
+        "type": "string",
+        "default": "Continue.",
+        "description": "Typed into a session whose work was interrupted (a limit or an API error) once it continues, and when a waiting session wakes. Empty = none after a hand-off; an API error retry then types “continue”."
       },
       {
-        "key": "thresholds_five_hour",
-        "title": "Advanced: 5-hour threshold (%)",
-        "type": "integer",
-        "default": 100,
-        "minimum": 1,
-        "maximum": 100,
-        "description": "Only used when Auto-switch is custom; with Auto-switch on auto, a value below 100 is kept as a hard cap and selects Switch early: earlier. 100 = only when exhausted."
+        "key": "max_api_retries",
+        "title": "Advanced: API error retries",
+        "type": "number",
+        "default": 6,
+        "description": "Retry a turn that failed with a passing API error (overloaded, 5xx) at most this many times in a row, with growing pauses. 0 = never retry. 0 to 50."
       },
       {
-        "key": "thresholds_seven_day",
-        "title": "Advanced: Weekly threshold (%)",
-        "type": "integer",
-        "default": 100,
-        "minimum": 1,
-        "maximum": 100,
-        "description": "Only used when Auto-switch is custom; with Auto-switch on auto, a value below 100 is kept as a hard cap."
+        "key": "model_fallback",
+        "title": "Advanced: Model fallback",
+        "type": "string",
+        "default": "",
+        "description": "At a model limit, when no other account is known to have room for that model, try these models on the same account before handing off. Per service, separated by semicolons."
       },
       {
-        "key": "auto_resume",
-        "title": "Advanced: Resume the session after a switch",
-        "type": "boolean",
-        "default": true,
-        "description": "Only used when Auto-switch is custom (see Running sessions)."
+        "key": "default_cooldown_minutes",
+        "title": "Advanced: Cooldown when a limit gives no reset time",
+        "type": "number",
+        "default": 60,
+        "description": "How long an account is set aside when its limit message gives no reset time. 1 to 1440 min."
       },
       {
-        "key": "wait_for_reset",
-        "title": "Advanced: Wait for reset when every account is exhausted",
-        "type": "boolean",
-        "default": true,
-        "description": "Only used when Auto-switch is custom (see When everything is used up)."
+        "key": "poll_interval_seconds",
+        "title": "Advanced: Read usage every",
+        "type": "number",
+        "default": 60,
+        "description": "How often usage is read from Orca. 15 to 3600 s."
+      },
+      {
+        "key": "handoff_max_chars",
+        "title": "Advanced: Hand-off summary size",
+        "type": "number",
+        "default": 6000,
+        "description": "Services that cannot resume (Codex, Antigravity, OpenCode, Devin) start the new session with a summary this long at most. Orca takes at most 4,096 characters, so a larger value changes nothing. 500 to 50000 chars."
+      },
+      {
+        "key": "orca_cli_path",
+        "title": "Advanced: Orca CLI path",
+        "type": "string",
+        "default": "",
+        "description": "Only if the orca command is not found by itself."
+      },
+      {
+        "key": "console_statusline_format",
+        "title": "Status line header",
+        "type": "string",
+        "default": "",
+        "description": "An optional first line of the Claude status line. Empty = account rows only. In the panel: under the Claude Status line switch."
+      },
+      {
+        "key": "exclude",
+        "title": "Advanced: Skipped accounts",
+        "type": "string",
+        "default": "",
+        "description": "Accounts never chosen automatically, separated by commas: an account (work@example.com), or one of a service (claude:work@example.com). In the panel: the Skip switch on each account card."
+      },
+      {
+        "key": "chain",
+        "title": "Advanced: Custom order",
+        "type": "string",
+        "default": "",
+        "description": "Set with the arrows in the panel when Pick the next account is Custom order (Auto ignores it): accounts, as the panel writes them (claude:<account id>) or by email (work@example.com, claude:work@example.com), or every account of a service (claude:*), separated by commas."
       }
     ]
   },

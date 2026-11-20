@@ -94,12 +94,14 @@ export function assess(
   if (s !== undefined) left.s = s
   if (w !== undefined) left.w = w
   if (m !== undefined) left.m = m
-  const over =
-    (!!session && session.usedPercent >= Math.min(config.thresholdFiveHour, 100)) ||
-    (!!weekly && weekly.usedPercent >= Math.min(config.thresholdSevenDay, 100))
+  const over = (!!session && session.usedPercent >= 100) || (!!weekly && weekly.usedPercent >= 100)
   if (cooling || over) return { ...base, state: 'out', over }
   const horizon = horizonMs(config)
   if (horizon > 0 && runway && runway.ms < horizon) return { ...base, state: 'low', over, low: { window: runway.win, by: 'pace' } }
+  // "Also hand off below this much left": the 5-hour window's level, whatever the pace.
+  if (session && config.floorFiveHour < 100 && session.usedPercent >= config.floorFiveHour) {
+    return { ...base, state: 'low', over, low: { window: 's', by: 'level' } }
+  }
   // No pace for a window: its level alone decides. So it does when the readings are too old to
   // forecast with (no runway from them), whatever pace the last half hour still shows.
   const latest = samples[samples.length - 1]
@@ -324,10 +326,10 @@ export function explain(
 ): string {
   const source = from?.label ?? 'the current account'
   const fromLevels = from ? ` (${levels(from, now)})` : ''
-  const arrived = `${options.selectionOnly ? 'new launches use' : 'moved to'} ${to.label} (${levels(to, now)})`
+  const arrived = `${options.selectionOnly ? 'new sessions start on' : 'handed off to'} ${to.label} (${levels(to, now)})`
   const idle = options.idle ? 'idle session; ' : ''
   if (kind === 'expiring') {
-    const tail = options.selectionOnly ? 'new launches use it' : `moved there from ${source}`
+    const tail = options.selectionOnly ? 'new sessions start on it' : `handed off there from ${source}`
     return `${idle}${to.label} has weekly quota that would expire unused (${levels(to, now)}); ${tail}`
   }
   if (kind === 'out') {

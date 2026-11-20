@@ -176,11 +176,6 @@ summary{cursor:pointer;color:var(--accent);font-weight:600}
 .check li::before{content:"";position:absolute;left:0;top:4px;width:18px;height:18px;border-radius:50%;background:var(--accent-soft);background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 8.5l2.5 2.5L12 5.5' fill='none' stroke='%2322c1b4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");background-size:12px;background-position:center;background-repeat:no-repeat}
 .check li b{color:var(--fg)}
 
-/* status bar mock */
-.sb{display:inline-flex;align-items:center;gap:8px;background:var(--bg-2);border:1px solid var(--line);border-radius:8px;padding:6px 12px;font-family:var(--mono);font-size:.82rem;margin-top:10px;max-width:100%;overflow-x:auto}
-.sb .gauge{width:14px;height:14px;color:var(--fg-2);flex:none}
-.sb .w{color:var(--warn)}
-
 /* install */
 .install ol{padding-left:0;list-style:none;counter-reset:i;display:grid;gap:18px;margin:0}
 .install ol>li{display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;align-items:start;min-width:0}
@@ -206,7 +201,7 @@ footer a{color:var(--fg-2)}
     <ul>
       <li><a href="#how">How it works</a></li>
       <li><a href="#triggers">Triggers</a></li>
-      <li><a href="#strategies">Strategies</a></li>
+      <li><a href="#strategies">How it decides</a></li>
       <li><a href="#ui">In the app</a></li>
       <li><a href="#settings">Settings</a></li>
       <li><a href="#install">Install</a></li>
@@ -228,13 +223,13 @@ footer a{color:var(--fg-2)}
     <div>
       <div class="eyebrow">For Orca · Claude, Codex, Antigravity, OpenCode, Devin</div>
       <h1>Hit a rate limit? <span>Auto-switch to your next account.</span></h1>
-      <p class="lede">Automatic account switching for Orca. Claude to Claude, Codex to Codex: a session always keeps its provider. Auto Hand-off runs the accounts Orca manages as one pool per service. When an agent pane prints a limit, the plugin cools that account down and selects the next healthy one. A Claude session is resumed there as the same session, with its context and the first message already typed. Codex, Antigravity, OpenCode and Devin cannot resume a session on another account: they start a new session there from a summary of the old one.</p>
+      <p class="lede">Automatic account switching for Orca. Claude to Claude, Codex to Codex: a session always keeps its provider. Auto Hand-off runs the accounts Orca manages as one pool per service. When a session hits a limit, the plugin cools that account down and hands the session off to the next account with room. A Claude session is resumed there as the same session, with its context and the first message already typed. Codex, Antigravity, OpenCode and Devin cannot resume a session on another account: they start a new session there from a summary of the old one.</p>
       <div class="badges">
-        <span class="badge">v<b>0.2.1</b></span>
+        <span class="badge">v<b>0.3.0</b></span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
         <span class="badge"><b>MIT</b> license</span>
-        <span class="badge"><b>270</b> tests, real captured banners</span>
-        <span class="badge">Never switches <b>across services</b></span>
+        <span class="badge"><b>395</b> tests, real captured banners</span>
+        <span class="badge">Never hands off <b>across services</b></span>
       </div>
       <div class="cta">
         <a class="btn primary" href="#install">Install</a>
@@ -244,13 +239,13 @@ footer a{color:var(--fg-2)}
     </div>
 
     <div class="panel" aria-label="The Auto Hand-off panel">
-      <div class="ph">Auto Hand-off <span>⟳ Refresh</span></div>
+      <div class="ph">Auto Hand-off <span>◐ Auto · Early when away · waiting</span></div>
       <div class="row"><span>Automatic hand-off</span><span class="toggle"></span></div>
-      <div class="tabs"><b>Accounts</b><span>History (13)</span></div>
+      <div class="tabs"><b>Accounts</b><span>History (13)</span><span>Settings</span></div>
       <div class="card">
-        <h4>claude</h4>
-        <div class="sub">3 account(s)</div>
-        <div class="row"><span>Auto hand-off claude accounts</span><span class="toggle"></span></div>
+        <h4>claude · on screen</h4>
+        <div class="row"><span>Automatic hand-off</span><span class="toggle"></span></div>
+        <div class="sub">2 of 3 ready · 1 limited</div>
         <div class="acct">
           <div class="row"><span>you@example.com</span><span class="pill on">active</span></div>
           <div class="meter">5h 25%</div><div class="bar"><i style="width:25%"></i></div>
@@ -265,14 +260,14 @@ footer a{color:var(--fg-2)}
         </div>
         <div class="acct">
           <div class="row"><span>third@example.com</span></div>
-          <div class="muted">Usage unknown until this account runs.</div>
+          <div class="muted">No usage yet: Orca reports it once this account runs.</div>
           <span class="ghost">Hand off to this account</span>
         </div>
       </div>
       <div class="card">
         <h4>codex</h4>
-        <div class="sub">2 account(s)</div>
-        <div class="row"><span>Auto hand-off codex accounts</span><span class="toggle"></span></div>
+        <div class="row"><span>Automatic hand-off</span><span class="toggle"></span></div>
+        <div class="sub">2 of 2 ready</div>
         <div class="acct">
           <div class="row"><span>you@example.com</span><span class="pill on">active</span></div>
           <div class="meter">5h 84%</div><div class="bar"><i class="w" style="width:84%"></i></div>
@@ -287,16 +282,16 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <div class="sec-head">
       <div class="eyebrow">How it works</div>
-      <h2>Six steps, one swap, no cascade</h2>
+      <h2>Six steps, one hand-off, no cascade</h2>
       <p class="lede">Detection runs when a pane turns <code>done</code> or <code>waiting</code>. A limit banner among the last five meaningful lines, shaped like a CLI status line and not an agent reply, starts the sequence.</p>
     </div>
     <div class="steps">
-      <div class="step"><h3>Cool down</h3><p>The limited account is parked until the reset time parsed from the banner, else Orca's <code>resetsAt</code>, else the default cooldown.</p></div>
-      <div class="step"><h3>Pick the next</h3><p>The strategy chooses another healthy account of the same service from your chain.</p></div>
-      <div class="step"><h3>Select</h3><p>Runs <code>orca account select</code>, so new launches use the new account too.</p></div>
-      <div class="step"><h3>Close</h3><p>Closes the limited pane, through the host API or the Orca CLI when the pane is in another workspace.</p></div>
-      <div class="step"><h3>Resume</h3><p>Calls <code>agent.resume</code> on the same session id. Services that cannot resume (Codex, Antigravity, OpenCode, Devin) start a new session from a summary instead, and only at a real limit.</p></div>
-      <div class="step"><h3>First message</h3><p>Types the configured message, "Continue." by default, and the agent carries on. Only where a limit or API error interrupted the work: a session that had finished its turn and was moved early is resumed and left ready.</p></div>
+      <div class="step"><h3>Cool down</h3><p>The limited account is set aside until the reset time parsed from the banner, else Orca's <code>resetsAt</code>, else the default cooldown.</p></div>
+      <div class="step"><h3>Pick the next</h3><p>Auto takes the account of the same service that will last longest at its pace; Custom order takes the highest account in your order that has room.</p></div>
+      <div class="step"><h3>Select</h3><p>Runs <code>orca account select</code>, so new sessions use the new account too.</p></div>
+      <div class="step"><h3>Close</h3><p>Reads the input box twice, a second apart, and once more right before closing the pane, through the host API or the Orca CLI when the pane is in another workspace. Typing in progress calls the hand-off off. If the hand-off fails before the pane is closed, the next account is tried, up to three times.</p></div>
+      <div class="step"><h3>Resume</h3><p>Calls <code>agent.resume</code> on the same session id. Services that cannot resume (Codex, Antigravity, OpenCode, Devin) start a new session from a summary instead (at most 4,096 characters), and only at a real limit.</p></div>
+      <div class="step"><h3>First message</h3><p>Types the configured message, "Continue." by default, and the agent carries on. Only where a limit or API error interrupted the work: a session that had finished its turn and was handed off early is resumed and left ready. Plain text you had typed and not sent is put back, unsent (Claude).</p></div>
     </div>
 
     <div class="trace">
@@ -313,7 +308,7 @@ footer a{color:var(--fg-2)}
         <div><span class="k">close   </span>  pane 3</div>
         <div><span class="k">resume  </span>  agent.resume 7f3a… <span class="dim">on work@example.com</span></div>
         <div><span class="k">send    </span>  "Continue."</div>
-        <div><span class="g">✓</span> one swap, same session, same workspace</div>
+        <div><span class="g">✓</span> one hand-off, same session, same workspace</div>
       </div>
     </div>
   </div>
@@ -323,30 +318,31 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <div class="sec-head">
       <div class="eyebrow">Triggers</div>
-      <h2>Every reason a pane moves, and what happens</h2>
-      <p class="lede">Each banner is handled once per session, so a transcript Orca redraws after a restore is never switched twice. Usage numbers come from Orca's own <code>orca account list</code>. The plugin never reads tokens or keychains.</p>
+      <h2>Every reason a session hands off, and what happens</h2>
+      <p class="lede">Each banner is handled once per session, so a transcript Orca redraws after a restore is never handed off twice. Usage numbers come from Orca's own <code>orca account list</code>. The plugin never reads tokens or keychains.</p>
     </div>
     <div class="tscroll">
     <table class="tbl">
       <thead><tr><th>Trigger</th><th>Action</th></tr></thead>
       <tbody>
-        <tr><td>Rate-limit banner in the pane's latest output</td><td>Cool the account down until the parsed reset time, switch, resume.</td></tr>
-        <tr><td>Model-specific cap (for example a Claude Fable weekly cap)</td><td>Smart and Follow my order: move to an account known to have room for that model, then type <code>/model &lt;next&gt;</code> from <em>Model fallback</em> in place, then try an account not known to be full for that model, then wait. Custom: <code>/model &lt;next&gt;</code> first, and switch accounts only when the list runs out. <code>/model</code> is never typed into a pane whose input box holds unsent text.</td></tr>
-        <tr><td>API error (529, overloaded, stream disconnected)</td><td>Type the first message again after a Fibonacci backoff from 5 s to 120 s, up to the retry limit. Only while the pane is still between turns, and never into an input box that holds unsent text.</td></tr>
-        <tr><td>Auth failure</td><td>12-hour cooldown on that account, then switch.</td></tr>
-        <tr><td>A turn ends while the account is over a threshold (Claude sessions)</td><td>Switch. The account left behind stays out of rotation until its window resets. Smart, the default, also leaves an account shortly before it runs out (about 10 minutes ahead at the current pace), between turns or when the session is idle. In custom mode thresholds default to 100 %, so this is reactive only.</td></tr>
-        <tr><td>Every account of the service limited</td><td>Park the session and wake it when the earliest account frees up. Carry on in the parked pane yourself and the wait ends. Close it yourself and the session is not resumed.</td></tr>
-        <tr><td>A higher-priority account is healthy again</td><td><b>Switch back.</b> New launches use it, and Claude sessions on lower accounts move back when they finish a turn or sit idle; they are resumed and left ready, without the first message.</td></tr>
-        <tr><td>A Claude session idles on an over-threshold account</td><td>Move it after <em>Move idle sessions after</em> seconds, 900 by default.</td></tr>
+        <tr><td>Rate-limit banner in the session's latest output</td><td>Cool the account down until the parsed reset time, hand off, resume.</td></tr>
+        <tr><td>Model-specific cap (for example a Claude Fable weekly cap)</td><td>Hand off to an account known to have room for that model, then type <code>/model &lt;next&gt;</code> from <em>Model fallback</em> in place, then try an account not known to be full for that model, then wait. <code>/model</code> is never typed into a pane whose input box holds unsent text.</td></tr>
+        <tr><td>API error (529, overloaded, stream disconnected)</td><td>Type the first message again after a Fibonacci backoff from 5 s to 120 s, up to <em>API error retries</em> (0 = never). Only while the pane is still between turns, and never into an input box that holds unsent text.</td></tr>
+        <tr><td>Sign-in failure</td><td>12-hour cooldown on that account, then hand off.</td></tr>
+        <tr><td>A turn ends while the account is about to run out (<em>Early when away</em>, once you have been away 10 minutes; Claude sessions)</td><td>Hand off, when the account would run out within 10 minutes at its current pace, or has less than 1 % of its 5-hour window left (97 % of the 5-hour or 99 % of the weekly window while the pace is unknown). The account left behind stays out of rotation until its window resets. While you are at Orca, and with <em>At limit</em>, this never happens: a session hands off only at a real limit.</td></tr>
+        <tr><td>A limit hits the session on screen</td><td><em>Ask me first</em> (default): you are notified and the panel asks "Hand off the session on screen?" with <em>Hand off now</em> or <em>Not now</em>; no answer acts like the next choice, <em>Not now</em> waits for another tab. <em>Wait, then count down</em>: wait while you are using Orca; otherwise a 60-second countdown with a notification. <em>Wait for me</em>: hand off once you switch tabs. <em>Move right away</em>: no waiting. A waiting session also offers <em>Hand off now</em> (which says why when it cannot), <em>Not now</em> and <em>Don't hand off</em>.</td></tr>
+        <tr><td>Every account of the service limited</td><td><em>Wait and resume</em>: the session waits and continues when the earliest account frees up; if its own account frees up first, it continues where it is. Carry on in the waiting pane yourself and the wait ends. Close it yourself and the session is not resumed. <em>Stop</em>: the session stops and you are told, also one waiting on screen.</td></tr>
+        <tr><td>A higher account in your order is healthy again (<em>Custom order</em>)</td><td><b>Switch back.</b> New sessions use it, and with <em>Early when away</em>, once you are away, Claude sessions on lower accounts hand off back when they finish a turn or sit idle; they are resumed and left ready, without the first message.</td></tr>
+        <tr><td>A Claude session idles on an account that is about to run out, or another account's weekly quota would expire unused (<em>Early when away</em>, you away)</td><td>Hand it off after <em>Hand off idle sessions after</em>, 15 minutes by default.</td></tr>
         <tr><td><code>orca account select</code> fails for an account</td><td>Skip that account for 10 minutes and take the next.</td></tr>
       </tbody>
     </table>
     </div>
 
     <div class="grid g3" style="margin-top:28px">
-      <div class="tile"><h3>Guards on moves</h3><p>No automatic move closes a pane holding unsent text. At a hard limit, or when a parked session is due, you are told once and the move is carried out as soon as the text is sent or cleared. Threshold, idle and switch-back moves also need at least a 10 % headroom gap, and change a service's selection at most once per 5 minutes; hard limits ignore those two. Claude's grey prompt suggestion is reported like typed text, so it can still hold back an automatic early move; the panel's manual switch asks instead.</p></div>
+      <div class="tile"><h3>Guards on hand-offs</h3><p>Plain text you typed and did not send goes with a Claude session and is put back unsent; if it cannot be put back, the notification quotes its first 300 characters and History keeps all of it to copy. Pasted images or blocks, text over 4,000 characters, text with escape sequences, queued messages, and unsent text in Codex, Antigravity, OpenCode or Devin keep the session where it is until you send or clear it. The session on screen is never handed off early. Early, idle and switch-back hand-offs also need at least 10 % more room on the target, and change a service's selection at most once per 5 minutes; hard limits ignore those two. Claude's grey prompt suggestion is reported like typed text, so it may come back as real text, never sent without Enter.</p></div>
       <div class="tile"><h3>Panes it did not start</h3><p>A restored pane has no recorded account. If it hits a limit while Orca shows plenty of room on the active account, the plugin cools nothing and simply resumes the session there.</p></div>
-      <div class="tile"><h3>Off switches</h3><p>Detection is heuristic. One toggle pauses every service, each service has its own switch, and <code>exclude</code> keeps named accounts out of automatic rotation.</p></div>
+      <div class="tile"><h3>Off switches</h3><p>Detection is heuristic. One switch pauses every service, each service has its own <em>Automatic hand-off</em> switch, and the <em>Skip</em> switch on an account card keeps that account out of automatic rotation. There is no manual or custom mode: these switches are it. While Orca cannot give the plugin your settings, or the upgrade from 0.2 is not finished, nothing is handed off automatically and the panel says so.</p></div>
     </div>
   </div>
 </section>
@@ -354,18 +350,19 @@ footer a{color:var(--fg-2)}
 <section id="strategies">
   <div class="wrap">
     <div class="sec-head">
-      <div class="eyebrow">Strategies</div>
-      <h2>Choose how the pool is spent</h2>
-      <p class="lede">Out of the box the plugin runs in <b style="color:var(--fg)">Smart</b> mode (<em>Auto-switch</em>): it looks ahead, leaves an account shortly before it runs out, and picks the next one by how long it will last. <em>Follow my order</em> follows your account order instead. The strategies below are the <em>Advanced</em> settings, used when <em>Auto-switch</em> is <code>custom</code> (kept automatically for settings changed in an earlier version). The <code>chain</code> setting orders accounts within each service, by email or seat key. Example: <code>me@example.com, claude:*</code>. Empty means Orca's order.</p>
+      <div class="eyebrow">How it decides</div>
+      <h2>Four choices, sensible defaults</h2>
+      <p class="lede">Out of the box the plugin runs <b style="color:var(--fg)">Auto · Early when away</b> and picks the next account by how long it will last. While you are using Orca (and right after it starts) a session hands off only at a real limit, so it is seldom moved under you; once you have been away for 10 minutes, Claude sessions hand off shortly before an account runs out, so work does not stop at a limit. You count as here while you send or answer a prompt in the session on screen, type in a waiting session, switch tabs, use the panel or run one of its commands. Four basic settings in the panel's Settings tab change what runs: <em>Pick the next account</em>, <em>When to hand off</em>, <em>When everything is used up</em> and <em>Session on screen</em>. The rest is folded away under <em>Advanced</em>.</p>
     </div>
     <div class="grid g5">
-      <div class="tile"><h3>drain</h3><p>Stay on an account until it is limited, then take the next in chain order.</p></div>
-      <div class="tile"><h3>balanced</h3><p>Always the account with the most room.</p></div>
-      <div class="tile"><h3>priority</h3><p>Always the first healthy account in the chain.</p></div>
-      <div class="tile"><h3>soonest-reset</h3><p>The account whose weekly window resets first, so expiring usage is spent before it is lost.</p></div>
-      <div class="tile"><h3>manual</h3><p>Never switch automatically. The panel and commands still work.</p></div>
+      <div class="tile"><h3>Auto</h3><p>The default. The account with the most room, judged by how fast each one is being used. Spends weekly quota that would expire unused first.</p></div>
+      <div class="tile"><h3>Custom order</h3><p>Your ranking, set with the arrows on the account cards. Hands off to the highest account with room, and goes back to a higher one once it is free again.</p></div>
+      <div class="tile"><h3>Early when away</h3><p>The default. Once you have been away a while, Claude sessions hand off shortly before an account runs out. While you are using Orca, sessions hand off only at a limit. Other services always hand off only at a limit.</p></div>
+      <div class="tile"><h3>At limit</h3><p>A session hands off only when it hits a limit. Each account is used to the end.</p></div>
+      <div class="tile"><h3>Session on screen</h3><p>Every pane of the tab Orca is showing. Never handed off early. At a limit, <em>Ask me first</em> (default) asks in the panel; unanswered, it waits while you are using Orca, then counts down. Or: <em>Wait, then count down</em>, <em>Wait for me</em>, <em>Move right away</em>.</p></div>
     </div>
-    <p class="lede" style="margin-top:24px"><b style="color:var(--fg)">Switch back</b> applies in <em>Follow my order</em>, and in custom mode (on by default) for drain and priority, where the chain is a priority order. Once an earlier account is out of cooldown and under its thresholds, new launches use it again and lingering sessions migrate back after their next turn, or after sitting idle.</p>
+    <p class="lede" style="margin-top:24px">The badge next to the panel's title says what is happening now: <b style="color:var(--fg)">● Auto · Early when away · on</b> (green, you are away), <b style="color:var(--fg)">◐ … · waiting</b> (you are here), <b style="color:var(--fg)">○ Auto · At limit</b> (grey) or <b style="color:var(--fg)">■ Paused</b> (amber). <b style="color:var(--fg)">When everything is used up</b>, the session waits for the first account to reset and continues by itself, or, with <em>Stop</em>, stops and you are told. There is no manual or custom mode any more: pause, or turn off a service's <em>Automatic hand-off</em>.</p>
+    <p class="lede" style="margin-top:12px"><b style="color:var(--fg)">Coming from 0.2?</b> At the first start of 0.3.0 your old settings are read once and turned into the new ones: <em>my-order</em> or an account order becomes Custom order; <em>at-limit</em>, a running-sessions limit or "Switch at usage threshold" off becomes At limit; <em>earlier</em> becomes Early when away, 25 minutes before running out; "Wait for reset" off becomes Stop; "Retry on API errors" off becomes 0 retries; the idle time in seconds becomes minutes, rounded up. A setup that never handed off by itself gets automatic hand-off paused once, with a notification. Until that upgrade has finished, nothing is handed off automatically and the panel says "Auto Hand-off is finishing the upgrade".</p>
   </div>
 </section>
 
@@ -374,7 +371,7 @@ footer a{color:var(--fg-2)}
     <div class="sec-head">
       <div class="eyebrow">Providers</div>
       <h2>Same service only, by design</h2>
-      <p class="lede">A Claude pane moves to another Claude account and a Codex pane to another Codex account, never across services. How the session continues depends on what the service can do.</p>
+      <p class="lede">A Claude session hands off to another Claude account and a Codex session to another Codex account, never across services. How the session continues depends on what the service can do.</p>
     </div>
     <div class="grid g2">
       <div class="tile">
@@ -382,8 +379,8 @@ footer a{color:var(--fg-2)}
         <p>Every Orca Claude profile shares the <code>~/.claude/projects</code> transcripts, so the exact session resumes on the next account. Usage for an account that has not run yet is unknown; such an account is a last resort, after every account with known room.</p>
       </div>
       <div class="tile">
-        <h3>Codex, Antigravity, OpenCode, Devin <span class="tag">handoff</span></h3>
-        <p>These keep sessions per account, so the same agent is started on the next account with a handoff prompt: why the previous run stopped, the session title, branch, <code>git status</code>, <code>git diff --stat</code> and the last 40 lines of output. OpenCode and Devin report no usage, so only rate limits move them.</p>
+        <h3>Codex, Antigravity, OpenCode, Devin <span class="tag">summary</span></h3>
+        <p>These keep sessions per account, so the same agent is started on the next account with a hand-off summary of at most 4,096 characters: why the previous run stopped, the session title, branch, <code>git status</code>, <code>git diff --stat</code> and the last 40 lines of output. OpenCode and Devin report no usage, so only rate limits hand them off.</p>
       </div>
     </div>
   </div>
@@ -393,25 +390,20 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <div class="sec-head">
       <div class="eyebrow">In the app</div>
-      <h2>Status bar, panel, commands, console line</h2>
+      <h2>Panel, commands, console line</h2>
     </div>
     <div class="grid g2">
       <div class="tile">
-        <h3>Status bar</h3>
-        <p>One glance at every service: accounts in rotation and the 5-hour and weekly usage of the active one. Warning tone at 80 %, danger while a session is parked. Click it to move Claude to the next account.</p>
-        <div class="sb"><svg class="gauge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 17a8 8 0 1 1 14 0"/><path d="M12 17l4-5"/></svg>Claude 2/3 · 7%·18% | Codex 1/3 · <span class="w">84%</span></div>
-      </div>
-      <div class="tile">
         <h3>Panel</h3>
-        <p>Gauge icon in the right sidebar. Each account with 5-hour, weekly and model bars, active and limited badges, a cooldown countdown, <em>Clear</em> and, on each standby account, <em>Hand off to this account</em> (it asks first, then new sessions start on that account and the session in the current tab moves too if it is between turns; when it shows unsent text, which includes Claude's grey prompt suggestion, the panel shows the text and asks once more before moving it). Plus the automatic-switching toggle, parked sessions and the swap history.</p>
+        <p>Gauge icon in the right sidebar. The badge next to the title says what is happening now (● on, ◐ waiting, ○ at limit, ■ paused, in one fixed-width slot). One section per service, with its brand colour, its own <em>Automatic hand-off</em> switch on a line of its own and "n of m ready"; the service on screen comes first, marked "· on screen". Each account with 5-hour, weekly and model bars, a status word, a cooldown with its reason and <em>Clear</em>, a <em>Skip</em> switch, arrows for <em>Custom order</em> and, on each standby account of the service on screen, <em>Hand off to this account</em> (it asks first; new sessions then start on that account and the session on screen hands off too if it is between turns; text that cannot go along is shown, and the panel asks once more). The Claude section has the <em>Status line</em> switch and, while it is on, the <em>Status line header</em>. Plus the pause switch, a <em>Waiting</em> box ("Hand off the session on screen?" with <em>Not now</em> / <em>Hand off now</em>; <em>Don't hand off</em>; <em>Cancel</em>), History in words with local times (<em>Limit reached</em>, <em>Running low</em>, <em>Back to preferred</em> …), and a Settings tab with Basic and Advanced settings, where each dropdown lists its default first, e.g. "Auto (Default)". There is no status bar item.</p>
       </div>
       <div class="tile">
         <h3>Commands</h3>
-        <p>Switch Claude or Codex to the next account. Move this workspace's agent to another account. Pause or resume automatic hand-off. Refresh usage. Install or remove the console status line.</p>
+        <p>Start new Claude or Codex sessions on the next account. Hand off this workspace's session to another account. Pause or resume automatic hand-off. Refresh usage. Install or remove the console status line. Running one counts as a sign that you are here.</p>
       </div>
       <div class="tile">
         <h3>Console status line for Claude panes</h3>
-        <p>Orca's own hook leaves Claude Code without a visible status line. The plugin's wrapper forwards every payload to Orca, then prints one row per account of the pane's service: percent left in the 5-hour, 7-day and best-model windows, green above 50 %, red at 20 or less. ▶ marks this pane's account, ⏸ a cooldown. About 40 ms per render, no CLI calls.</p>
+        <p>Orca's own hook leaves Claude Code without a visible status line. The plugin's wrapper forwards every payload to Orca, then prints one row per account of the pane's service: percent left in the 5-hour, 7-day and best-model windows, green above 50 %, red at 20 or less. Every row shows the same numbers as the panel, and idle panes refresh every 10 seconds. ▶ marks this pane's account, ⏸ a cooldown. About 40 ms per render, no CLI calls.</p>
         <pre style="margin-top:12px"><code>▶ you    5h ██████░░  78%  7d ████████  96%  fable ████████  94%
 · work   5h ████████ 100%  7d ████████ 100%  fable ████████ 100%
 · third  5h ░░░░░░░░   0%  7d ██████░░  81%  fable ██████░░  81%  ⏸1h20m</code></pre>
@@ -425,41 +417,36 @@ footer a{color:var(--fg-2)}
     <div class="sec-head">
       <div class="eyebrow">Settings</div>
       <h2>Every knob, straight from the manifest</h2>
-      <p class="lede">Settings → Plugins → Auto Hand-off. The first four rows are all most people need. Every cux key is here too, plus the chain, exclusions, switch-back guards and the console status line format; the strategy, switch-back, threshold, gap, idle, resume and wait rows are <em>Advanced</em> and only used when <em>Auto-switch</em> is <code>custom</code>.</p>
+      <p class="lede">The panel's Settings tab shows the four basic settings and, folded away, the <em>Advanced</em> ones; the same settings are in Settings → Plugins → Auto Hand-off. The first four rows are all most people need. A setting that does not apply right now is greyed out in the panel, with the reason. The texts below are the manifest's own.</p>
     </div>
     <div class="tscroll">
     <table class="tbl">
       <thead><tr><th>Key</th><th>Default</th><th>What it does</th></tr></thead>
       <tbody>
-<tr><td><code>mode</code><div class="st">Auto-switch</div></td><td>auto</td><td>smart: looks ahead (see <a href="#strategies">Strategies</a>). my-order: follows your account order and goes back to an earlier account when it is free again. manual: never switches by itself. custom: uses the Advanced settings exactly as set. auto: smart, unless you had changed the Advanced settings in an earlier version; those are then kept.</td></tr>
-<tr><td><code>switch_early</code><div class="st">Switch early</div></td><td>just-before</td><td>just-before: about 10 minutes before the limit at the current pace. earlier: about 25 minutes before. at-limit: only when the limit is reached. Not used in custom mode.</td></tr>
-<tr><td><code>running_sessions</code><div class="st">Running sessions</div></td><td>move</td><td>move: a session moves between turns or when idle, never in the middle of a turn and never with unsent text in its input box. limit: only when it hits a limit. launches: running sessions are never moved. Not used in custom mode.</td></tr>
-<tr><td><code>when_all_used</code><div class="st">When everything is used up</div></td><td>wait</td><td>wait: the session waits for the first account to reset and resumes by itself. stop: it stops and you are told. Not used in custom mode.</td></tr>
-<tr><td><code>strategy</code><div class="st">Advanced: Strategy</div></td><td>drain</td><td>Only used when Auto-switch is custom. drain, balanced, priority, soonest-reset or manual. See <a href="#strategies">Strategies</a>.</td></tr>
-<tr><td><code>chain</code><div class="st">Account order</div></td><td><em>empty</em></td><td>Comma-separated order of accounts within each service: emails, seat keys (claude:&lt;id&gt;, codex:system) or provider:*. Example: me@example.com, claude:*. Empty = Orca's order. Switching never leaves the agent's own service.</td></tr>
-<tr><td><code>exclude</code><div class="st">Never switch to</div></td><td><em>empty</em></td><td>Comma-separated accounts that automatic hand-off never picks (emails, seat keys, or provider:*). Picking them from the panel still works.</td></tr>
-<tr><td><code>service_claude</code><div class="st">Auto hand-off Claude accounts</div></td><td>on</td><td>Off: Claude panes are never switched or resumed automatically (manual switching still works). The same switch exists for <code>service_codex</code>, <code>service_antigravity</code>, <code>service_opencode</code> and <code>service_devin</code>.</td></tr>
-<tr><td><code>switch_back</code><div class="st">Switch back when a higher-priority account resets</div></td><td>on</td><td>drain and priority only: once an account earlier in the chain is healthy again, new launches use it and sessions on lower accounts move back when they finish a turn (or sit idle).</td></tr>
-<tr><td><code>switch_cooldown_minutes</code><div class="st">Minimum minutes between automatic selection changes</div></td><td>5</td><td>Applies to threshold, switch-back and idle moves, so two accounts near the line never ping-pong. Rate limits and auth failures ignore it.</td></tr>
-<tr><td><code>min_headroom_gap</code><div class="st">Minimum headroom gap for a threshold move (%)</div></td><td>10</td><td>A threshold move needs a target with at least this many points more room than the current account (when both are known). An exhausted account may always leave.</td></tr>
-<tr><td><code>auto_swap_idle_after_seconds</code><div class="st">Move idle sessions after (seconds)</div></td><td>900</td><td>A session idle this long on an over-threshold account, or on a lower account while a higher-priority one is healthy, is moved. 0 = off. Sessions with unsent text in the input box are left alone.</td></tr>
-<tr><td><code>auto_switch_on_rate_limit</code><div class="st">Switch on rate limit</div></td><td>on</td><td></td></tr>
-<tr><td><code>auto_switch_on_threshold</code><div class="st">Switch at usage threshold</div></td><td>on</td><td>Checked when an agent finishes a turn.</td></tr>
-<tr><td><code>thresholds_five_hour</code><div class="st">5-hour threshold (%)</div></td><td>100</td><td>100 = only when exhausted.</td></tr>
-<tr><td><code>thresholds_seven_day</code><div class="st">Weekly threshold (%)</div></td><td>100</td><td></td></tr>
-<tr><td><code>auto_resume</code><div class="st">Resume the session after a switch</div></td><td>on</td><td>Only used when Auto-switch is custom (otherwise see Running sessions). Off: the plugin only switches the account for new launches and tells you. The limited pane stays for you to resume.</td></tr>
-<tr><td><code>auto_message</code><div class="st">First message after a switch</div></td><td>Continue.</td><td>Empty = resume silently.</td></tr>
-<tr><td><code>wait_for_reset</code><div class="st">Wait for reset when every account is exhausted</div></td><td>on</td><td></td></tr>
-<tr><td><code>retry_on_api_error</code><div class="st">Retry on API errors</div></td><td>on</td><td>Types the first message again after a Fibonacci backoff (5 s … 120 s).</td></tr>
-<tr><td><code>max_api_retries</code><div class="st">Maximum API error retries</div></td><td>6</td><td></td></tr>
-<tr><td><code>model_fallback</code><div class="st">Model fallback</div></td><td><em>empty</em></td><td>Models to try on the same account when one model's limit is hit, e.g. claude=sonnet,haiku; codex=gpt-5-mini</td></tr>
-<tr><td><code>default_cooldown_minutes</code><div class="st">Default cooldown (minutes)</div></td><td>60</td><td>Used when neither the message nor Orca says when a limit resets.</td></tr>
-<tr><td><code>poll_interval_seconds</code><div class="st">Read usage from Orca every (seconds)</div></td><td>60</td><td>How often the plugin reads Orca's usage numbers (15–3600).</td></tr>
-<tr><td><code>usage_cache_max_age_hours</code><div class="st">Remember usage of accounts not in use for (hours)</div></td><td>168</td><td>When Orca has no current numbers for an account, the plugin uses its last reading, shown with its age. 0 = only Orca's current numbers.</td></tr>
-<tr><td><code>handoff_max_chars</code><div class="st">Handoff prompt size limit</div></td><td>6000</td><td></td></tr>
-<tr><td><code>orca_cli_path</code><div class="st">Orca CLI path</div></td><td><em>empty</em></td><td>Empty = detect (ORCA_CLI_COMMAND, the app bundle, then orca).</td></tr>
-<tr><td><code>console_statusline_format</code><div class="st">Console status line header</div></td><td><em>empty</em></td><td>Optional line above the account rows; empty = rows only. Placeholders: {model}, {ctxbar} context-left gauge, {ctx} context left %, {5h} and {7d} this pane's % left, {reset} time until the 5-hour window resets, {best} the best-model window's name. Example: {model} │ ctx {ctxbar} │ 5h reset {reset} │ best={best}</td></tr>
-<tr><td><code>console_statusline_bar_width</code><div class="st">Console status line bar width</div></td><td>8</td><td>Cells per gauge. 8 keeps a row with three gauges and a cooldown inside 80 columns.</td></tr>
+<tr><td><code>service_claude</code><div class="st">Automatic hand-off: Claude</div></td><td>on</td><td>Off: Claude sessions are never handed off or resumed automatically (Hand off to this account still works). The same switch exists for <code>service_codex</code>, <code>service_antigravity</code>, <code>service_opencode</code> and <code>service_devin</code>; in the panel it is the <em>Automatic hand-off</em> switch in each service's section.</td></tr>
+<tr><td><code>pick</code><div class="st">Pick the next account</div></td><td>smart</td><td>Which account a session is handed off to. smart (Auto, default): Picks the account with the most room, judged by how fast each one is being used. my-order (Custom order): Your ranking, set with the arrows in the Accounts tab. Goes back to a higher account once it is free again.</td></tr>
+<tr><td><code>timing</code><div class="st">When to hand off</div></td><td>early</td><td>When sessions are handed off to another account. early (Early when away, default): Once you have been away a while, Claude sessions hand off shortly before an account runs out, so work does not stop at a limit. While you are using Orca, sessions hand off only at a limit. Other services always hand off only at a limit. at-limit (At limit): A session hands off only when it hits a limit. Each account is used to the end.</td></tr>
+<tr><td><code>when_all_used</code><div class="st">When everything is used up</div></td><td>wait</td><td>When no account of the service has room. wait (Wait and resume, default): The session waits for the first account to reset, then continues by itself. stop (Stop): The session stops and you are told.</td></tr>
+<tr><td><code>active_terminal</code><div class="st">Session on screen</div></td><td>ask</td><td>The session in the tab Orca is showing. You may be reading or typing in it, so it gets extra care. ask (Ask me first, default): Never handed off early. At a limit the Auto Hand-off panel asks whether to hand it off now. If you do not answer, it waits while you are using Orca, then counts down. Not now: it waits until you switch tabs. careful (Wait, then count down): Never handed off early. At a limit it waits while you are using Orca, then hands off after a short countdown that you can cancel. wait (Wait for me): Stays until you switch to another tab or press Hand off now. now (Move right away): No waiting: it hands off as soon as it is between turns, early hand-offs included, like sessions in other tabs.</td></tr>
+<tr><td><code>away_minutes</code><div class="st">Advanced: Start early hand-offs after you&#x27;ve been away</div></td><td>10</td><td>Early hand-offs start only once there has been no sign of you this long (sending or answering a prompt, typing in a waiting session, switching tabs, using the Auto Hand-off panel or one of its commands). 0 = always, even while you are here. 0 to 240 min.</td></tr>
+<tr><td><code>early_minutes</code><div class="st">Advanced: Hand off this long before running out</div></td><td>10</td><td>Hand off when an account would run out within this many minutes at its current pace. 1 to 120 min.</td></tr>
+<tr><td><code>early_percent_left</code><div class="st">Advanced: Always hand off below (% left)</div></td><td>1</td><td>Also hand off when less than this much of the 5-hour window is left, however slowly it is being used. 1 % by default: an account at 99 % is left whatever its pace, since one big turn could use the rest. 0 = by pace only. 0 to 50 %.</td></tr>
+<tr><td><code>idle_minutes</code><div class="st">Advanced: Hand off idle sessions after</div></td><td>15</td><td>A session idle this long is handed off from an account that is about to run out, or to an account whose weekly quota would expire unused. 0 = never: idle sessions stay, and expiring quota is spent only by new sessions. 0 to 1440 min.</td></tr>
+<tr><td><code>switch_cooldown_minutes</code><div class="st">Advanced: Minimum time between early hand-offs</div></td><td>5</td><td>Early hand-offs never change the account more often than this. A limit always hands off. 0 to 240 min.</td></tr>
+<tr><td><code>active_countdown_seconds</code><div class="st">Advanced: Countdown for the session on screen</div></td><td>60</td><td>How long the countdown lasts before the session on screen hands off anyway. 10 to 3600 s.</td></tr>
+<tr><td><code>active_presence_seconds</code><div class="st">Advanced: Keep the session on screen waiting after your last activity</div></td><td>300</td><td>You count as using Orca for this long after your last activity (sending or answering a prompt, typing in a waiting session, switching tabs, using the Auto Hand-off panel or one of its commands). 10 to 3600 s.</td></tr>
+<tr><td><code>active_reminder_minutes</code><div class="st">Advanced: Remind me when the session on screen has waited</div></td><td>10</td><td>One reminder when the session on screen has waited this long to hand off. 0 = none. 0 to 1440 min.</td></tr>
+<tr><td><code>restore_unsent_text</code><div class="st">Advanced: Put unsent text back after a hand-off</div></td><td>on</td><td>Claude: text typed and not sent goes back, unsent, into the session after a hand-off. Off, and for other services: the session waits until the text is sent or cleared. Pasted images or blocks, queued messages, and text over 4,000 characters always wait.</td></tr>
+<tr><td><code>auto_message</code><div class="st">Advanced: First message after a limit</div></td><td>Continue.</td><td>Typed into a session whose work was interrupted (a limit or an API error) once it continues, and when a waiting session wakes. Empty = none after a hand-off; an API error retry then types “continue”.</td></tr>
+<tr><td><code>max_api_retries</code><div class="st">Advanced: API error retries</div></td><td>6</td><td>Retry a turn that failed with a passing API error (overloaded, 5xx) at most this many times in a row, with growing pauses. 0 = never retry. 0 to 50.</td></tr>
+<tr><td><code>model_fallback</code><div class="st">Advanced: Model fallback</div></td><td><em>empty</em></td><td>At a model limit, when no other account is known to have room for that model, try these models on the same account before handing off. Per service, separated by semicolons.</td></tr>
+<tr><td><code>default_cooldown_minutes</code><div class="st">Advanced: Cooldown when a limit gives no reset time</div></td><td>60</td><td>How long an account is set aside when its limit message gives no reset time. 1 to 1440 min.</td></tr>
+<tr><td><code>poll_interval_seconds</code><div class="st">Advanced: Read usage every</div></td><td>60</td><td>How often usage is read from Orca. 15 to 3600 s.</td></tr>
+<tr><td><code>handoff_max_chars</code><div class="st">Advanced: Hand-off summary size</div></td><td>6000</td><td>Services that cannot resume (Codex, Antigravity, OpenCode, Devin) start the new session with a summary this long at most. Orca takes at most 4,096 characters, so a larger value changes nothing. 500 to 50000 chars.</td></tr>
+<tr><td><code>orca_cli_path</code><div class="st">Advanced: Orca CLI path</div></td><td><em>empty</em></td><td>Only if the orca command is not found by itself.</td></tr>
+<tr><td><code>console_statusline_format</code><div class="st">Status line header</div></td><td><em>empty</em></td><td>An optional first line of the Claude status line. Empty = account rows only. In the panel: under the Claude Status line switch.</td></tr>
+<tr><td><code>exclude</code><div class="st">Advanced: Skipped accounts</div></td><td><em>empty</em></td><td>Accounts never chosen automatically, separated by commas: an account (work@example.com), or one of a service (claude:work@example.com). In the panel: the Skip switch on each account card.</td></tr>
+<tr><td><code>chain</code><div class="st">Advanced: Custom order</div></td><td><em>empty</em></td><td>Set with the arrows in the panel when Pick the next account is Custom order (Auto ignores it): accounts, as the panel writes them (claude:&lt;account id&gt;) or by email (work@example.com, claude:work@example.com), or every account of a service (claude:*), separated by commas.</td></tr>
       </tbody>
     </table>
     </div>
@@ -486,12 +473,12 @@ footer a{color:var(--fg-2)}
       <div class="tile">
         <h3>Outside the host API</h3>
         <ul class="check">
-          <li>Runs the <b>orca CLI</b>: <code>account select</code>, <code>account list</code>, <code>terminal close</code>, <code>terminal send</code>, <code>terminal read</code> (only to ask whether a pane holds unsent text; the panel shows that text when it asks before a manual switch), <code>terminal list</code> (only to see which terminal tab is in front). Always an argument list, never a shell.</li>
+          <li>Runs the <b>orca CLI</b>: <code>account select</code>, <code>account list</code>, <code>terminal close</code>, <code>terminal send</code>, <code>terminal read</code> (only to ask whether a pane holds unsent text; that text is put back after a hand-off, or shown when the panel asks before a hand-off by hand), <code>terminal list</code> (only to see which terminal tab is in front). Always an argument list, never a shell.</li>
           <li>For a project on a paired Orca server: loads Orca's own runtime client from the app bundle (<code>cli/runtime/client.js</code>, and before it the store helper <code>shared/remote-runtime/host-store/runtime-environment-store-execution.js</code>) to list and select that server's accounts, and to look up, read-only, which Orca a workspace runs on. The list call passes <code>refreshUsage: false, refreshStaleUsage: true</code>: no forced refresh, but that Orca may refresh readings it considers stale. These are Orca internals, not a published API</li>
           <li>Writes its status file (readable by you only, mode 0600, since it names your accounts) and the status line script under <code>~/.orca/account-rotator/</code>, and, only when you install the console status line, that workspace's <code>.claude/settings.local.json</code></li>
-          <li>Runs <b>git status</b> and <b>git diff --stat</b> for handoff prompts</li>
+          <li>Runs <b>git status</b> and <b>git diff --stat</b> for hand-off summaries</li>
           <li><b>Never</b> reads tokens, keychains or credential files</li>
-          <li>A handoff prompt carries up to 40 lines of the previous agent's output, so treat it like any pasted terminal output</li>
+          <li>A hand-off summary carries up to 40 lines of the previous agent's output, so treat it like any pasted terminal output</li>
         </ul>
       </div>
     </div>
@@ -503,23 +490,25 @@ footer a{color:var(--fg-2)}
     <div class="sec-head">
       <div class="eyebrow">Known limitations</div>
       <h2>Read these before you rely on it</h2>
-      <p class="lede">None of them loses typed text, interrupts a turn or crosses services. The README lists the rest.</p>
+      <p class="lede">None of them interrupts a turn or crosses services. The README lists the rest.</p>
     </div>
     <div class="grid g2">
       <div class="tile">
-        <h3>When a session moves</h3>
+        <h3>When a session hands off</h3>
         <ul class="check">
           <li>Closing a pane also stops the background processes the agent left running in it (a dev server, a watcher)</li>
           <li>If the resume fails after the pane was closed, the session stays closed. You are notified and can reopen it; the conversation is not lost</li>
-          <li>Codex, Antigravity, OpenCode and Devin start a new session from a summary, so they move only at a real limit or when you ask</li>
-          <li>If Orca cannot be asked whether a session is mid-turn or holds unsent text, it is not moved until Orca answers</li>
+          <li>Codex, Antigravity, OpenCode and Devin start a new session from a summary, so they hand off only at a real limit or when you ask</li>
+          <li>If Orca cannot be asked whether a session is mid-turn or holds unsent text, it is not handed off until Orca answers. The same holds while Orca cannot say where a workspace runs; it is asked again at the next check</li>
+          <li>Orca cannot say whether you are in front of it, only which tab is shown: a session on screen you are reading without typing can hand off after the countdown if you do not answer the panel's question</li>
+          <li>Claude's grey prompt suggestion is reported like typed text, so it can come back as real text after a hand-off (never sent without Enter). The scroll position is not kept</li>
         </ul>
       </div>
       <div class="tile">
         <h3>Commands and the status line</h3>
         <ul class="check">
-          <li>The move command picks the first idle agent when a plain shell tab is in front</li>
-          <li>The status bar click switches the Claude account at once, and Orca may show its restart prompt. You do not need to press Restart</li>
+          <li>The hand-off command picks the first idle agent when a plain shell tab is in front</li>
+          <li>The next-account commands change the account for new sessions at once, and Orca may show its restart prompt. You do not need to press Restart</li>
           <li><em>Hand off to this account</em> turns automatic hand-off off for that service, until you turn it on again</li>
           <li>The console status line needs <code>sh</code> (no Windows), and installing it writes <code>.claude/settings.local.json</code> in the repository</li>
         </ul>
@@ -549,14 +538,13 @@ footer a{color:var(--fg-2)}
       </li>
       <li>
         <div>
-          <p>Add a second account for the service in Orca, if you have not already. Optionally set <code>chain</code> in Settings → Plugins → Auto Hand-off to order your accounts. Done: the gauge appears in the status bar.</p>
+          <p>Add a second account for the service in Orca, if you have not already. Done: open the Auto Hand-off panel (gauge icon, right sidebar). Optionally choose <em>Custom order</em> in its Settings tab and arrange your accounts with the arrows.</p>
         </div>
       </li>
     </ol>
-    <div class="note"><b>Coming from cux?</b> Run <code>cux uninstall-hooks</code> first so the two don't both rotate. Every cux setting key has the same name here. Per-directory project bindings and <code>cux attach</code> are not migrated yet.</div>
     <details>
       <summary>Working on the plugin itself</summary>
-      <pre style="margin-top:12px"><code>orca plugin test . --json        # 272 tests: adapters, selector, usage, status line, worker end to end, panel
+      <pre style="margin-top:12px"><code>orca plugin test . --json        # 395 tests: adapters, selector, usage, status line, worker end to end, panel
 orca plugin check . --json       # renders the panel with the real worker
 npx -p typescript tsc -p .       # type-check
 orca plugin validate . --json
@@ -573,7 +561,7 @@ orca plugin dev request . rotator.debug</code></pre>
     <span>Auto Hand-off · MIT license · by <a href="https://github.com/ngoohebi">ngoohebi</a></span>
     <a href="https://github.com/ngoohebi/orca-auto-handoff">Source on GitHub</a>
     <a href="https://github.com/ngoohebi/orca-auto-handoff/issues">Issues</a>
-    <span>Ideas borrowed with thanks from <a href="https://github.com/inulute/cux">cux</a>, cswap, tokenmaxx and the Orca community's rotation PRs.</span>
+    <span>Ideas borrowed with thanks from cswap, tokenmaxx and the Orca community's rotation PRs.</span>
   </div>
 </footer>
 

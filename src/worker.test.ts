@@ -1,12 +1,37 @@
 // End-to-end through the real worker: Orca events in, host calls and CLI calls out.
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
-import { Rotator, type Cli } from './engine'
+import { Rotator, restartNote, type Cli } from './engine'
+import { classify, draftOf } from './adapters'
 import * as fx from './fixtures'
-import { activateWith, readConfig, resolveMode, statusText } from './worker'
-import { DEFAULT_CONFIG, SMART_CONFIG, type Config, type RotatorState } from './types'
+import { likeOrca, type SettingsFaults } from './fixtures'
+import { activateWith, configFrom, nextTickMs, ticker } from './worker'
+import { settingValues, upgradedValues } from './settings'
+
+/** What a setup reads as after the one-time 0.2 upgrade (worker.ts). */
+const up = (stored: Record<string, unknown>) => ({ ...settingValues(stored), ...upgradedValues(stored) })
+import { DEFAULT_CONFIG, type RotatorState } from './types'
 
 type Pane = { terminalId: string; agent: string; state: 'working' | 'waiting' | 'done' | 'blocked'; sessionId?: string; title?: string; stateStartedAt?: number; unlisted?: boolean }
+
+/** One thing the plugin did to a session or to the selected account, as the fake Orca saw it, with
+ *  what held at that very moment: the session's state and input box (`draft` as `orca terminal
+ *  read` would report it, `screenDraft` as its screen shows it), whether automatic hand-off was
+ *  paused, and whether the service's switch was on. `paste` is text put into the input box
+ *  without Enter. The safety tests at the end of this file check every one of them. */
+type Act = {
+  kind: 'select' | 'close' | 'type' | 'paste' | 'resume' | 'launch'
+  terminalId?: string
+  agent?: string
+  accountId?: string
+  sessionId?: string
+  text?: string
+  state?: Pane['state']
+  draft?: string
+  screenDraft?: string | null
+  paused: boolean
+  serviceOn: boolean
+}
 
 function world(options: {
   panes: Pane[]
@@ -21,6 +46,12 @@ function world(options: {
    *  change it); by default Orca reports nothing for them. */
   inactiveClaude?: Record<string, { session: number; weekly: number; fable?: number }>
   settings?: Record<string, string | number | boolean>
+  /** Orca's settings failing to be read or written (fixtures.ts `likeOrca`). */
+  settingsFaults?: SettingsFaults
+  /** Runs the worker's own clock on these timers (by default it has none: tests call `tick`). */
+  timers?: { setTimer: (fn: () => void, ms: number) => unknown; clearTimer: (handle: unknown) => void }
+  /** What the plugin's storage holds besides its state. */
+  storage?: Record<string, unknown>
   state?: Partial<RotatorState>
   /** Resumed sessions redraw their transcript, as live Claude does; `late` = only after the
    *  first message arrives (live: the redraw raced the plugin's first read). */
@@ -31,6 +62,10 @@ function world(options: {
   failSelect?: string[]
   /** Terminals in the active tab of each workspace (`orca terminal list --include-visual-layouts`). */
   activeTerminals?: string[]
+  /** Every terminal on screen in those tabs (the other panes of a split tab too), when the CLI says. */
+  visibleTerminals?: string[]
+  /** Terminals of the focused workspace (`workspace.readContext`); read on every call. */
+  focusedTerminals?: string[]
   /** Called when the plugin waits (a backoff, a settle delay), with the wait in ms. */
   onSleep?: (ms: number) => void
   /** While it returns true, Orca cannot list agents (`agents.list` fails); it is given the call's
@@ -46,6 +81,11 @@ function world(options: {
   onListAccounts?: () => Promise<void>
   /** While it returns true, `orca terminal send` fails (live: the pane is gone, or the CLI is). */
   failSend?: () => boolean
+  /** Called while git is read for a hand-off summary (live: a process each, up to seconds). */
+  onGit?: () => void
+  /** What `orca account list` answers, given what it would have answered (read on every list, so
+   *  a test can change it): accounts removed, an empty or broken answer, or a throw. */
+  accounts?: (list: Record<string, any>) => any
 }) {
   // Each world gets its own copy of the lines: tests add to a pane's tail (`w.tails.t1!.push`), and
   // the fixtures are shared. (Until fix round 15 such a push changed `fx.CLAUDE_SESSION_LIMIT`
@@ -67,27 +107,66 @@ function world(options: {
     }
   }
   const typed: { terminalId: string; text: string }[] = []
+  // The looks that start an `orca` process each, live: the terminal layout, and a pane's input box.
+  const lookups: string[] = []
+  // Everything done to a session or to the selection, with what held at that moment (see `Act`).
+  const acts: Act[] = []
+  // What the plugin asked of Orca that the real host API refuses whole for its size (Orca 1.4.263,
+  // its own schemas; the test host takes any size): a notification that is then never shown, a
+  // first message that is then never sent. The fake Orca refuses them too, and notes them here.
+  const refused: string[] = []
+  const tooLong = (what: string, text: unknown, max: number) => {
+    if (typeof text !== 'string' || text.length <= max) return
+    refused.push(`${what}: ${text.length} characters (Orca takes ${max})`)
+    throw Object.assign(new Error(`${what} is too long`), { code: 'invalid_params' })
+  }
+  const act = (kind: Act['kind'], extra: Partial<Act> = {}) => {
+    const pane = panes.find((p) => p.terminalId === extra.terminalId)
+    const agent = extra.agent ?? pane?.agent
+    const service = agent === 'opencode2' ? 'opencode' : agent
+    acts.push({
+      kind,
+      ...(agent ? { agent } : {}),
+      ...(pane ? { state: pane.state, ...(pane.sessionId ? { sessionId: pane.sessionId } : {}) } : {}),
+      ...(extra.terminalId ? { draft: options.drafts?.[extra.terminalId] ?? '', screenDraft: draftOf(options.tails[extra.terminalId] ?? []) } : {}),
+      paused: rotator?.state.paused === true,
+      serviceOn: service ? host.data().settings[`service_${service}`] !== false : true,
+      ...extra
+    })
+  }
   const cli: Cli = {
     async listAccounts() {
       cliCalls.push('list')
       await options.onListAccounts?.()
       const result = accountListFor()
-      return result
+      return options.accounts ? options.accounts(result) : result
     },
     async select(provider, accountId) {
       cliCalls.push(`select ${provider} ${accountId}`)
+      act('select', { agent: provider, accountId })
       if (options.failSelect?.includes(accountId)) throw new Error(`account ${accountId} needs sign-in`)
       if (provider === 'claude') claudeActive = accountId === 'system' ? null : accountId
       if (provider === 'codex') codexActive = accountId === 'system' ? null : accountId
     },
     async closeTerminal(id) {
       cliCalls.push(`close ${id}`)
+      act('close', { terminalId: id })
     },
     async activeTerminals() {
+      lookups.push('terminals')
       await options.onActiveTerminals?.()
       return options.activeTerminals ?? []
     },
+    ...(options.visibleTerminals
+      ? {
+          visibleTerminals: async () => {
+            lookups.push('terminals')
+            return options.visibleTerminals!
+          }
+        }
+      : {}),
     async draft(terminalId) {
+      lookups.push(`draft ${terminalId}`)
       const text = options.drafts?.[terminalId]
       if (text === '!') throw new Error('orca terminal read: runtime_unavailable')
       if (text === '?') return undefined
@@ -96,10 +175,17 @@ function world(options: {
     async sendText(terminalId, text) {
       cliCalls.push(`send ${terminalId}`)
       if (options.failSend?.()) throw new Error('orca terminal send: terminal_not_found')
+      act('type', { terminalId, text })
       typed.push({ terminalId, text })
       deliver(terminalId, text)
     },
+    async typeText(terminalId, text) {
+      cliCalls.push(`type ${terminalId}`)
+      act('paste', { terminalId, text })
+      typed.push({ terminalId, text })
+    },
     async git(_cwd, args) {
+      options.onGit?.()
       return args[0] === 'status' ? ' M src/parser.ts' : ' src/parser.ts | 4 ++--'
     }
   }
@@ -126,8 +212,12 @@ function world(options: {
     return terminalId
   }
   const host = mockHost({
-    settings: options.settings ?? {},
-    storage: options.state ? { state: { paused: false, health: {}, paneSeat: {}, seen: {}, apiRetries: {}, modelStep: {}, waiting: [], history: [], ...options.state } as never } : {},
+    // The tests of holding for unsent text run with it not put back; `restoreOn` tests turn it on.
+    // Engine tests run "Early when away" (the default) with no wait for the user to leave (early
+    // moves at once) unless they say otherwise.
+    settings: { restore_unsent_text: false, timing: 'early', away_minutes: 0, ...(options.settings ?? {}) },
+    // Engine tests that name the 0.2 "manual" setting: its one-time pause has been done.
+    storage: { 'migrated-manual': true as never, ...(options.storage as object), ...(options.state ? { state: { paused: false, health: {}, paneSeat: {}, seen: {}, apiRetries: {}, modelStep: {}, waiting: [], history: [], ...options.state } as never } : {}) } as never,
     results: {
       'agents.list': (params?: { workspaceId?: string }) => {
         if (options.agentsListFails?.(params)) throw Object.assign(new Error('selector_not_found'), { code: 'action_failed' })
@@ -138,34 +228,52 @@ function world(options: {
       },
       'terminal.read': ({ terminalId }: { terminalId: string }) => ({ lines: options.tails[terminalId] ?? [], truncated: false }),
       'terminal.close': ({ terminalId }: { terminalId: string }) => {
+        act('close', { terminalId })
         const i = panes.findIndex((p) => p.terminalId === terminalId)
         if (i >= 0) panes.splice(i, 1)
         return { closed: true }
       },
       'agent.resume': ({ agent, sessionId }: { agent: string; sessionId: string }) => {
         const from = Object.keys(options.tails).find((t) => panes.every((p) => p.terminalId !== t) && options.tails[t]?.length)
+        act('resume', { agent, sessionId })
         return { terminalId: spawn(agent, sessionId, from), started: true }
       },
-      'agent.launch': ({ agent }: { agent: string }) => ({ terminalId: spawn(agent) }),
-      'terminal.sendText': ({ terminalId, text }: { terminalId: string; text: string }) => {
+      'agent.launch': ({ agent, prompt }: { agent: string; prompt?: string }) => {
+        tooLong('agent.launch prompt', prompt, 4096)
+        act('launch', { agent })
+        return { terminalId: spawn(agent) }
+      },
+      'terminal.sendText': ({ terminalId, text, enter }: { terminalId: string; text: string; enter?: boolean }) => {
         if (options.refuseHostSend) throw Object.assign(new Error('terminal is outside the active worktree'), { code: 'action_failed' })
+        // (Refused, not noted: the plugin then sends it with the CLI, which has no such limit.)
+        if (text.length > 4096) throw Object.assign(new Error('text is too long'), { code: 'invalid_params' })
+        act(enter === false ? 'paste' : 'type', { terminalId, text })
         typed.push({ terminalId, text })
         deliver(terminalId, text)
         return { accepted: true }
       },
       'workspace.list': { workspaces: [{ id: 'w1', kind: 'worktree', name: 'w1', path: '/repo', branch: 'feat/x', hostId: 'local' }], truncated: false },
-      'workspace.readContext': { workspaceId: 'w1', branch: 'feat/x', displayName: 'w1', terminals: [] },
-      'notifications.show': { delivered: true },
+      'workspace.readContext': () => ({ workspaceId: 'w1', branch: 'feat/x', displayName: 'w1', terminals: (options.focusedTerminals ?? []).map((id) => ({ id })) }),
+      'notifications.show': ({ title, body }: { title: string; body?: string }) => {
+        tooLong('notification title', title, 120)
+        tooLong('notification body', body, 1000)
+        return { delivered: true }
+      },
       'statusBar.update': { ok: true }
     }
   })
   let rotator!: Rotator
+  let settings!: OrcaWorkerApi['settings']
   const mod = {
     default: async (orca: OrcaWorkerApi) => {
-      rotator = await activateWith(
-        orca,
-        { cli, now: () => clock, sleep: async (ms: number) => options.onSleep?.(ms) },
-        { tick: false }
+      settings = orca.settings
+      rotator = await activateWith(likeOrca(orca, options.settingsFaults),
+        {
+          cli,
+          now: () => clock,
+          sleep: async (ms: number) => options.onSleep?.(ms)
+        },
+        options.timers ? { timers: options.timers } : { tick: false }
       )
     }
   }
@@ -174,12 +282,19 @@ function world(options: {
     tails: options.tails,
     cliCalls,
     typed,
+    acts,
+    refused,
+    lookups,
     panes,
     get rotator() {
       return rotator
     },
     advance(ms: number) {
       clock += ms
+    },
+    /** A setting changed in Orca's own Settings (not in the panel, which is a sign of the user). */
+    async set(key: string, value: string | number | boolean) {
+      await settings.set(key, value)
     },
     /** The pane's state changed now (live: `stateStartedAt` moves with every turn). */
     touch(terminalId: string) {
@@ -384,16 +499,16 @@ test('API error: the retry never types into a pane that holds unsent text, or th
 })
 
 test('model cap: the fallback model is never typed into a pane that holds unsent text', async () => {
-  for (const mode of ['smart', 'custom']) {
+  for (const pick of ['smart', 'my-order']) {
     const w = world({
       panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
       tails: { t1: [...fx.CLAUDE_MODEL_CAP, ...DRAFT_BOX] },
-      settings: { mode, model_fallback: 'claude=fable,sonnet' }
+      settings: { pick, model_fallback: 'claude=fable,sonnet' }
     })
     const worker = await w.mount()
     await worker.emit('agent.status.changed', statusEvent('t1'))
     // Neither `/model sonnet` nor the first message: both would send the user's text.
-    assert.deepEqual(w.typed, [], mode)
+    assert.deepEqual(w.typed, [], pick)
     assert.equal(w.cliCalls.filter((c) => c.startsWith('send')).length, 0)
     assert.equal(w.host.callsOf('terminal.close').length, 0)
     const state = w.host.data().storage.state as RotatorState
@@ -459,6 +574,9 @@ test('Codex limit: next Codex account, continued by a same-service handoff with 
   assert.match(launches[0]!.prompt, /git status --short:\n M src\/parser.ts/)
   assert.match(launches[0]!.prompt, /Session title: fix parser/)
   assert.match(launches[0]!.prompt, /usage limit/)
+  // The summary is a prompt sent from the new account: it never names the old one (an email).
+  assert.match(launches[0]!.prompt, /^You are taking over a coding session that Codex was running in this workspace\./)
+  assert.equal(/example\.test/.test(launches[0]!.prompt), false, launches[0]!.prompt)
   const state = w.host.data().storage.state as RotatorState
   assert.equal(state.history.at(-1)?.result, 'handoff')
   assert.equal(state.paneSeat.t2, 'codex:system')
@@ -469,10 +587,9 @@ test('threshold: a finished turn on a busy seat moves on; normal output never tr
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'waiting', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
-    claudeUsage: { session: 60, weekly: 10 },
+    claudeUsage: { session: 100, weekly: 10 },
     // A threshold move needs a target with known room.
-    inactiveClaude: { c2: { session: 5, weekly: 5 } },
-    settings: { thresholds_five_hour: 50 }
+    inactiveClaude: { c2: { session: 5, weekly: 5 } }
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1', 'waiting'))
@@ -502,10 +619,11 @@ test('paused: nothing happens; panel requests and commands work', async () => {
   assert.equal(snap.paused, true)
   assert.equal(snap.seats.length, 6)
   assert.match(await worker.command('rotator.togglePause') as string, /resumed/)
-  assert.match(await worker.command('rotator.nextCodex') as string, /Codex: new launches use/)
+  assert.match(await worker.command('rotator.nextCodex') as string, /Codex: new sessions start on/)
   assert.ok(w.cliCalls.includes('select codex system'), w.cliCalls.join(','))
   assert.ok(worker.posts.some((p) => p.event === 'rotator.changed'))
-  assert.ok(w.host.callsOf('statusBar.update').length > 0)
+  // No status bar item: the plugin never touches Orca's status bar.
+  assert.equal(w.host.callsOf('statusBar.update').length, 0)
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
 })
@@ -610,6 +728,28 @@ test('a service switched off is left alone; the others still switch', async () =
   await worker.deactivate()
 })
 
+test('the panel\'s Settings tab reads every setting, changes one (checked and clamped), and refuses anything else', async () => {
+  const w = world({ panes: [], tails: {}, settings: { timing: 'at-limit', active_terminal: 'nonsense' } })
+  const worker = await w.mount()
+  const values = await worker.request('rotator.settings', {})
+  assert.equal(values.pick, 'smart')
+  assert.equal(values.timing, 'at-limit')
+  assert.equal(values.active_terminal, 'ask', 'a value a setting does not take reads as its default')
+  assert.equal(values.early_minutes, 10)
+  const out = await worker.request('rotator.settings', { key: 'pick', value: 'my-order' })
+  assert.equal(out.pick, 'my-order')
+  assert.equal(w.host.data().settings.pick, 'my-order')
+  assert.equal((await worker.request('rotator.snapshot', {})).mode, 'my-order')
+  // Numbers typed in the panel arrive as text, and are kept within range.
+  assert.equal((await worker.request('rotator.settings', { key: 'early_minutes', value: '500' })).early_minutes, 120)
+  assert.equal((await worker.request('rotator.settings', { key: 'restore_unsent_text', value: false })).restore_unsent_text, false)
+  await assert.rejects(worker.request('rotator.settings', { key: 'pick', value: 'yolo' }))
+  await assert.rejects(worker.request('rotator.settings', { key: 'early_minutes', value: 'soon' }))
+  await assert.rejects(worker.request('rotator.settings', { key: 'chain', value: 'claude:*' }))
+  await assert.rejects(worker.request('rotator.settings', { key: 'service_claude', value: false }))
+  await worker.deactivate()
+})
+
 test('live bug: Orca restores a handled session in a new pane — its redrawn banner is not new', async () => {
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
@@ -684,17 +824,17 @@ test('review: a handled banner that scrolled out of a full read window counts ag
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    settings: { auto_resume: false }
+    redraw: true
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
-  // The user goes on in the same pane; 80 lines later the old banner is out of the read window.
-  w.tails.t1 = Array.from({ length: 80 }, (_, i) => `  line ${i}`)
-  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
-  w.tails.t1 = [...Array.from({ length: 77 }, (_, i) => `  line ${i}`), ...fx.CLAUDE_SESSION_LIMIT.slice(2, 4)]
-  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 3))
-  // Handled as a new limit (c2 is already selected, so there is no second select).
+  // The user goes on in the resumed session; 80 lines later the old banner is out of the read window.
+  w.tails.t2 = Array.from({ length: 80 }, (_, i) => `  line ${i}`)
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 2))
+  w.tails.t2 = [...Array.from({ length: 77 }, (_, i) => `  line ${i}`), ...fx.CLAUDE_SESSION_LIMIT.slice(2, 4)]
+  await worker.emit('agent.status.changed', statusEvent('t2', 'done', 3))
+  // Handled as a new limit.
   const state = w.host.data().storage.state as RotatorState
   assert.equal(state.history.filter((h) => h.reason === 'rate_limit').length, 2)
   await worker.deactivate()
@@ -727,19 +867,18 @@ test('review: a parked session the user went on with is not closed and resumed a
   await worker.deactivate()
 })
 
-test('review: every account over a threshold does not rotate (and type) forever', async () => {
+test('review: every account used up does not rotate (and type) forever', async () => {
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'waiting', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
-    claudeUsage: { session: 60, weekly: 10 },
-    laterClaudeUsage: { session: 70, weekly: 10 },
+    claudeUsage: { session: 100, weekly: 10 },
+    laterClaudeUsage: { session: 100, weekly: 10 },
     // Orca's (older) numbers for the accounts not in use show room: a threshold move needs that.
     inactiveClaude: { c2: { session: 5, weekly: 5 }, c3: { session: 5, weekly: 5 } },
-    settings: { thresholds_five_hour: 50 },
     redraw: true
   })
   const worker = await w.mount()
-  // Each resumed pane ends its turn on an account that is over the threshold too.
+  // Each resumed pane ends its turn on an account that is used up too.
   for (const id of ['t1', 't2', 't3', 't4', 't5']) {
     w.advance(6 * 60_000) // past the usage poll interval and the selection cooldown
     if (w.panes.some((p) => p.terminalId === id)) await worker.emit('agent.status.changed', statusEvent(id, 'waiting'))
@@ -753,11 +892,11 @@ test('review: every account over a threshold does not rotate (and type) forever'
   await worker.deactivate()
 })
 
-test('switch back: once the first account resets, new launches use it and a pane moves back at turn end', async () => {
+test('switch back: once the first account resets, new sessions start on it and a pane moves back at turn end', async () => {
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    settings: { auto_swap_idle_after_seconds: 0 }
+    settings: { pick: 'my-order', idle_minutes: 0 }
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
@@ -795,8 +934,8 @@ test('switch back: an idle pane on the backup account moves without waiting for 
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    // Switch-back belongs to the legacy strategies; the default mode (Smart) has no preferred account.
-    settings: { mode: 'custom' }
+    // Switch-back belongs to Custom order; Auto (Smart) has no preferred account.
+    settings: { pick: 'my-order' }
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
@@ -812,23 +951,22 @@ test('switch back: an idle pane on the backup account moves without waiting for 
   await worker.deactivate()
 })
 
-test('switch back is off for balanced, and never closes a pane with unsent text', async () => {
-  const balanced = world({
+test('switch back is off for Auto, and never closes a pane with unsent text', async () => {
+  const auto = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
-    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    settings: { strategy: 'balanced' }
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT }
   })
-  let worker = await balanced.mount()
+  let worker = await auto.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
-  balanced.advance(48 * 3_600_000)
-  await balanced.rotator.tick()
-  assert.equal(balanced.cliCalls.filter((c) => c.startsWith('select')).length, 1)
+  auto.advance(48 * 3_600_000)
+  await auto.rotator.tick()
+  assert.equal(auto.cliCalls.filter((c) => c.startsWith('select')).length, 1)
   await worker.deactivate()
 
   const draft = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    settings: { mode: 'custom' }
+    settings: { pick: 'my-order' }
   })
   worker = await draft.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
@@ -895,7 +1033,6 @@ test('no data: each banner without a reset time on an unknown account is a strik
     panes: ids.map((terminalId) => ({ terminalId, agent: 'claude', state: 'done' as const, sessionId: `s-${terminalId}` })),
     tails: Object.fromEntries(ids.map((id) => [id, fx.CLAUDE_LIMIT_NO_RESET])),
     claudeUsage: { session: 5, weekly: 5 },
-    settings: { auto_resume: false },
     // Every pane runs on c2, which Orca reports nothing for.
     state: { paneSeat: Object.fromEntries(ids.map((id) => [id, 'claude:c2'])) }
   })
@@ -978,7 +1115,6 @@ test('no data: a finished turn without a banner clears the strikes of the accoun
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
     claudeUsage: { session: 5, weekly: 5 },
-    settings: { switch_back: false },
     state: {
       paneSeat: { t1: 'claude:c2' },
       health: { 'claude:c2': { strikes: 2, strikeAt: 1_000_000 - 5 * MIN }, 'claude:c3': { strikes: 1, strikeAt: 1_000_000 - 5 * MIN } }
@@ -997,18 +1133,18 @@ test('no data: a finished turn without a banner clears the strikes of the accoun
 })
 
 test('no data: a threshold move needs a known target, unless the account is at 100 % and none is known', async () => {
-  // 60 % of a 50 % threshold, and nothing known about the other accounts: stay.
+  // Low at 98 % (not used up), and nothing known about the other accounts: stay.
   const stay = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'waiting', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
-    claudeUsage: { session: 60, weekly: 10 },
-    settings: { thresholds_five_hour: 50 }
+    claudeUsage: { session: 98, weekly: 10 }
   })
   let worker = await stay.mount()
   await worker.emit('agent.status.changed', statusEvent('t1', 'waiting'))
   assert.equal(selects(stay).length, 0)
   assert.equal(stay.host.callsOf('terminal.close').length, 0)
-  assert.equal(stored(stay).waiting.length, 0)
+  // Nothing happened, so nothing was stored.
+  assert.equal(stored(stay)?.waiting.length ?? 0, 0)
   await worker.deactivate()
 
   // Known to be at 100 % (no banner yet): an unknown account is better than a certain failure.
@@ -1029,16 +1165,15 @@ test('no data: after landing on an unknown account, advisory moves wait out the 
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    laterClaudeUsage: { session: 60, weekly: 10 },
-    inactiveClaude,
-    settings: { thresholds_five_hour: 50 }
+    laterClaudeUsage: { session: 100, weekly: 10 },
+    inactiveClaude
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
   assert.deepEqual(selects(w), ['select claude c2'])
   // max(10 min, 2 × the 5-minute selection cooldown).
   assert.deepEqual(stored(w).probation?.claude, { key: 'claude:c2', until: 1_000_000 + 10 * MIN })
-  // c2 turns out to be over the threshold, and c3 is now known to have room.
+  // c2 turns out to be used up, and c3 is now known to have room.
   inactiveClaude.c3 = { session: 5, weekly: 5 }
   w.tails.t2 = [...fx.CLAUDE_TALKING_ABOUT_LIMITS]
   w.advance(6 * MIN)
@@ -1089,7 +1224,7 @@ const behind = (state: Partial<RotatorState> = {}, known?: { c1: number; c2: num
     tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
     claudeUsage: { session: 5, weekly: known?.c1 ?? 5 },
     ...(known ? { inactiveClaude: { c2: { session: 5, weekly: known.c2 } } } : {}),
-    settings: { chain: 'claude:c2, claude:c1, claude:c3', auto_swap_idle_after_seconds: 0 },
+    settings: { chain: 'claude:c2, claude:c1, claude:c3', pick: 'my-order', idle_minutes: 0 },
     state: { paneSeat: { t1: 'claude:c1' }, ...state }
   })
 
@@ -1218,34 +1353,6 @@ test('no data: state stored by an older version (cooldowns only, no strikes or p
   await worker.deactivate()
 })
 
-test('status bar text', () => {
-  const s = statusText({
-    paused: false,
-    updatedAt: 0,
-    services: { claude: true, codex: true, antigravity: true, opencode: true, devin: true },
-    waiting: [],
-    history: [],
-    seats: [
-      { key: 'claude:a', provider: 'claude', accountId: 'a', label: 'a', active: false, usage: { known: false } },
-      { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'b', active: true, usage: { known: true, session: { usedPercent: 85, resetsAt: null }, weekly: { usedPercent: 18.4, resetsAt: null } } }
-    ]
-  })
-  assert.equal(s.text, 'Claude 2/2 · 85%·18%')
-  assert.equal(s.tone, 'warning')
-  const off = statusText({
-    paused: false,
-    updatedAt: 0,
-    services: { claude: false, codex: true, antigravity: true, opencode: true, devin: true },
-    waiting: [],
-    history: [],
-    seats: [
-      { key: 'claude:a', provider: 'claude', accountId: 'a', label: 'a', active: true, usage: { known: false } },
-      { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'b', active: false, usage: { known: false } }
-    ]
-  })
-  assert.equal(off.text, 'Claude off')
-})
-
 test('swap history keeps 7 days and cleans itself up', async () => {
   const DAY = 86_400_000
   const w = world({
@@ -1367,19 +1474,19 @@ test('manual switch: selects the account, turns the service\u2019s automatic han
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: [] },
     claudeUsage: { session: 5, weekly: 5 },
-    settings: { auto_swap_idle_after_seconds: 0 }
+    settings: { pick: 'my-order', idle_minutes: 0 }
   })
   const worker = await w.mount()
   // c1 is healthy and first in the chain; the user still wants another account.
   const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
-  assert.match(message, /new launches use/)
-  assert.match(message, /Automatic hand-off for Claude is now off/)
+  assert.match(message, /new sessions start on/)
+  assert.match(message, /Claude: automatic hand-off is now off, because you chose an account yourself/)
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
   let snap = await worker.request('rotator.snapshot', {})
   assert.equal(snap.services.claude, false)
   assert.equal(snap.history.at(-1)?.reason, 'manual')
   assert.equal(w.host.data().settings.service_claude, false)
-  assert.ok(w.host.callsOf('notifications.show').some((c: any) => /automatic hand-off is off/.test(c.body)))
+  assert.ok(w.host.callsOf('notifications.show').some((c: any) => /automatic hand-off is now off/.test(c.body)))
   // Switch-back would return to c1 at once; with the service off nothing moves, tick after tick,
   // and a turn ending on c1 stays put too.
   await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
@@ -1404,7 +1511,7 @@ test('manual switch: the pane in the current tab moves at once when it is betwee
   })
   const worker = await w.mount()
   const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
-  assert.match(message, /this pane moved \(resumed\)/)
+  assert.match(message, /this session was handed off/)
   assert.deepEqual(w.host.callsOf('terminal.close').map((c: any) => c.terminalId), ['t1'])
   assert.equal(w.host.callsOf('agent.resume').length, 1)
   const state = w.host.data().storage.state as RotatorState
@@ -1424,7 +1531,7 @@ test('manual switch: a working pane is left alone; an already selected or limite
   const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
   assert.match(message, /keeps its account while it works/)
   assert.equal(w.host.callsOf('terminal.close').length, 0)
-  assert.match((await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })).message, /already use/)
+  assert.match((await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })).message, /already start on/)
   w.rotator.state.health['claude:c3'] = { cooldownUntil: w.rotator['deps'].now() + 3_600_000, reason: 'rate_limit' }
   assert.match((await worker.request('rotator.switchTo', { seatKey: 'claude:c3' })).message, /limited until/)
   assert.deepEqual(w.cliCalls.filter((c) => c.startsWith('select')), ['select claude c2'])
@@ -1445,7 +1552,7 @@ test('manual switch: the chosen account takes the pane in the tab whatever its h
   })
   const worker = await w.mount()
   const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
-  assert.match(message, /this pane moved \(resumed\)/)
+  assert.match(message, /this session was handed off/)
   assert.deepEqual(selects(w), ['select claude c2'])
   assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
   assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w1', agent: 'claude', sessionId: 's1' }])
@@ -1455,10 +1562,10 @@ test('manual switch: the chosen account takes the pane in the tab whatever its h
   await worker.deactivate()
 })
 
-test('manual switch: the pane in the tab moves as the confirmation says, also when running sessions are otherwise left alone', async () => {
-  // "Running sessions: new launches only" and (custom) "Resume the session after a switch: off"
-  // are about what the plugin does by itself. Here the user asked, and was told the session moves.
-  const cases: Record<string, string | number | boolean>[] = [{ running_sessions: 'launches' }, { mode: 'custom', auto_resume: false }, { mode: 'manual' }]
+test('manual switch: the pane in the tab moves as the confirmation says, also when running sessions are otherwise moved only at a limit', async () => {
+  // "At limit" is about what the plugin does by itself. Here the user asked, and was told the
+  // session moves.
+  const cases: Record<string, string | number | boolean>[] = [{}, { timing: 'at-limit' }]
   for (const settings of cases) {
     const label = JSON.stringify(settings)
     const w = world({
@@ -1471,7 +1578,7 @@ test('manual switch: the pane in the tab moves as the confirmation says, also wh
     })
     const worker = await w.mount()
     const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
-    assert.match(message, /this pane moved \(resumed\)/, label)
+    assert.match(message, /this session was handed off/, label)
     assert.deepEqual(selects(w), ['select claude c2'], label)
     assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }], label)
     assert.equal(stored(w).paneSeat.t2, 'claude:c2', label)
@@ -1498,7 +1605,7 @@ test('manual switch: unsent text in the pane is asked about; without the answer 
     const worker = await w.mount()
     const answer = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
     assert.deepEqual(answer.draft, { terminalId: 't1', text: 'also update the docs' }, how)
-    assert.match(answer.message, /nothing was switched/, how)
+    assert.match(answer.message, /nothing was handed off/, how)
     // Nothing changed: no account selected, the service still on, the pane as it was.
     assert.deepEqual(selects(w), [], how)
     assert.notEqual(w.host.data().settings.service_claude, false, how)
@@ -1524,8 +1631,8 @@ test('manual switch: with the text accepted by the second confirmation the pane 
   const asked = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
   const { message, draft } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', acceptDraft: true, draft: asked.draft! })
   assert.equal(draft, undefined)
-  assert.match(message, /new launches use two@example\.test; this pane moved \(resumed\)/)
-  assert.match(message, /Automatic hand-off for Claude is now off/)
+  assert.match(message, /new sessions start on two@example\.test; this session was handed off/)
+  assert.match(message, /Claude: automatic hand-off is now off, because you chose an account yourself/)
   assert.deepEqual(selects(w), ['select claude c2'])
   assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
   assert.equal(w.host.callsOf('agent.resume').length, 1)
@@ -1551,7 +1658,7 @@ test('manual switch: text that changed since it was shown, or another pane\u2019
   assert.equal(w.host.callsOf('terminal.close').length, 0)
   // Asked again and accepted as it is now: the pane moves.
   const third = await worker.request('rotator.switchTo', { seatKey: 'claude:c2', acceptDraft: true, draft: second.draft! })
-  assert.match(third.message, /this pane moved \(resumed\)/)
+  assert.match(third.message, /this session was handed off/)
   assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 't1' }])
   await worker.deactivate()
 
@@ -1564,7 +1671,7 @@ test('manual switch: text that changed since it was shown, or another pane\u2019
   const worker2 = await race.mount()
   const { message, draft } = await worker2.request('rotator.switchTo', { seatKey: 'claude:c2', acceptDraft: true, draft: { terminalId: 't1', text: 'also update the docs' } })
   assert.equal(draft, undefined)
-  assert.match(message, /new launches use two@example\.test; this pane has unsent text in its input box and keeps its account/)
+  assert.match(message, /new sessions start on two@example\.test; this session has unsent text in its input box and keeps its account/)
   assert.deepEqual(selects(race), ['select claude c2'])
   assert.equal(race.host.callsOf('terminal.close').length, 0)
   assert.equal(race.host.callsOf('agent.resume').length, 0)
@@ -1620,12 +1727,16 @@ test('queued messages ("Press up to edit queued messages") count as unsent input
     const worker = await w.mount()
     const { draft } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
     assert.equal(draft?.terminalId, 't1', JSON.stringify(extra))
+    // Said as queued messages, not as text the user typed.
+    assert.equal(draft?.queued, true, JSON.stringify(extra))
     assert.equal(w.host.callsOf('terminal.close').length, 0, JSON.stringify(extra))
     await worker.deactivate()
   }
   // Automatic moves: a limit never closes a pane with queued messages; it holds as for typed text.
-  for (const text of [HINT, 'push it']) {
+  // Queued messages also hold when unsent text is put back: they cannot go with the session.
+  for (const [text, restore] of [[HINT, false], ['push it', false], [HINT, true], [`  ${HINT}\n`, true]] as const) {
     const w = world({
+      settings: { restore_unsent_text: restore },
       panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
       tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, '╭──────────────╮', '│ >', '╰──────────────╯'] },
       state: { paneSeat: { t1: 'claude:c1' } },
@@ -1633,8 +1744,8 @@ test('queued messages ("Press up to edit queued messages") count as unsent input
     })
     const worker = await w.mount()
     await worker.emit('agent.status.changed', statusEvent('t1'))
-    assert.equal(w.host.callsOf('terminal.close').length, 0, text)
-    assert.ok(stored(w).waiting[0]?.draftAt, text)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, `${text} ${restore}`)
+    assert.ok(stored(w).waiting[0]?.draftAt, `${text} ${restore}`)
     await worker.deactivate()
   }
 })
@@ -1686,8 +1797,8 @@ test('manual switch: a timer tick that comes while the switch is still being car
   const worker = await w.mount()
   const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
   assert.ok(ticked, 'a tick ran during the switch')
-  assert.match(message, /new launches use two@example\.test/)
-  assert.match(message, /Automatic hand-off for Claude is now off/)
+  assert.match(message, /new sessions start on two@example\.test/)
+  assert.match(message, /Claude: automatic hand-off is now off, because you chose an account yourself/)
   // The choice stands: nothing selected c1 again.
   assert.deepEqual(selects(w), ['select claude c2'])
   assert.equal(w.host.data().settings.service_claude, false)
@@ -1698,24 +1809,7 @@ test('manual switch: a timer tick that comes while the switch is still being car
   await worker.deactivate()
 })
 
-test('Auto-switch manual: a limit is noted and said as such, not as "no healthy account"', async () => {
-  const w = world({
-    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
-    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    inactiveClaude: { c2: { session: 5, weekly: 5 } },
-    settings: { mode: 'manual' },
-    state: { paneSeat: { t1: 'claude:c1' } }
-  })
-  const worker = await w.mount()
-  await worker.emit('agent.status.changed', statusEvent('t1'))
-  assert.deepEqual(selects(w), [])
-  assert.equal(w.host.callsOf('terminal.close').length, 0)
-  assert.equal(lastNote(w), 'Claude hit a limit on one@example.test. Auto-switch is set to manual, so nothing was switched.')
-  const last = stored(w).history.at(-1)
-  assert.deepEqual([last?.result, last?.detail, last?.why], ['failed', 'manual strategy', 'Auto-switch is manual, so nothing is switched automatically'])
-  await worker.deactivate()
-
-  // "When everything is used up: Stop", with every other account limited: that is the cause.
+test('When everything is used up: Stop. A limit with every other account limited says that is the cause', async () => {
   const stop = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_SESSION_LIMIT },
@@ -1724,8 +1818,8 @@ test('Auto-switch manual: a limit is noted and said as such, not as "no healthy 
   })
   const sw = await stop.mount()
   await sw.emit('agent.status.changed', statusEvent('t1'))
-  assert.equal(lastNote(stop), 'Claude: no other account has room, and waiting for a reset is off. The session stays where it is.')
-  assert.equal(stored(stop).history.at(-1)?.why, 'no other Claude account has room, and waiting for a reset is off')
+  assert.equal(lastNote(stop), 'Claude: no other account has room, and When everything is used up is set to Stop. The session stays where it is.')
+  assert.equal(stored(stop).history.at(-1)?.why, 'no other Claude account has room, and When everything is used up is set to Stop')
   await sw.deactivate()
 })
 
@@ -1774,7 +1868,7 @@ test('manual move command: with several agents in the workspace it moves the one
   const w = world(options)
   const worker = await w.mount()
   // The tab in front is tB: t1, listed first, is left alone.
-  assert.match(String(await worker.command('rotator.swapThisPane')), /moved to/)
+  assert.match(String(await worker.command('rotator.swapThisPane')), /handed off to/)
   assert.deepEqual(w.host.callsOf('terminal.close'), [{ terminalId: 'tB' }])
   assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w1', agent: 'claude', sessionId: 'sB' }])
   // The tab in front is in the middle of a turn: nothing moves, the idle pane behind it included.
@@ -1811,36 +1905,6 @@ test('manual move command: a turn that started while the move waited its turn is
   assert.equal(w.host.callsOf('terminal.close').length, 0)
   assert.equal(w.host.callsOf('agent.resume').length, 0)
   assert.deepEqual(selects(w), [])
-  await worker.deactivate()
-})
-
-test('selection only: the notification names what keeps the session where it is', async () => {
-  // Running sessions: new launches only. Nothing called "auto resume" was turned off.
-  const launches = world({
-    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
-    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    settings: { running_sessions: 'launches' }
-  })
-  let worker = await launches.mount()
-  await worker.emit('agent.status.changed', statusEvent('t1'))
-  assert.deepEqual(selects(launches), ['select claude c2'])
-  assert.equal(launches.host.callsOf('terminal.close').length, 0)
-  // The one notification, whole: it names that setting and no other.
-  assert.deepEqual(notes(launches), ['Claude: new launches now use two@example.test. The session stays where it is for you to resume, because Running sessions is set to new launches only.'])
-  assert.equal(stored(launches).history.at(-1)?.detail, 'Running sessions: new launches only')
-  await worker.deactivate()
-
-  // Custom mode with "Resume the session after a switch" off.
-  const custom = world({
-    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
-    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    settings: { auto_resume: false }
-  })
-  worker = await custom.mount()
-  await worker.emit('agent.status.changed', statusEvent('t1'))
-  assert.deepEqual(selects(custom), ['select claude c2'])
-  assert.deepEqual(notes(custom), ['Claude: new launches now use two@example.test. The session stays where it is for you to resume, because Resume the session after a switch is off.'])
-  assert.equal(stored(custom).history.at(-1)?.detail, 'auto_resume off')
   await worker.deactivate()
 })
 
@@ -1939,7 +2003,7 @@ test('project on a remote Orca server: reads accounts and switches seats on the 
   const worker = await mountWorker(
     {
       default: async (orca: OrcaWorkerApi) => {
-        rotator = await activateWith(orca, { cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false })
+        rotator = await activateWith(likeOrca(orca), { cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false })
       }
     },
     { host }
@@ -2016,7 +2080,7 @@ test('project on a direct SSH target: Orca manages no accounts there, so a limit
   const worker = await mountWorker(
     {
       default: async (orca: OrcaWorkerApi) => {
-        rotator = await activateWith(orca, { cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false })
+        rotator = await activateWith(likeOrca(orca), { cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false })
       }
     },
     { host }
@@ -2056,24 +2120,23 @@ test('history: every move and wait says why in one line', async () => {
   await worker.emit('agent.status.changed', statusEvent('t1'))
   let state = w.host.data().storage.state as RotatorState
   assert.equal(state.history.at(-1)?.result, 'resumed')
-  assert.equal(state.history.at(-1)?.why, 'one hit a usage limit; moved to two (used 5 % of 5h, 6 % of the week)')
+  assert.equal(state.history.at(-1)?.why, 'one hit a usage limit; handed off to two (used 5 % of 5h, 6 % of the week)')
   // The snapshot the panel reads carries it.
   assert.equal(w.rotator.snapshot().history.at(-1)?.why, state.history.at(-1)?.why)
   await worker.deactivate()
 
-  // A threshold: the level that caused it is in the line.
+  // Used up without a banner yet: the level that caused it is in the line.
   const t = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'waiting', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_TALKING_ABOUT_LIMITS },
-    claudeUsage: { session: 60, weekly: 10 },
-    inactiveClaude: { c2: { session: 5, weekly: 5 } },
-    settings: { thresholds_five_hour: 50 }
+    claudeUsage: { session: 100, weekly: 10 },
+    inactiveClaude: { c2: { session: 5, weekly: 5 } }
   })
   const tw = await t.mount()
   await tw.emit('agent.status.changed', statusEvent('t1', 'waiting'))
   state = t.host.data().storage.state as RotatorState
   assert.equal(state.history.at(-1)?.reason, 'threshold')
-  assert.equal(state.history.at(-1)?.why, 'one is over its usage threshold (used 60 % of 5h, 10 % of the week); moved to two (used 5 % of 5h, 5 % of the week)')
+  assert.equal(state.history.at(-1)?.why, 'one is running low (used 100 % of 5h, 10 % of the week); handed off to two (used 5 % of 5h, 5 % of the week)')
   await tw.deactivate()
 
   // Nowhere to go: the wait explains itself; so does the wake.
@@ -2094,32 +2157,20 @@ test('history: every move and wait says why in one line', async () => {
   assert.match(state.history.at(-1)?.why ?? '', /^a limit has reset; resumed on two/)
   await pw.deactivate()
 
-  // A choice made by hand, and auto resume off (only the selection moves).
+  // A choice made by hand (only the selection moves).
   const m = world({ panes: [], tails: {}, claudeUsage: { session: 10, weekly: 10 } })
   const mw = await m.mount()
   await m.rotator.selectSeat('claude:c2')
   state = m.host.data().storage.state as RotatorState
-  assert.equal(state.history.at(-1)?.why, 'chosen by hand; new launches use two')
+  assert.equal(state.history.at(-1)?.why, 'chosen by hand; new sessions start on two')
   await mw.deactivate()
-
-  const s = world({
-    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
-    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    settings: { auto_resume: false }
-  })
-  const sw = await s.mount()
-  await sw.emit('agent.status.changed', statusEvent('t1'))
-  state = s.host.data().storage.state as RotatorState
-  assert.equal(state.history.at(-1)?.result, 'selected')
-  assert.equal(state.history.at(-1)?.why, 'one hit a usage limit; new launches use two')
-  await sw.deactivate()
 })
 
 test('history: switching back for new launches says which account is available again', async () => {
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_SESSION_LIMIT },
-    settings: { auto_swap_idle_after_seconds: 0 }
+    settings: { pick: 'my-order', idle_minutes: 0 }
   })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
@@ -2127,152 +2178,115 @@ test('history: switching back for new launches says which account is available a
   await w.rotator.tick()
   const state = w.host.data().storage.state as RotatorState
   assert.equal(state.history.at(-1)?.reason, 'switch_back')
-  assert.match(state.history.at(-1)?.why ?? '', /^one is available again.*; new launches use it$/)
+  assert.match(state.history.at(-1)?.why ?? '', /^one is available again.*; new sessions start on it$/)
   await worker.deactivate()
 })
 
-// ---- modes: Smart, Follow my order, Manual, custom ----------------------------------------------
+// ---- settings: Auto or Custom order, Early when away or At limit ---------------------------------
 
-const configFor = (settings: Record<string, string | number | boolean>): Promise<Config> =>
-  readConfig({ settings: { get: async () => settings } } as unknown as Pick<OrcaWorkerApi, 'settings'>)
-
-/** Every legacy decision setting spelled out at its default, as a host that fills in manifest
- *  defaults would report them. */
-const LEGACY_AT_DEFAULTS = {
-  strategy: 'drain',
-  switch_back: true,
-  switch_cooldown_minutes: 5,
-  min_headroom_gap: 10,
-  auto_swap_idle_after_seconds: 900,
-  auto_switch_on_rate_limit: true,
-  auto_switch_on_threshold: true,
-  thresholds_five_hour: 100,
-  thresholds_seven_day: 100,
-  auto_resume: true,
-  wait_for_reset: true,
-  chain: ''
-}
-
-test('modes: `auto` resolves from the earlier settings (the migration table)', async () => {
-  // Nothing changed: Smart, whether the host reports no settings or every default.
-  assert.deepEqual(await configFor({}), SMART_CONFIG)
-  assert.deepEqual(await configFor({ mode: 'auto', ...LEGACY_AT_DEFAULTS }), SMART_CONFIG)
-  assert.deepEqual(resolveMode({}), { mode: 'smart', auto: true, switchEarly: 'just-before', keepThresholds: false })
-
-  // An account order with drain or priority: Follow my order, with switch-back.
-  const ordered = await configFor({ chain: 'claude:c2, claude:c1' })
-  assert.deepEqual([ordered.mode, ordered.strategy, ordered.switchBack, ordered.chain], ['my-order', 'drain', true, 'claude:c2, claude:c1'])
-  const priority = await configFor({ chain: 'claude:c2', strategy: 'priority' })
-  assert.deepEqual([priority.mode, priority.strategy, priority.switchBack], ['my-order', 'priority', true])
-  // It looks ahead like Smart does.
-  assert.deepEqual([ordered.horizonMinutes, ordered.lowFiveHour, ordered.lowSevenDay], [10, 97, 99])
-
-  // strategy manual: Manual, whatever else is set.
-  const manual = await configFor({ strategy: 'manual', switch_back: false, chain: 'claude:c2' })
-  assert.deepEqual([manual.mode, manual.strategy], ['manual', 'manual'])
-
-  // Anything else: custom, the stored settings exactly, and a note for the panel.
-  const changed: [Record<string, string | number | boolean>, Partial<Config>][] = [
-    [{ strategy: 'balanced' }, { strategy: 'balanced' }],
-    [{ strategy: 'soonest-reset' }, { strategy: 'soonest-reset' }],
-    [{ strategy: 'priority' }, { strategy: 'priority' }],
-    [{ switch_back: false }, { switchBack: false }],
-    [{ switch_cooldown_minutes: 0 }, { switchCooldownMinutes: 0 }],
-    [{ min_headroom_gap: 25 }, { minHeadroomGap: 25 }],
-    [{ auto_swap_idle_after_seconds: 0 }, { autoSwapIdleAfterSeconds: 0 }],
-    [{ auto_switch_on_rate_limit: false }, { autoSwitchOnRateLimit: false }],
-    [{ auto_switch_on_threshold: false }, { autoSwitchOnThreshold: false }],
-    [{ auto_resume: false }, { autoResume: false }],
-    [{ wait_for_reset: false }, { waitForReset: false }],
-    [{ chain: 'claude:c2', strategy: 'balanced', thresholds_five_hour: 80 }, { chain: 'claude:c2', strategy: 'balanced', thresholdFiveHour: 80 }]
-  ]
-  for (const [settings, expected] of changed) {
-    const { notice, ...config } = await configFor(settings)
-    assert.deepEqual(config, { ...DEFAULT_CONFIG, ...expected }, JSON.stringify(settings))
-    assert.match(notice ?? '', /kept exactly as they were/, JSON.stringify(settings))
-  }
-
-  // Thresholds below 100 are no reason for custom: "Earlier", with the threshold kept as a hard cap.
-  const capped = await configFor({ thresholds_five_hour: 80 })
-  assert.deepEqual(capped, { ...SMART_CONFIG, thresholdFiveHour: 80, horizonMinutes: 25, lowFiveHour: 90, lowSevenDay: 97 })
-  const cappedOrder = await configFor({ thresholds_seven_day: 90, chain: 'claude:c2' })
-  assert.deepEqual([cappedOrder.mode, cappedOrder.thresholdSevenDay, cappedOrder.thresholdFiveHour, cappedOrder.horizonMinutes], ['my-order', 90, 100, 25])
-  // A Switch early chosen by hand stands; the cap stays.
-  const cappedAtLimit = await configFor({ thresholds_five_hour: 80, switch_early: 'at-limit' })
-  assert.deepEqual([cappedAtLimit.thresholdFiveHour, cappedAtLimit.horizonMinutes, cappedAtLimit.lowFiveHour], [80, 0, 100])
+test('settings: the two basic choices give the engine its behaviour', () => {
+  // At limit, chosen.
+  const passive = configFrom({ timing: 'at-limit' })
+  assert.equal(passive.mode, 'smart')
+  assert.equal(passive.horizonMinutes, 0)
+  assert.equal(passive.runningSessions, 'limit')
+  assert.equal(passive.autoSwapIdleAfterSeconds, 0)
+  // The default: Auto, Early when away.
+  const smartEarly = configFrom({})
+  assert.equal(smartEarly.mode, 'smart')
+  assert.equal(smartEarly.strategy, 'smart')
+  assert.equal(smartEarly.switchBack, false)
+  assert.equal(smartEarly.horizonMinutes, 10)
+  assert.equal(smartEarly.lowFiveHour, 97)
+  assert.equal(smartEarly.floorFiveHour, 99, 'an account at 99 % is left whatever its pace')
+  assert.equal(smartEarly.runningSessions, 'move')
+  assert.equal(smartEarly.autoSwapIdleAfterSeconds, 900)
+  assert.equal(smartEarly.waitForReset, true)
+  assert.equal(smartEarly.activeTerminal, 'ask')
+  const ordered = configFrom({ pick: 'my-order', timing: 'at-limit', when_all_used: 'stop' })
+  assert.equal(ordered.mode, 'my-order')
+  assert.equal(ordered.strategy, 'drain')
+  assert.equal(ordered.switchBack, true)
+  assert.equal(ordered.horizonMinutes, 0)
+  assert.equal(ordered.lowFiveHour, 100)
+  assert.equal(ordered.runningSessions, 'limit')
+  assert.equal(ordered.autoSwapIdleAfterSeconds, 0)
+  assert.equal(ordered.autoSwitchOnThreshold, false)
+  assert.equal(ordered.waitForReset, false)
+  // Advanced: minutes, the level floor, idle time; out-of-range numbers are clamped.
+  const tuned = configFrom({ timing: 'early', early_minutes: 25, early_percent_left: 10, idle_minutes: 0, switch_cooldown_minutes: 999 })
+  assert.equal(tuned.horizonMinutes, 25)
+  assert.equal(tuned.floorFiveHour, 90)
+  assert.equal(tuned.autoSwapIdleAfterSeconds, 0)
+  assert.equal(tuned.switchCooldownMinutes, 240)
+  // A value a setting does not take is its default.
+  assert.equal(configFrom({ pick: 'manual', timing: 7 }).mode, 'smart')
 })
 
-test('modes: a mode chosen by hand; legacy settings apply in custom only', async () => {
-  const legacy = { strategy: 'balanced', switch_back: false, thresholds_five_hour: 60, min_headroom_gap: 30, switch_cooldown_minutes: 1, auto_resume: false, wait_for_reset: false }
-  // Smart ignores them all.
-  assert.deepEqual(await configFor({ mode: 'smart', ...legacy }), SMART_CONFIG)
-  // Custom reads them exactly, without the note (it was chosen, not carried over).
-  assert.deepEqual(await configFor({ mode: 'custom', ...legacy }), {
-    ...DEFAULT_CONFIG,
-    strategy: 'balanced',
-    switchBack: false,
-    thresholdFiveHour: 60,
-    minHeadroomGap: 30,
-    switchCooldownMinutes: 1,
-    autoResume: false,
-    waitForReset: false
-  })
-  assert.deepEqual(await configFor({ mode: 'custom' }), DEFAULT_CONFIG)
-  // Follow my order and Manual by hand.
-  const order = await configFor({ mode: 'my-order', ...legacy })
-  assert.deepEqual([order.strategy, order.switchBack, order.thresholdFiveHour, order.autoResume, order.waitForReset], ['drain', true, 100, true, true])
-  assert.equal((await configFor({ mode: 'manual' })).strategy, 'manual')
-  // An unknown value is `auto`.
-  assert.equal((await configFor({ mode: 'whatever' })).mode, 'smart')
-  // Settings that are not decisions apply in every mode.
-  const kept = await configFor({ mode: 'smart', exclude: 'claude:c3', chain: 'claude:c2', model_fallback: 'claude=sonnet', auto_message: 'go on', poll_interval_seconds: 30, service_codex: false })
-  assert.deepEqual(
-    [kept.exclude, kept.chain, kept.modelFallback, kept.autoMessage, kept.pollIntervalSeconds, kept.services.codex],
-    ['claude:c3', 'claude:c2', 'claude=sonnet', 'go on', 30, false]
-  )
+test('settings: values an older version stored carry over while the new setting is unset', () => {
+  assert.equal(up({ mode: 'my-order' }).pick, 'my-order')
+  assert.equal(up({ chain: 'claude:c2, claude:c1' }).pick, 'my-order')
+  assert.equal(up({ chain: 'claude:c2', strategy: 'balanced' }).pick, 'smart')
+  assert.equal(up({ mode: 'manual' }).pick, 'smart')
+  assert.equal(up({ switch_early: 'at-limit' }).timing, 'at-limit')
+  assert.equal(up({ running_sessions: 'launches' }).timing, 'at-limit')
+  assert.equal(up({ switch_early: 'earlier' }).early_minutes, 25)
+  assert.equal(up({ switch_early: 'earlier' }).timing, 'early')
+  assert.equal(up({ switch_early: 'just-before' }).timing, 'early', 'the old default lands on the new one')
+  assert.equal(up({ auto_swap_idle_after_seconds: 1800 }).idle_minutes, 30)
+  // "Only at a limit" for running sessions wins over "earlier"; short idle times round up.
+  assert.equal(up({ switch_early: 'earlier', running_sessions: 'limit' }).timing, 'at-limit')
+  assert.equal(up({ auto_swap_idle_after_seconds: 20 }).idle_minutes, 1)
+  assert.equal(up({ auto_swap_idle_after_seconds: 999_999 }).idle_minutes, 1440)
+  // A new value that differs from its default wins. One at its default counts as untouched, since
+  // Orca reads every declared setting as its default (the upgrade runs once, at the first start).
+  assert.equal(up({ switch_early: 'earlier', early_minutes: 40 }).early_minutes, 40)
+  assert.equal(up({ switch_early: 'at-limit', timing: 'early' }).timing, 'at-limit')
+  assert.deepEqual(upgradedValues({ pick: 'smart', timing: 'early' }), {}, 'nothing from 0.2: nothing changes')
 })
 
-test('modes: the three knobs beside Auto-switch', async () => {
-  const early = async (switch_early: string) => {
-    const c = await configFor({ switch_early })
-    return [c.horizonMinutes, c.lowFiveHour, c.lowSevenDay]
+test('settings: every setting the panel shows is in orca-plugin.json, with the same default and choices', async () => {
+  const { readFileSync } = await import('node:fs')
+  const manifest = JSON.parse(readFileSync(new URL('../orca-plugin.json', import.meta.url) as never, 'utf8'))
+  const listed = new Map<string, any>(manifest.contributes.settings.map((x: any) => [x.key, x]))
+  const { ALL_SETTINGS } = await import('./settings')
+  for (const spec of ALL_SETTINGS) {
+    const entry = listed.get(spec.key)
+    assert.ok(entry, `${spec.key} is in the manifest`)
+    assert.deepEqual(entry.default, spec.default, spec.key)
+    if (spec.kind === 'choice') assert.deepEqual(entry.enum, spec.options.map((o) => o.value), spec.key)
   }
-  assert.deepEqual(await early('just-before'), [10, 97, 99])
-  assert.deepEqual(await early('earlier'), [25, 90, 97])
-  assert.deepEqual(await early('at-limit'), [0, 100, 100])
-  const running = async (running_sessions: string) => {
-    const c = await configFor({ running_sessions })
-    return [c.runningSessions, c.autoSwitchOnThreshold, c.autoSwapIdleAfterSeconds, c.autoResume, c.autoSwitchOnRateLimit]
-  }
-  assert.deepEqual(await running('move'), ['move', true, 900, true, true])
-  assert.deepEqual(await running('limit'), ['limit', false, 0, true, true])
-  assert.deepEqual(await running('launches'), ['launches', false, 0, false, true])
-  assert.equal((await configFor({ when_all_used: 'wait' })).waitForReset, true)
-  assert.equal((await configFor({ when_all_used: 'stop' })).waitForReset, false)
-  // In custom the knobs are not read.
-  assert.deepEqual(await configFor({ mode: 'custom', switch_early: 'earlier', running_sessions: 'launches', when_all_used: 'stop' }), DEFAULT_CONFIG)
+  // Nothing in the manifest the panel leaves out but the services (Accounts tab) and the account order (arrows).
+  const shown = new Set(ALL_SETTINGS.map((x) => x.key))
+  assert.deepEqual([...listed.keys()].filter((k) => !shown.has(k)).sort(), ['chain', 'service_antigravity', 'service_claude', 'service_codex', 'service_devin', 'service_opencode'])
 })
 
-test('modes: the panel is told the mode, and once that earlier settings were kept as custom', async () => {
+test('the panel is told the mode and when sessions hand off', async () => {
   const smart = world({ panes: [], tails: {} })
   let worker = await smart.mount()
   await smart.rotator.tick()
   assert.equal(smart.rotator.snapshot().mode, 'smart')
-  assert.equal(smart.rotator.snapshot().notice, undefined)
+  assert.equal(smart.rotator.snapshot().atLimitOnly, undefined)
+  assert.equal(smart.rotator.snapshot().order, undefined)
   await worker.deactivate()
 
-  const custom = world({ panes: [], tails: {}, settings: { strategy: 'balanced' } })
-  worker = await custom.mount()
-  await custom.rotator.tick()
-  assert.equal(custom.rotator.snapshot().mode, 'custom')
-  assert.match(custom.rotator.snapshot().notice ?? '', /kept exactly as they were/)
-  await worker.request('rotator.dismissNotice', {})
-  assert.equal(custom.rotator.snapshot().notice, undefined)
-  assert.equal(stored(custom).customNoticeSeen, true)
+  const ordered = world({ panes: [], tails: {}, settings: { pick: 'my-order', timing: 'at-limit', chain: 'claude:c3, claude:c1, claude:elsewhere' } })
+  worker = await ordered.mount()
+  await ordered.rotator.tick()
+  const snap = ordered.rotator.snapshot()
+  assert.equal(snap.mode, 'my-order')
+  assert.equal(snap.atLimitOnly, true)
+  assert.deepEqual(snap.order?.claude?.slice(0, 2), ['claude:c3', 'claude:c1'])
+  // The arrows: c1 up, then c3 down again; the order is saved as the account order setting.
+  await worker.request('rotator.moveSeat', { seatKey: 'claude:c1', by: -1 })
+  assert.match(String(ordered.host.data().settings.chain), /^claude:c1, claude:c3/)
+  // An entry for an account this project does not list (another Orca server's) is kept.
+  assert.match(String(ordered.host.data().settings.chain), /claude:elsewhere$/)
+  await assert.rejects(worker.request('rotator.moveSeat', { seatKey: 'claude:c1', by: 2 }))
   await worker.deactivate()
 })
 
-test('model cap, Smart: an account known to have room for that model comes before the fallback model', async () => {
+test('model cap, Auto: an account known to have room for that model comes before the fallback model', async () => {
   const w = world({
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: fx.CLAUDE_MODEL_CAP },
@@ -2302,7 +2316,7 @@ test('model cap, Smart: an account known to have room for that model comes befor
   await fw.deactivate()
 })
 
-test('model cap, Smart: with no known room and no fallback model the next account not known to be full is tried', async () => {
+test('model cap, Auto: with no known room and no fallback model the next account not known to be full is tried', async () => {
   // c2 is known and has room in general; nothing says its Fable bucket is full. Waiting for c1's
   // bucket could take days, so the session moves there.
   const unknown = world({
@@ -2381,32 +2395,6 @@ test('model cap, Smart: with no known room and no fallback model the next accoun
   await sw.deactivate()
 })
 
-test('model cap, custom: the legacy order is unchanged (fallback model first, then any next account)', async () => {
-  const withFallback = world({
-    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
-    tails: { t1: fx.CLAUDE_MODEL_CAP },
-    inactiveClaude: { c2: { session: 5, weekly: 5, fable: 20 } },
-    settings: { mode: 'custom', model_fallback: 'claude=fable,sonnet' }
-  })
-  let worker = await withFallback.mount()
-  await worker.emit('agent.status.changed', statusEvent('t1'))
-  assert.deepEqual(selects(withFallback), [])
-  assert.deepEqual(withFallback.typed.map((t) => t.text), ['/model sonnet', 'Continue.'])
-  await worker.deactivate()
-
-  const without = world({
-    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
-    tails: { t1: fx.CLAUDE_MODEL_CAP },
-    settings: { mode: 'custom' }
-  })
-  worker = await without.mount()
-  await worker.emit('agent.status.changed', statusEvent('t1'))
-  // No numbers for c2 at all: the legacy order still moves there.
-  assert.deepEqual(selects(without), ['select claude c2'])
-  assert.equal(stored(without).waiting.length, 0)
-  await worker.deactivate()
-})
-
 // ---- Smart at work: leaving early, selection-only changes, short waits -------------------------
 
 const lastNote = (w: { host: { callsOf(method: string): any[] } }): string => w.host.callsOf('notifications.show').at(-1)?.body ?? ''
@@ -2422,7 +2410,7 @@ const calm = (claudeUsage: { session: number; weekly: number; sessionReset?: num
     ...extra
   })
 
-test('smart: a turn that ends on a Low account moves that session, and says why', async () => {
+test('Auto: a turn that ends on a Low account moves that session, and says why', async () => {
   // No pace is known, so the level decides: 97 % of the 5-hour window.
   const w = calm({ session: 97, weekly: 40 })
   const worker = await w.mount()
@@ -2434,13 +2422,13 @@ test('smart: a turn that ends on a Low account moves that session, and says why'
   const state = stored(w)
   assert.equal(state.paneSeat.t2, 'claude:c2')
   assert.equal(state.history.at(-1)?.reason, 'threshold')
-  assert.equal(state.history.at(-1)?.why, 'one is nearly at the end of its 5h window (5h 97 %, week 40 %, weekly resets in 24 h); moved to two (5h 5 %, week 5 %, weekly resets in 24 h)')
+  assert.equal(state.history.at(-1)?.why, 'one is nearly at the end of its 5h window (5h 97 %, week 40 %, weekly resets in 24 h); handed off to two (5h 5 %, week 5 %, weekly resets in 24 h)')
   // Not at a limit: the account is not cooled, only set aside until its window ends.
   assert.equal(state.health['claude:c1'], undefined)
   assert.equal(state.leftLow?.['claude:c1']?.until, 1_000_000 + 3_600_000)
   // The notification gives the reason and says Orca's restart prompt needs no action.
   assert.match(lastNote(w), /^Claude: one is nearly at the end of its 5h window/)
-  assert.match(lastNote(w), /Orca may now offer to restart your running sessions: you do not need to\./)
+  assert.match(lastNote(w), /Orca may now offer to restart your running sessions: you do not need to\. They keep working on the account they are on, and Auto Hand-off hands each one off by itself between turns or when it is idle\./)
   await worker.deactivate()
 
   // 96 %: not Low, nothing happens.
@@ -2452,7 +2440,7 @@ test('smart: a turn that ends on a Low account moves that session, and says why'
   await okWorker.deactivate()
 })
 
-test('smart: the pace decides before the level does (fake clock)', async () => {
+test('Auto: the pace decides before the level does (fake clock)', async () => {
   const usage = { session: 80, weekly: 40 }
   const w = calm(usage)
   const worker = await w.mount()
@@ -2474,12 +2462,12 @@ test('smart: the pace decides before the level does (fake clock)', async () => {
   assert.deepEqual(selects(w), [])
   await worker.emit('agent.status.changed', statusEvent('t1', 'done', 92))
   assert.deepEqual(selects(w), ['select claude c2'])
-  assert.equal(stored(w).history.at(-1)?.why, 'one had about 8 min left at this pace (5h 92 %, week 40 %, weekly resets in 24 h); moved to two (5h 5 %, week 5 %, weekly resets in 24 h)')
+  assert.equal(stored(w).history.at(-1)?.why, 'one had about 8 min left at this pace (5h 92 %, week 40 %, weekly resets in 24 h); handed off to two (5h 5 %, week 5 %, weekly resets in 24 h)')
   await worker.deactivate()
 
   // "Only at the limit": the same readings never move it.
   const late = { session: 80, weekly: 40 }
-  const l = calm(late, { settings: { switch_early: 'at-limit' } })
+  const l = calm(late, { settings: { timing: 'at-limit' } })
   const lw = await l.mount()
   for (const level of [84, 88, 92, 99]) {
     l.advance(4 * MIN)
@@ -2491,7 +2479,7 @@ test('smart: the pace decides before the level does (fake clock)', async () => {
   await lw.deactivate()
 })
 
-test('smart: never in the middle of a turn; only the account for new launches changes, once per cooldown', async () => {
+test('Auto: never in the middle of a turn; only the account for new launches changes, once per cooldown', async () => {
   const inactiveClaude: Record<string, { session: number; weekly: number }> = { c2: { session: 5, weekly: 5 }, c3: { session: 6, weekly: 6 } }
   const later = { session: 5, weekly: 5 }
   const w = world({
@@ -2517,7 +2505,7 @@ test('smart: never in the middle of a turn; only the account for new launches ch
   assert.deepEqual(w.typed, [])
   let state = stored(w)
   assert.deepEqual(state.history.at(-1), { ...state.history.at(-1), reason: 'threshold', result: 'selected', from: 'claude:c1', to: 'claude:c2' })
-  assert.match(state.history.at(-1)?.why ?? '', /^one is nearly at the end of its 5h window .*; new launches use two/)
+  assert.match(state.history.at(-1)?.why ?? '', /^one is nearly at the end of its 5h window .*; new sessions start on two/)
   assert.match(lastNote(w), /^Claude: one is nearly at the end of its 5h window .* Only new sessions start on two@example\.test\./)
   assert.match(lastNote(w), /Orca may now offer to restart your running sessions: you do not need to\. They keep working on the account they are on/)
   // c2 is running Low too (t5 works there) a minute later: within the cooldown nothing changes again.
@@ -2538,7 +2526,7 @@ test('smart: never in the middle of a turn; only the account for new launches ch
   await worker.deactivate()
 })
 
-test('smart: a selection-only change needs a session in mid-turn on the selected account', async () => {
+test('Auto: a selection-only change needs a session in mid-turn on the selected account', async () => {
   // The only session is between turns (and not idle for long): it will move itself at its next
   // turn end, so the selection is left alone until then.
   const w = calm({ session: 97, weekly: 40 }, { panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', stateStartedAt: 1_000_000 }] })
@@ -2548,7 +2536,7 @@ test('smart: a selection-only change needs a session in mid-turn on the selected
   await worker.deactivate()
 })
 
-test('smart: unsent text in the input box blocks the move', async () => {
+test('Auto: unsent text in the input box blocks the move', async () => {
   const w = calm({ session: 97, weekly: 40 })
   w.tails.t1 = ['⏺ Done.', '╭──────────────╮', '│ > also update the docs', '╰──────────────╯']
   const worker = await w.mount()
@@ -2593,6 +2581,7 @@ test('a session that went on while its move waited behind another one is left al
 })
 
 test('a limited session the user restarted while its move waited behind another one is not closed mid-turn', async () => {
+  let restarted = false
   const w = world({
     panes: [
       { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
@@ -2600,7 +2589,10 @@ test('a limited session the user restarted while its move waited behind another 
     ],
     tails: { t1: fx.CLAUDE_SESSION_LIMIT, tB: fx.CLAUDE_SESSION_LIMIT },
     state: { paneSeat: { t1: 'claude:c1', tB: 'claude:c1' } },
+    // The user starts a turn in tB while t1 moves (once: later sleeps are tB's own move).
     onSleep: () => {
+      if (restarted) return
+      restarted = true
       w.panes.find((p) => p.terminalId === 'tB')!.state = 'working'
     }
   })
@@ -2616,7 +2608,7 @@ test('a limited session the user restarted while its move waited behind another 
   await worker.deactivate()
 })
 
-test('smart: paused, or the service off, does nothing at all', async () => {
+test('Auto: paused, or the service off, does nothing at all', async () => {
   for (const off of ['paused', 'service'] as const) {
     const w = world({
       panes: [
@@ -2650,7 +2642,7 @@ test('smart: paused, or the service off, does nothing at all', async () => {
   }
 })
 
-test('smart: only the session whose turn ended moves; the others follow at their own turn end', async () => {
+test('Auto: only the session whose turn ended moves; the others follow at their own turn end', async () => {
   const w = calm({ session: 97, weekly: 40 }, {
     panes: [
       { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', stateStartedAt: 1_000_000 },
@@ -2675,7 +2667,7 @@ test('smart: only the session whose turn ended moves; the others follow at their
   await worker.deactivate()
 })
 
-test('smart: an account left as Low is not gone back to within its 5-hour window, unless a reading shows it reset', async () => {
+test('Auto: an account left as Low is not gone back to within its 5-hour window, unless a reading shows it reset', async () => {
   const usage = { session: 80, weekly: 10 }
   const later = { session: 5, weekly: 5 }
   const inactiveClaude: Record<string, { session: number; weekly: number }> = { c2: { session: 5, weekly: 5 } }
@@ -2716,7 +2708,7 @@ test('smart: an account left as Low is not gone back to within its 5-hour window
   await worker.deactivate()
 })
 
-test('smart: short wait. An account that resets within 5 minutes is waited for, not left', async () => {
+test('Auto: short wait. An account that resets within 5 minutes is waited for, not left', async () => {
   // A limit, c1's 5-hour window resets in 4 minutes, and c2 would be free to take the session.
   const usage = { session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }
   const w = calm(usage, { tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] } })
@@ -2727,7 +2719,7 @@ test('smart: short wait. An account that resets within 5 minutes is waited for, 
   let state = stored(w)
   assert.deepEqual(state.waiting.map((x) => [x.terminalId, x.hold, x.wakeAt]), [['t1', 'short', 1_000_000 + 4 * MIN]])
   assert.equal(state.history.at(-1)?.result, 'waiting')
-  assert.equal(state.history.at(-1)?.why, 'one resets in 4 min; waiting is cheaper than moving, which re-reads the whole conversation')
+  assert.equal(state.history.at(-1)?.why, 'one resets in 4 min; waiting is cheaper than handing off, which re-reads the whole conversation')
   assert.match(lastNote(w), /^Claude: one resets in 4 min\. The session waits and continues there/)
   // Another account having room does not end a short wait early.
   w.advance(2 * MIN)
@@ -2764,16 +2756,9 @@ test('smart: short wait. An account that resets within 5 minutes is waited for, 
   assert.equal(stored(low).waiting.length, 0)
   assert.equal(stored(low).history.length, 0)
   await lw.deactivate()
-
-  // The legacy settings (custom) know no short wait.
-  const custom = calm({ session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }, { tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] }, settings: { mode: 'custom' } })
-  const cw = await custom.mount()
-  await cw.emit('agent.status.changed', statusEvent('t1'))
-  assert.deepEqual(selects(custom), ['select claude c2'])
-  await cw.deactivate()
 })
 
-test('smart: short wait when the best target would run out before the source is back', async () => {
+test('Auto: short wait when the best target would run out before the source is back', async () => {
   // c1 is at its limit and back in 12 minutes. c2, the only other account, has filled by 2 points
   // a minute and has 45 left: about 22 minutes, under three horizons, and c1 is back before that.
   const usage = { session: 40, weekly: 40, sessionReset: 1_000_000 + 30 * MIN }
@@ -2794,7 +2779,7 @@ test('smart: short wait when the best target would run out before the source is 
   await worker.deactivate()
 })
 
-test('smart: use it or lose it. An idle session, and new launches, go to weekly quota that would expire', async () => {
+test('Auto: use it or lose it. An idle session, and new launches, go to weekly quota that would expire', async () => {
   // c1 resets in 6 days; c2 has 95 % of its week left and resets in 24 h.
   const w = calm({ session: 20, weekly: 30, weeklyReset: 1_000_000 + 6 * 86_400_000 })
   const worker = await w.mount()
@@ -2807,8 +2792,8 @@ test('smart: use it or lose it. An idle session, and new launches, go to weekly 
   assert.deepEqual(selects(w), ['select claude c2'])
   const state = stored(w)
   assert.deepEqual(state.history.map((h) => [h.reason, h.result]), [['expiring', 'selected'], ['expiring', 'resumed']])
-  assert.equal(state.history[0]?.why, 'two has weekly quota that would expire unused (5h 5 %, week 5 %, weekly resets in 24 h); new launches use it')
-  assert.equal(state.history[1]?.why, 'idle session; two has weekly quota that would expire unused (5h 5 %, week 5 %, weekly resets in 24 h); moved there from one')
+  assert.equal(state.history[0]?.why, 'two has weekly quota that would expire unused (5h 5 %, week 5 %, weekly resets in 24 h); new sessions start on it')
+  assert.equal(state.history[1]?.why, 'idle session; two has weekly quota that would expire unused (5h 5 %, week 5 %, weekly resets in 24 h); handed off there from one')
   assert.equal(state.paneSeat.t2, 'claude:c2')
   // Nothing moves back: c1 has nothing expiring.
   w.tails.t2 = [...fx.CLAUDE_TALKING_ABOUT_LIMITS]
@@ -2826,31 +2811,29 @@ test('smart: use it or lose it. An idle session, and new launches, go to weekly 
   await ow.deactivate()
 })
 
-test('smart: Running sessions. "Only at a limit" and "New launches only" leave a Low session where it is', async () => {
-  for (const running_sessions of ['limit', 'launches']) {
-    const w = calm({ session: 98, weekly: 40 }, { settings: { running_sessions } })
-    const worker = await w.mount()
-    await worker.emit('agent.status.changed', statusEvent('t1'))
-    w.advance(20 * MIN)
-    await w.rotator.tick()
-    assert.deepEqual(selects(w), [], running_sessions)
-    // A real limit still acts: "limit" moves the session, "launches" only changes the account.
-    w.tails.t1 = [...fx.CLAUDE_SESSION_LIMIT]
-    await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
-    assert.deepEqual(selects(w), ['select claude c2'], running_sessions)
-    assert.equal(w.host.callsOf('agent.resume').length, running_sessions === 'limit' ? 1 : 0, running_sessions)
-    await worker.deactivate()
-  }
+test('Auto: "At limit" leaves a Low session where it is', async () => {
+  const w = calm({ session: 98, weekly: 40 }, { settings: { timing: 'at-limit' } })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  w.advance(20 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), [])
+  // A real limit still moves the session.
+  w.tails.t1 = [...fx.CLAUDE_SESSION_LIMIT]
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
 })
 
-test('my order: leaves a Low account early, and switch-back does not return to it within its window', async () => {
+test('Custom order: leaves a Low account early, and switch-back does not return to it within its window', async () => {
   const later = { session: 5, weekly: 5 }
   const inactiveClaude: Record<string, { session: number; weekly: number }> = { c2: { session: 5, weekly: 5 } }
   const w = calm({ session: 97, weekly: 40 }, { laterClaudeUsage: later, inactiveClaude, settings: { chain: 'claude:c1, claude:c2, claude:c3' } })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
   assert.deepEqual(selects(w), ['select claude c2'])
-  // c1 is first in the order and under 100 %: the legacy switch-back would return at once.
+  // c1 is first in the order and under 100 %: switch-back alone would return at once.
   inactiveClaude.c1 = { session: 97, weekly: 40 }
   delete inactiveClaude.c2
   w.tails.t2 = [...fx.CLAUDE_TALKING_ABOUT_LIMITS]
@@ -2877,9 +2860,9 @@ test('my order: leaves a Low account early, and switch-back does not return to i
   await worker.deactivate()
 })
 
-test('smart: a Low account is left for a target with moderate weekly use (the headroom gap is not halved)', async () => {
-  // c1 is at 97 % of its 5-hour window; c2 has used 45 % of its week. The legacy comparison
-  // halves 5-hour use (48.5 against 45) and would keep the session on c1 until it hits the limit.
+test('Auto: a Low account is left for a target with moderate weekly use (the headroom gap is not halved)', async () => {
+  // c1 is at 97 % of its 5-hour window; c2 has used 45 % of its week. Comparing loads would
+  // halve 5-hour use (48.5 against 45) and keep the session on c1 until it hits the limit.
   const w = calm({ session: 97, weekly: 30 }, { inactiveClaude: { c2: { session: 5, weekly: 45 } } })
   const worker = await w.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
@@ -2904,16 +2887,9 @@ test('smart: a Low account is left for a target with moderate weekly use (the he
   assert.deepEqual(selects(busy), ['select claude c2'])
   assert.equal(busy.host.callsOf('terminal.close').length, 0)
   await bw.deactivate()
-
-  // Custom keeps the legacy comparison.
-  const custom = calm({ session: 97, weekly: 30 }, { inactiveClaude: { c2: { session: 5, weekly: 45 } }, settings: { mode: 'custom', thresholds_five_hour: 95 } })
-  const cw = await custom.mount()
-  await cw.emit('agent.status.changed', statusEvent('t1'))
-  assert.deepEqual(selects(custom), [])
-  await cw.deactivate()
 })
 
-test('smart: a session is not moved when the fresh reading shows its account is no longer Low', async () => {
+test('Auto: a session is not moved when the fresh reading shows its account is no longer Low', async () => {
   // The cached reading says 97 % of the 5-hour window; the window has reset since.
   const usage = { session: 97, weekly: 50, sessionReset: 1_000_000 + 3_600_000 }
   const w = calm(usage)
@@ -2927,7 +2903,7 @@ test('smart: a session is not moved when the fresh reading shows its account is 
   await worker.deactivate()
 })
 
-test('smart: a short wait never types into a pane that holds unsent text', async () => {
+test('Auto: a short wait never types into a pane that holds unsent text', async () => {
   const usage = { session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }
   const w = calm(usage, { tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] } })
   const worker = await w.mount()
@@ -2970,7 +2946,7 @@ test('unsent text Orca reports apart from the screen: a limit does not close the
   assert.equal(w.host.callsOf('agent.resume').length, 0)
   assert.deepEqual(selects(w), [])
   assert.deepEqual(w.typed, [])
-  assert.deepEqual(notes(w), ['Claude hit its limit on one. Send or clear the text you were typing and the session moves to two.'])
+  assert.deepEqual(notes(w), ['Claude hit its limit on one. Send or clear the text you were typing and the session hands off to two.'])
   assert.ok(stored(w).waiting[0]?.draftAt)
   // Cleared: the next look carries the move out.
   delete drafts.t1
@@ -3002,7 +2978,7 @@ test('unsent text Orca reports apart from the screen: no early move, no retry an
     const w = world({
       panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
       tails: { t1: [...tail, ...EMPTY_BOX] },
-      settings: { mode: 'custom', model_fallback: 'claude=sonnet' },
+      settings: { model_fallback: 'claude=sonnet' },
       state: { paneSeat: { t1: 'claude:c1' } },
       drafts: { t1: 'also update the docs' }
     })
@@ -3057,7 +3033,7 @@ test('unsent text: a limit does not close the pane; it is said once and noted on
   assert.deepEqual(selects(w), [])
   assert.deepEqual(w.typed, [])
   assert.ok(w.panes.some((p) => p.terminalId === 't1'))
-  assert.deepEqual(notes(w), ['Claude hit its limit on one. Send or clear the text you were typing and the session moves to two.'])
+  assert.deepEqual(notes(w), ['Claude hit its limit on one. Send or clear the text you were typing and the session hands off to two.'])
   let state = stored(w)
   assert.equal(state.waiting.length, 1)
   assert.equal(state.waiting[0]!.reason, 'rate_limit')
@@ -3100,7 +3076,7 @@ test('unsent text: once it is cleared the limit move happens (at a tick, or at a
     assert.equal(state.waiting.length, 0, by)
     assert.equal(state.paneSeat.t2, 'claude:c2', by)
     assert.deepEqual([state.history.at(-1)?.reason, state.history.at(-1)?.result], ['rate_limit', 'resumed'], by)
-    assert.match(state.history.at(-1)?.why ?? '', /hit a usage limit; moved to two/, by)
+    assert.match(state.history.at(-1)?.why ?? '', /hit a usage limit; handed off to two/, by)
     // One notice for the wait, one for the move.
     assert.equal(notes(w).length, 2, by)
     await w.rotator.tick()
@@ -3152,7 +3128,7 @@ test('unsent text: the wake of a parked session waits for it too', async () => {
   assert.equal(w.host.callsOf('agent.resume').length, 0)
   assert.deepEqual(selects(w), [])
   assert.deepEqual(w.typed, [])
-  assert.deepEqual(notes(w).slice(before), ['Claude: two is free again. Send or clear the text you were typing and the session moves to two.'])
+  assert.deepEqual(notes(w).slice(before), ['Claude: two is free again. Send or clear the text you were typing and the session hands off to two.'])
   let state = stored(w)
   assert.equal(state.waiting.length, 1)
   assert.ok(state.waiting[0]!.draftAt)
@@ -3243,7 +3219,7 @@ test('unsent text: the command that moves this workspace’s agent refuses inste
   assert.equal(w.host.callsOf('terminal.close').length, 0)
   assert.deepEqual(selects(w), [])
   w.tails.t1 = ['⏺ Done.']
-  assert.match(await w.rotator.swapFocused(), /moved to/)
+  assert.match(await w.rotator.swapFocused(), /handed off to/)
   assert.equal(w.host.callsOf('terminal.close').length, 1)
   await worker.deactivate()
 })
@@ -3260,14 +3236,14 @@ test('unsent text: a model cap that waited still goes to the account with room f
   await worker.emit('agent.status.changed', statusEvent('t1'))
   assert.equal(w.host.callsOf('terminal.close').length, 0)
   assert.deepEqual(w.typed, [])
-  assert.match(lastNote(w), /Send or clear the text you were typing and the session moves to me\./)
+  assert.match(lastNote(w), /Send or clear the text you were typing and the session hands off to me\./)
   assert.equal(stored(w).waiting[0]?.model, 'fable')
   w.tails.t1 = [...fx.CLAUDE_MODEL_CAP]
   await w.rotator.tick()
   assert.deepEqual(selects(w), ['select claude c3'])
   assert.equal(w.host.callsOf('agent.resume').length, 1)
   assert.deepEqual([stored(w).history.at(-1)?.reason, stored(w).history.at(-1)?.result], ['model_cap', 'resumed'])
-  assert.match(stored(w).history.at(-1)?.why ?? '', /hit its fable limit; moved to me/)
+  assert.match(stored(w).history.at(-1)?.why ?? '', /hit its fable limit; handed off to me/)
   await worker.deactivate()
 })
 
@@ -3620,7 +3596,7 @@ test('new launches: a tick already under way when a move changes the selection d
     panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
     tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] },
     inactiveClaude: { c2: { session: 5, weekly: 5 } },
-    settings: { chain: 'claude:c3, claude:c1, claude:c2', auto_swap_idle_after_seconds: 0 },
+    settings: { chain: 'claude:c3, claude:c1, claude:c2', pick: 'my-order', idle_minutes: 0 },
     state: { paneSeat: { t1: 'claude:c1' } },
     onListAccounts: async () => {
       if (!armed || tick) return
@@ -3645,7 +3621,7 @@ test('new launches: a tick already under way when a move changes the selection d
 
 // ---- Review round 9: permission prompts are mid-turn; state per server; the launch hook's save --
 
-test('smart: a session asking for permission (blocked) is in the middle of a turn, so the account for new launches changes', async () => {
+test('Auto: a session asking for permission (blocked) is in the middle of a turn, so the account for new launches changes', async () => {
   const w = calm({ session: 97, weekly: 40 }, { panes: [{ terminalId: 't1', agent: 'claude', state: 'blocked', sessionId: 's1' }] })
   const worker = await w.mount()
   await w.rotator.tick()
@@ -3747,8 +3723,9 @@ function twoServers(options: {
     }
   }
   const host = mockHost({
-    settings: options.settings ?? {},
-    storage: options.state ? { state: { paused: false, health: {}, paneSeat: {}, seen: {}, apiRetries: {}, modelStep: {}, waiting: [], history: [], ...options.state } as never } : {},
+    settings: { timing: 'early', away_minutes: 0, ...(options.settings ?? {}) },
+    // Engine tests that name the 0.2 "manual" setting: its one-time pause has been done.
+    storage: { 'migrated-manual': true as never, ...(options.state ? { state: { paused: false, health: {}, paneSeat: {}, seen: {}, apiRetries: {}, modelStep: {}, waiting: [], history: [], ...options.state } as never } : {}) } as never,
     results: {
       'agents.list': (params?: { workspaceId?: string }) => ({
         agents: panes
@@ -3789,7 +3766,7 @@ function twoServers(options: {
   let rotator!: Rotator
   const mod = {
     default: async (orca: OrcaWorkerApi) => {
-      rotator = await activateWith(orca, { cli, now: () => clock, sleep: async () => undefined }, { tick: false })
+      rotator = await activateWith(likeOrca(orca), { cli, now: () => clock, sleep: async () => undefined }, { tick: false })
     }
   }
   return {
@@ -3994,15 +3971,15 @@ test('per server: a session in the middle of a turn on a paired server does not 
   await worker.deactivate()
 })
 
-test('the next-account command (the status-bar click): switch-back does not undo it at the next tick; it waits out the switch cooldown', async () => {
-  // "Follow my order" (and the legacy drain) go back to an earlier account that is healthy. The
+test('the next-account command: switch-back does not undo it at the next tick; it waits out the switch cooldown', async () => {
+  // Custom order goes back to an earlier account that is healthy. The
   // user just left that account by hand: going back half a minute later is a flap, with Orca's
   // restart prompt shown twice.
-  for (const settings of [{ chain: 'claude:c1,claude:c2,claude:c3' }, { switch_cooldown_minutes: 5, min_headroom_gap: 11 }] as Record<string, string | number>[]) {
+  for (const settings of [{ chain: 'claude:c1,claude:c2,claude:c3' }, { pick: 'my-order' }] as Record<string, string | number>[]) {
     const label = JSON.stringify(settings)
     const w = world({ panes: [], tails: {}, claudeUsage: { session: 5, weekly: 5 }, settings })
     const worker = await w.mount()
-    assert.match(String(await worker.command('rotator.next')), /Claude: new launches use two@example.test/, label)
+    assert.match(String(await worker.command('rotator.next')), /Claude: new sessions start on two@example.test/, label)
     assert.deepEqual(selects(w), ['select claude c2'], label)
     for (let i = 0; i < 4; i++) {
       w.advance(30_000)
@@ -4044,13 +4021,13 @@ test('after a move: a first message that cannot be typed leaves the move a move,
 })
 
 test('model cap: the fallback model is never typed into a turn the user started meanwhile', async () => {
-  for (const mode of ['smart', 'custom']) {
+  for (const pick of ['smart', 'my-order']) {
     let armed = true
     const drafts: Record<string, string> = {}
     const w = world({
       panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
       tails: { t1: [...fx.CLAUDE_MODEL_CAP] },
-      settings: { mode, model_fallback: 'claude=fable,sonnet' },
+      settings: { pick, model_fallback: 'claude=fable,sonnet' },
       drafts
     })
     // The user sends a prompt while Orca is asked for unsent text (live: a CLI process).
@@ -4062,24 +4039,24 @@ test('model cap: the fallback model is never typed into a turn the user started 
     })
     const worker = await w.mount()
     await worker.emit('agent.status.changed', statusEvent('t1'))
-    assert.equal(w.panes[0]!.state, 'working', mode)
-    assert.equal(w.typed.length, 0, mode)
-    assert.equal(w.cliCalls.filter((c) => c.startsWith('send')).length, 0, mode)
-    assert.deepEqual(selects(w), [], mode)
-    assert.equal(w.host.callsOf('terminal.close').length, 0, mode)
+    assert.equal(w.panes[0]!.state, 'working', pick)
+    assert.equal(w.typed.length, 0, pick)
+    assert.equal(w.cliCalls.filter((c) => c.startsWith('send')).length, 0, pick)
+    assert.deepEqual(selects(w), [], pick)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, pick)
     // The fallback model is still there for the next time.
-    assert.equal(stored(w).modelStep.t1 ?? 0, 0, mode)
+    assert.equal(stored(w).modelStep.t1 ?? 0, 0, pick)
     // That turn ends on the same cap: a new event, and the model is switched then.
     armed = false
     w.panes[0]!.state = 'done'
     w.tails.t1 = [...fx.CLAUDE_MODEL_CAP, '❯ go on', ...fx.CLAUDE_MODEL_CAP]
     await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
-    assert.deepEqual(w.typed.map((t) => t.text), ['/model sonnet', 'Continue.'], mode)
+    assert.deepEqual(w.typed.map((t) => t.text), ['/model sonnet', 'Continue.'], pick)
     await worker.deactivate()
   }
 })
 
-test('smart: a short wait never types into a turn the user started while the accounts were read', async () => {
+test('Auto: a short wait never types into a turn the user started while the accounts were read', async () => {
   const usage = { session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }
   let listings = 0
   let armed = false
@@ -4148,7 +4125,7 @@ test('the move command: switch-back does not undo it at the next tick or turn en
   // As for the next-account command: the user just moved this session off c1 by hand. Selecting
   // c1 again half a minute later, or taking the session back at its next turn end, is a flap,
   // with Orca's restart prompt shown twice.
-  for (const settings of [{ chain: 'claude:c1,claude:c2,claude:c3' }, { switch_cooldown_minutes: 5, min_headroom_gap: 11 }] as Record<string, string | number>[]) {
+  for (const settings of [{ chain: 'claude:c1,claude:c2,claude:c3' }, { pick: 'my-order' }] as Record<string, string | number>[]) {
     const label = JSON.stringify(settings)
     const w = world({
       panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
@@ -4158,7 +4135,7 @@ test('the move command: switch-back does not undo it at the next tick or turn en
       settings
     })
     const worker = await w.mount()
-    assert.match(String(await worker.command('rotator.swapThisPane')), /claude: moved to two@example.test \(resumed\)/, label)
+    assert.match(String(await worker.command('rotator.swapThisPane')), /Claude: handed off to two@example.test/, label)
     assert.deepEqual(selects(w), ['select claude c2'], label)
     assert.equal(stored(w).paneSeat.t2, 'claude:c2', label)
     w.tails.t2 = ['⏺ Done.']
@@ -4200,7 +4177,7 @@ test('fail closed: when Orca cannot say what the input box holds, a limit does n
     assert.deepEqual(selects(w), [], how)
     assert.deepEqual(w.typed, [], how)
     // Said once, in plain words, and not as "the text you were typing": nobody knows there is any.
-    assert.deepEqual(notes(w), ['Claude hit its limit on one. Orca could not be asked whether the session is between turns with an empty input box, so it was not moved. It moves to two once that can be checked.'], how)
+    assert.deepEqual(notes(w), ['Claude hit its limit on one. Orca could not be asked whether the session is between turns with an empty input box, so it was not handed off. It hands off to two once that can be checked.'], how)
     assert.equal(stored(w).history.at(-1)?.detail, 'could not check the session', how)
     assert.ok(stored(w).waiting[0]?.draftAt, how)
     // Orca answers again, and the box is empty: the next look carries the move out.
@@ -4232,7 +4209,7 @@ test('fail closed: when Orca cannot say what the input box holds, no early or id
     const w = world({
       panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
       tails: { t1: [...tail, ...EMPTY_BOX] },
-      settings: { mode: 'custom', model_fallback: 'claude=sonnet' },
+      settings: { model_fallback: 'claude=sonnet' },
       state: { paneSeat: { t1: 'claude:c1' } },
       drafts: { t1: '?' }
     })
@@ -4345,7 +4322,7 @@ test('fail closed, by hand: "Hand off to this account" says it could not check t
     const w = idleInTab(how === 'agents' ? { agentsListFails: (params) => !!params?.workspaceId } : { drafts: { t1: how === 'draft-error' ? '!' : '?' } })
     const worker = await w.mount()
     const answer = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
-    assert.match(answer.message, /^Claude: Orca could not be asked whether this session is between turns with an empty input box, so nothing was switched/, how)
+    assert.match(answer.message, /^Claude: Orca could not be asked whether this session is between turns with an empty input box, so nothing was handed off/, how)
     assert.equal(answer.draft, undefined, how)
     assert.deepEqual(selects(w), [], how)
     assert.notEqual(w.host.data().settings.service_claude, false, how)
@@ -4356,7 +4333,7 @@ test('fail closed, by hand: "Hand off to this account" says it could not check t
     assert.match(again.message, /could not be asked/, how)
     assert.equal(w.host.callsOf('terminal.close').length, 0, how)
     // The command that moves this workspace's agent says the same and moves nothing.
-    assert.match(String(await worker.command('rotator.swapThisPane')), /Orca could not be asked whether this pane is between turns with an empty input box; it was not moved/, how)
+    assert.match(String(await worker.command('rotator.swapThisPane')), /Orca could not be asked whether this session is between turns with an empty input box; it was not handed off/, how)
     assert.equal(w.host.callsOf('terminal.close').length, 0, how)
     assert.deepEqual(selects(w), [], how)
     await worker.deactivate()
@@ -4375,7 +4352,7 @@ test('fail closed, by hand: a session that cannot be checked once the account is
   }
   const { message } = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
   assert.deepEqual(selects(w), ['select claude c2'])
-  assert.match(message, /Orca could not be asked about this session, so it was not moved and keeps its account/)
+  assert.match(message, /Orca could not be asked about this session, so it was not handed off and keeps its account/)
   assert.equal(w.host.callsOf('terminal.close').length, 0)
   assert.equal(w.host.callsOf('agent.resume').length, 0)
   await worker.deactivate()
@@ -4404,12 +4381,12 @@ test('services that cannot resume a session (Codex): a running pane moves only a
   assert.equal(stored(w).history.at(-1)?.result, 'handoff')
   await worker.deactivate()
 
-  // Switch-back (custom mode) leaves a Codex pane on the lower account as well; new launches follow.
+  // Switch-back (Custom order) leaves a Codex pane on the lower account as well; new launches follow.
   const back = world({
     panes: [{ terminalId: 'k1', agent: 'codex', state: 'done', sessionId: 'cs1' }],
     tails: { k1: ['• Updated the parser.', '', '› Ask Codex to do anything', '  gpt-5 default · ~/projects/demo'] },
     codexUsage: { session: 5, weekly: 5 },
-    settings: { mode: 'custom' },
+    settings: { pick: 'my-order' },
     state: { paneSeat: { k1: 'codex:system' } }
   })
   const bw = await back.mount()
@@ -4418,6 +4395,10 @@ test('services that cannot resume a session (Codex): a running pane moves only a
   await back.rotator.tick()
   assert.equal(back.host.callsOf('agent.launch').length, 0)
   assert.equal(back.host.callsOf('terminal.close').length, 0)
+  // The note about Orca's restart prompt does not promise Codex what only Claude sessions get.
+  assert.match(restartNote(configFrom({}), 'claude'), /They keep working on the account they are on, and Auto Hand-off hands each one off by itself between turns or when it is idle\.$/)
+  assert.match(restartNote(configFrom({}), 'codex'), /They keep working on the account they are on\.$/)
+  assert.match(restartNote(configFrom({ timing: 'at-limit' }), 'claude'), /They keep working on the account they are on\.$/)
   await bw.deactivate()
 
   // A Claude pane Orca gives no session id for cannot be resumed either: no early move.
@@ -4441,8 +4422,8 @@ test('the first message is typed only where work was interrupted: not after an e
   assert.deepEqual(early.typed, [])
   await worker.deactivate()
 
-  // Idle (the sweep) on an account at its threshold, custom mode.
-  const idle = calm({ session: 60, weekly: 10 }, { settings: { mode: 'custom', thresholds_five_hour: 50 } })
+  // Idle (the sweep) on an account that is used up.
+  const idle = calm({ session: 100, weekly: 10 })
   worker = await idle.mount()
   idle.advance(20 * MIN)
   await idle.rotator.tick()
@@ -4462,7 +4443,7 @@ test('the first message is typed only where work was interrupted: not after an e
   // By hand: the user is there and types what they want.
   const hand = idleInTab()
   worker = await hand.mount()
-  assert.match((await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })).message, /this pane moved \(resumed\)/)
+  assert.match((await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })).message, /this session was handed off/)
   assert.deepEqual(hand.typed, [])
   await worker.deactivate()
 
@@ -4479,22 +4460,31 @@ test('the first message is typed only where work was interrupted: not after an e
 })
 
 /** A Claude pane that shows a limit in a workspace on a direct SSH target. */
-function sshWorld(options: { settings?: Record<string, string | number | boolean>; state?: Partial<RotatorState> } = {}) {
+function sshWorld(options: { settings?: Record<string, string | number | boolean>; state?: Partial<RotatorState>; /** While true, Orca cannot list the workspaces. */ workspaceListFails?: () => boolean } = {}) {
+  const cliCalls: string[] = []
   const cli: Cli = {
     listAccounts: async () => fx.accountList({ claudeUsage: { session: 100, weekly: 40 } }),
-    select: async () => undefined,
-    closeTerminal: async () => undefined,
-    sendText: async () => undefined,
+    select: async (provider, accountId) => void cliCalls.push(`select ${provider} ${accountId}`),
+    closeTerminal: async (id) => void cliCalls.push(`close ${id}`),
+    sendText: async (id) => void cliCalls.push(`send ${id}`),
     git: async () => '',
     draft: async () => ''
   }
+  const workspaces = { workspaces: [{ id: 'w-ssh', kind: 'worktree', name: 'build-app', projectId: 'p-ssh', path: '/home/me/repo', branch: 'main', hostId: 'ssh:build-box' }], truncated: false }
   const host = mockHost({
     settings: options.settings ?? {},
-    storage: options.state ? { state: { paused: false, health: {}, paneSeat: {}, seen: {}, apiRetries: {}, modelStep: {}, waiting: [], history: [], ...options.state } as never } : {},
+    // Engine tests that name the 0.2 "manual" setting: its one-time pause has been done.
+    storage: { 'migrated-manual': true as never, ...(options.state ? { state: { paused: false, health: {}, paneSeat: {}, seen: {}, apiRetries: {}, modelStep: {}, waiting: [], history: [], ...options.state } as never } : {}) } as never,
     results: {
       'agents.list': { agents: [{ title: null, task: null, stateStartedAt: 1, terminalId: 'ts1', agent: 'claude', state: 'done', sessionId: 'ss1' }] },
       'terminal.read': () => ({ lines: fx.CLAUDE_SESSION_LIMIT, truncated: false }),
-      'workspace.list': { workspaces: [{ id: 'w-ssh', kind: 'worktree', name: 'build-app', projectId: 'p-ssh', path: '/home/me/repo', branch: 'main', hostId: 'ssh:build-box' }], truncated: false },
+      'workspace.list': () => {
+        if (options.workspaceListFails?.()) throw Object.assign(new Error('runtime_unavailable'), { code: 'action_failed' })
+        return workspaces
+      },
+      'terminal.close': { closed: true },
+      'agent.resume': { terminalId: 'ts2', started: true },
+      'terminal.sendText': { accepted: true },
       'workspace.readContext': { workspaceId: 'w-ssh', branch: 'main', displayName: 'build-app', terminals: [] },
       'notifications.show': { delivered: true },
       'statusBar.update': { ok: true }
@@ -4502,11 +4492,11 @@ function sshWorld(options: { settings?: Record<string, string | number | boolean
   })
   const mod = {
     default: async (orca: OrcaWorkerApi) => {
-      await activateWith(orca, { cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false })
+      await activateWith(likeOrca(orca), { cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false })
     }
   }
   const event = (stamp: number) => ({ workspaceId: 'w-ssh', paneKey: 'pane-ts1', terminalId: 'ts1', state: 'done' as const, receivedAt: stamp, mainAgent: { state: 'done' as const, stateStartedAt: stamp } })
-  return { host, event, mount: () => mountWorker(mod, { host }) }
+  return { host, event, cliCalls, mount: () => mountWorker(mod, { host }) }
 }
 
 test('SSH target: paused, or the service off, a limit there is only noted: no notification and no History line', async () => {
@@ -4527,5 +4517,2883 @@ test('SSH target: paused, or the service off, a limit there is only noted: no no
   await worker.emit('agent.status.changed', on.event(1))
   assert.equal(on.host.callsOf('notifications.show').length, 1)
   assert.equal((on.host.data().storage.state as RotatorState).history.length, 1)
+  await worker.deactivate()
+})
+
+// ---- the terminal you are on ------------------------------------------------------------------
+
+const onTab = (extra: Partial<Parameters<typeof world>[0]> = {}) => {
+  const options: Parameters<typeof world>[0] = {
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    activeTerminals: ['t1'],
+    focusedTerminals: ['t1'],
+    ...extra,
+    // These tests are about "Wait, then count down" unless they say otherwise ("Ask me first" is
+    // the default, and adds a question on top of it).
+    settings: { active_terminal: 'careful', ...(extra.settings ?? {}) }
+  }
+  return { options, w: world(options) }
+}
+const bodies = (w: { host: { callsOf(m: string): unknown[] } }) => w.host.callsOf('notifications.show').map((n: any) => String(n.body))
+
+test('the terminal you are on: a limit there waits out a countdown with no sign of you, then hands off', async () => {
+  const { w } = onTab()
+  const worker = await w.mount()
+  // Past the start-up, when the user is taken to be here (5 minutes).
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  const held = w.rotator.snapshot().waiting.find((x) => x.terminalId === 't1')
+  assert.ok(held?.activeSince !== undefined && held.countdownUntil !== undefined, JSON.stringify(held))
+  assert.ok(bodies(w).some((b) => /The session on screen hands off to .* in 60 s unless you are using it\./.test(b)), bodies(w).join(' | '))
+  assert.equal(stored(w).history.at(-1)?.result, 'waiting')
+  // Not yet: half the countdown.
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  // Run out, no sign of the user: it moves, and the wait is over.
+  w.advance(31_000)
+  await w.rotator.tick()
+  assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w1', agent: 'claude', sessionId: 's1' }])
+  assert.deepEqual(w.rotator.snapshot().waiting, [])
+  await worker.deactivate()
+})
+
+test('the terminal you are on: a sign of you stops the countdown; Hand off now moves it at once', async () => {
+  const { w } = onTab()
+  const worker = await w.mount()
+  // Past the start-up, when the user is taken to be here (5 minutes).
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  // Using the panel is a sign of the user.
+  await worker.request('rotator.clearCooldown', { seatKey: 'claude:c9' })
+  w.advance(61_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  const held = w.rotator.snapshot().waiting.find((x) => x.terminalId === 't1')
+  assert.ok(held && held.countdownUntil === undefined, JSON.stringify(held))
+  assert.ok(bodies(w).some((b) => /The session on screen was not handed off\. It hands off to .* when you switch to another tab or step away/.test(b)), bodies(w).join(' | '))
+  await worker.request('rotator.handoffNow', { terminalId: 't1' })
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(w.rotator.snapshot().waiting, [])
+  await worker.deactivate()
+})
+
+test('the terminal you are on: typing in its input box counts as you being there', async () => {
+  const drafts: Record<string, string> = {}
+  const { w } = onTab({ drafts, settings: { restore_unsent_text: true } })
+  const worker = await w.mount()
+  // Past the start-up, when the user is taken to be here (5 minutes).
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  w.advance(20_000)
+  await w.rotator.tick()
+  drafts.t1 = 'one more th'
+  w.advance(45_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 0, 'typing during the countdown keeps it')
+  assert.equal(w.rotator.snapshot().waiting[0]?.countdownUntil, undefined)
+  await worker.deactivate()
+})
+
+test('the terminal you are on, "wait until I leave it": no countdown; it moves once another tab is shown, with one reminder meanwhile', async () => {
+  const { options, w } = onTab({ settings: { active_terminal: 'wait' } })
+  const worker = await w.mount()
+  // Past the start-up, when the user is taken to be here (5 minutes).
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.rotator.snapshot().waiting[0]?.countdownUntil, undefined)
+  w.advance(11 * 60_000)
+  await w.rotator.tick()
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(bodies(w).filter((b) => /has waited 11 min to hand off/.test(b)).length, 1, bodies(w).join(' | '))
+  options.activeTerminals = ['t9']
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('the terminal you are on, "move at once": moved like any other pane', async () => {
+  const { w } = onTab({ settings: { active_terminal: 'now' } })
+  const worker = await w.mount()
+  // Past the start-up, when the user is taken to be here (5 minutes).
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('the terminal you are on: never moved early, while a pane in another tab is', async () => {
+  const shown = calm({ session: 97, weekly: 40 }, { activeTerminals: ['t1'], focusedTerminals: ['t1'] })
+  let worker = await shown.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(shown.host.callsOf('agent.resume').length, 0)
+  await worker.deactivate()
+  // In the active tab of a workspace that is not the focused one: not shown, moved.
+  const elsewhere = calm({ session: 97, weekly: 40 }, { activeTerminals: ['t1'], focusedTerminals: [] })
+  worker = await elsewhere.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(elsewhere.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('unsent text goes with the session: put back unsent in the new pane, after the first message', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    drafts: { t1: 'fix the parser\nthen run the tests' },
+    settings: { restore_unsent_text: true }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  const fresh = w.typed.map((t) => t.terminalId).find((id) => id !== 't1')!
+  assert.deepEqual(
+    w.typed.filter((t) => t.terminalId === fresh).map((t) => t.text),
+    ['Continue.', '\u001b[200~fix the parser\nthen run the tests\u001b[201~']
+  )
+  assert.ok(bodies(w).some((b) => b.includes('Your unsent text was put back in its input box: “fix the parser')), bodies(w).join(' | '))
+  await worker.deactivate()
+})
+
+test('unsent text that stands for a pasted image or block keeps the session where it is', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    drafts: { t1: '[Image #1] what is wrong here?' },
+    settings: { restore_unsent_text: true }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.ok(w.rotator.snapshot().waiting[0]?.draftAt)
+  await worker.deactivate()
+})
+
+test('the last look: an input box that changes in the moment before closing keeps the pane, and the move is tried again', async () => {
+  const drafts: Record<string, string> = {}
+  let typing = true
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    drafts,
+    settings: { restore_unsent_text: true },
+    onSleep: (ms) => {
+      if (ms === 1000 && typing) {
+        drafts.t1 = 'wait'
+        typing = false
+      }
+    }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(w.rotator.snapshot().waiting.length, 1)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.ok(w.typed.some((t) => t.text === '\u001b[200~wait\u001b[201~'))
+  await worker.deactivate()
+})
+
+// ---- "Early when away": early only once the user has left ---------------------------------------
+
+test("early when away: no early move while you are here; one once you have been away 10 minutes", async () => {
+  const w = calm({ session: 97, weekly: 40 }, { settings: { away_minutes: 10 } })
+  const worker = await w.mount()
+  // Just started: you are taken to be here. A turn that ends on a Low account stays.
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(w.rotator.snapshot().userHere, true)
+  // Ten minutes with no sign of you: away. The next turn end moves it.
+  w.advance(10 * 60_000 + 1000)
+  w.touch('t1')
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.equal(w.rotator.snapshot().userHere, undefined)
+  await worker.deactivate()
+})
+
+test("early when away: a prompt you send counts as you being here; a turn the plugin started does not", async () => {
+  // The session is on screen; "Move right away" so that only your presence holds the early move.
+  const w = calm({ session: 97, weekly: 40 }, { settings: { away_minutes: 10, active_terminal: 'now' }, activeTerminals: ['t1'], focusedTerminals: ['t1'] })
+  const worker = await w.mount()
+  // Between turns at the start (you are taken to be here, so it stays).
+  await worker.emit('agent.status.changed', statusEvent('t1', 'waiting', 2))
+  w.advance(11 * 60_000)
+  // You send a prompt: the pane goes from between turns to working.
+  await worker.emit('agent.status.changed', { ...statusEvent('t1', 'done', 3), state: 'working' as const, mainAgent: { state: 'working', stateStartedAt: 3 } })
+  assert.equal(w.rotator.snapshot().userHere, true)
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 4))
+  assert.equal(w.host.callsOf('agent.resume').length, 0, 'held: you were just here')
+  await worker.deactivate()
+})
+
+test('early when away: a turn that starts in a session not on screen is no sign of you', async () => {
+  // t1 is in a tab Orca is not showing: an agent going on by itself there says nothing about you.
+  const w = calm({ session: 97, weekly: 40 }, { settings: { away_minutes: 10 }, activeTerminals: ['t9'], focusedTerminals: ['t9'] })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1', 'waiting', 2))
+  w.advance(11 * 60_000)
+  await worker.emit('agent.status.changed', { ...statusEvent('t1', 'done', 3), state: 'working' as const, mainAgent: { state: 'working', stateStartedAt: 3 } })
+  assert.equal(w.rotator.snapshot().userHere, undefined)
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 4))
+  assert.equal(w.host.callsOf('agent.resume').length, 1, 'moved early: you are away')
+  await worker.deactivate()
+})
+
+test("at limit: only a limit moves a session; the panel shows the style chosen", async () => {
+  const w = calm({ session: 97, weekly: 40 }, { settings: { timing: 'at-limit' } })
+  const worker = await w.mount()
+  w.advance(60 * 60_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(w.rotator.snapshot().atLimitOnly, true)
+  assert.equal(configFrom({ timing: 'at-limit' }).runningSessions, 'limit')
+  await worker.deactivate()
+})
+
+
+test('session on screen, "Ask me first" (the default): the panel asks; Hand off now moves it at once', async () => {
+  const { w } = onTab({ settings: { active_terminal: 'ask' } })
+  const worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  const held = w.rotator.snapshot().waiting[0]
+  assert.equal(held?.asked, true)
+  assert.ok(held?.countdownUntil !== undefined, 'no sign of you: the countdown runs while it asks')
+  assert.ok(bodies(w).some((b) => /Hand off the session on screen to .* now\? Open Auto Hand-off and press Hand off now or Not now\. If you do not answer, it hands off in 60 s\./.test(b)), bodies(w).join(' | '))
+  await worker.request('rotator.handoffNow', { terminalId: 't1' })
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('session on screen, "Ask me first": not answered, it acts like Wait, then count down', async () => {
+  const { w } = onTab({ settings: { active_terminal: 'ask' } })
+  const worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  w.advance(61_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('session on screen, "Ask me first": Not now stops the countdown; it moves once another tab is shown', async () => {
+  const { options, w } = onTab({ settings: { active_terminal: 'ask' } })
+  const worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  await worker.request('rotator.declineHandoff', { terminalId: 't1' })
+  const held = w.rotator.snapshot().waiting[0]
+  assert.equal(held?.declined, true)
+  assert.equal(held?.countdownUntil, undefined)
+  w.advance(5 * 60_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 0, 'no countdown after Not now')
+  options.activeTerminals = ['t9']
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('upgrade: an older "manual" setting pauses automatic hand-off once, and says so', async () => {
+  const host = mockHost({ settings: { mode: 'manual' }, results: { 'notifications.show': { delivered: true }, 'agents.list': { agents: [] } } })
+  const { mountWorker: mount } = await import('orca/testing')
+  const worker = await mount({ default: async (orca: OrcaWorkerApi) => { await activateWith(likeOrca(orca), { cli: { async listAccounts() { return {} }, async select() {}, async closeTerminal() {}, async sendText() {}, async git() { return '' }, async draft() { return '' } } as Cli, now: () => 1_000_000, sleep: async () => undefined }, { tick: false }) } }, { host })
+  assert.equal((host.data().storage.state as RotatorState | undefined)?.paused, true)
+  assert.equal(host.data().storage['migrated-manual'], true)
+  assert.ok(host.callsOf('notifications.show').some((n: any) => /kept Auto Hand-off from handing sessions off by itself/.test(String(n.body))))
+  await worker.deactivate()
+})
+
+test('upgrade: which 0.2 settings count as "not by itself" (paused once), and which leftovers do not', async () => {
+  const { wasManual } = await import('./settings')
+  assert.equal(wasManual({}), false)
+  assert.equal(wasManual({ mode: 'manual' }), true)
+  assert.equal(wasManual({ strategy: 'manual' }), true)
+  assert.equal(wasManual({ mode: 'custom', strategy: 'manual' }), true)
+  // 0.2 ran the Advanced settings as stored (custom): no hand-off at a limit, or none resumed.
+  assert.equal(wasManual({ auto_switch_on_rate_limit: false }), true)
+  assert.equal(wasManual({ mode: 'custom', auto_resume: false }), true)
+  // Smart or My order chosen in 0.2 overrode them: such a user had automatic hand-offs, and keeps them.
+  assert.equal(wasManual({ mode: 'smart', strategy: 'manual' }), false)
+  assert.equal(wasManual({ mode: 'my-order', auto_switch_on_rate_limit: false }), false)
+  assert.equal(wasManual({ mode: 'smart', pick: 'smart' }), false)
+})
+
+test('an account card\'s "Never switch to this": added to and removed from the exclude list, and shown on the card', async () => {
+  const w = world({ panes: [], tails: {}, settings: { exclude: 'one@example.test' } })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  await worker.request('rotator.setExcluded', { seatKey: 'claude:c2', excluded: true })
+  assert.equal(w.host.data().settings.exclude, 'one@example.test, claude:c2')
+  await w.rotator.tick()
+  assert.equal(w.rotator.snapshot().seats.find((x) => x.key === 'claude:c2')?.excluded, true)
+  // Turned off again: every entry naming it goes, its label included.
+  await worker.request('rotator.setExcluded', { seatKey: 'claude:c1', excluded: false })
+  assert.equal(w.host.data().settings.exclude, 'claude:c2')
+  await assert.rejects(worker.request('rotator.setExcluded', { seatKey: 'claude:c1' } as never))
+  await worker.deactivate()
+})
+
+test('settings: one API retry setting (0 = off); an older "retry off" carries over as 0', () => {
+  assert.equal(configFrom(up({})).retryOnApiError, true)
+  assert.equal(configFrom(up({ max_api_retries: 0 })).retryOnApiError, false)
+  assert.equal(up({ retry_on_api_error: false }).max_api_retries, 0)
+  assert.equal(configFrom(up({ retry_on_api_error: false })).retryOnApiError, false)
+})
+
+// ---- review fixes (0.3.0) ----------------------------------------------------------------------
+
+test('unsent text is never lost: a hand-off that fails keeps it in full in History, and the notification quotes its start', async () => {
+  const text = `fix the parser\n${'and then the tests '.repeat(150)}`.trim()
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    drafts: { t1: text },
+    settings: { restore_unsent_text: true }
+  })
+  const worker = await w.mount()
+  // The old pane is closed, then resuming the session fails: the text is no longer in any pane.
+  w.host.respond('agent.resume', () => {
+    throw Object.assign(new Error('session_not_found'), { code: 'action_failed' })
+  })
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  const failed = stored(w).history.at(-1)
+  assert.equal(failed?.result, 'failed')
+  assert.equal(failed?.unsent, text)
+  const said = bodies(w).find((b) => /hand-off to .* failed/.test(b)) ?? ''
+  assert.match(said, /^Claude: hand-off to two failed: /)
+  // (Orca shows no notification over 1000 characters: one that quoted it all would not be shown.)
+  assert.ok(said.includes(`Your unsent text is kept in History: “${text.slice(0, 299)}…”`), said.slice(0, 200))
+  assert.ok(said.length <= 1000, `${said.length} characters`)
+  // The panel's snapshot carries it.
+  assert.equal(w.rotator.snapshot().history.at(-1)?.unsent, text)
+  await worker.deactivate()
+})
+
+test('unsent text is never lost: when the new input box is not free it is kept with the History entry', async () => {
+  const drafts: Record<string, string> = { t1: 'fix the parser' }
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    drafts,
+    settings: { restore_unsent_text: true, auto_message: '' }
+  })
+  const worker = await w.mount()
+  // The resumed pane (t2) already shows something in its input box: nothing is pasted over it.
+  drafts.t2 = 'a suggestion'
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.equal(w.typed.filter((t) => t.text.includes('fix the parser')).length, 0)
+  const moved = stored(w).history.at(-1)
+  assert.equal(moved?.result, 'resumed')
+  assert.equal(moved?.unsent, 'fix the parser')
+  assert.ok(bodies(w).some((b) => b.includes('Your unsent text could not be put back; it is kept in History: “fix the parser”')), bodies(w).join(' | '))
+  await worker.deactivate()
+})
+
+test('the last look comes right before the pane is closed: a turn started while the account was selected keeps the pane', async () => {
+  // A limit move: the turn starts during the settle look (after `orca account select`).
+  let started = false
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    onSleep: (ms) => {
+      if (ms !== 1000 || started) return
+      started = true
+      w.panes.find((p) => p.terminalId === 't1')!.state = 'working'
+    }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'], 'the look comes after the selection')
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  // The limit move stays pending for the tick.
+  assert.equal(stored(w).waiting.length, 1)
+  await worker.deactivate()
+
+  // An early (advisory) move: the same, and nothing is left waiting.
+  let typing = false
+  const drafts: Record<string, string> = {}
+  const e = calm({ session: 97, weekly: 40 }, {
+    drafts,
+    onSleep: (ms) => {
+      if (ms !== 1000 || typing) return
+      typing = true
+      drafts.t1 = 'one more thing'
+    }
+  })
+  const ew = await e.mount()
+  await ew.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(e.host.callsOf('terminal.close').length, 0)
+  assert.equal(e.host.callsOf('agent.resume').length, 0)
+  assert.equal(stored(e).waiting.length, 0)
+  await ew.deactivate()
+})
+
+test('Hand off now says why it did not hand off: paused, service off, or no account with room', async () => {
+  const { w } = onTab({ settings: { active_terminal: 'wait' } })
+  const worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.rotator.snapshot().waiting.length, 1)
+  await worker.request('rotator.pause', { paused: true })
+  assert.match((await worker.request('rotator.handoffNow', { terminalId: 't1' })).message ?? '', /paused/)
+  await worker.request('rotator.pause', { paused: false })
+  await worker.request('rotator.setService', { provider: 'claude', enabled: false })
+  assert.match((await worker.request('rotator.handoffNow', { terminalId: 't1' })).message ?? '', /^Claude: automatic hand-off is off/)
+  await worker.request('rotator.setService', { provider: 'claude', enabled: true })
+  // Every other account is cooling down now.
+  w.rotator.state.health['claude:c2'] = { cooldownUntil: 1_000_000 + 10 * 3_600_000 }
+  w.rotator.state.health['claude:c3'] = { cooldownUntil: 1_000_000 + 10 * 3_600_000 }
+  assert.equal((await worker.request('rotator.handoffNow', { terminalId: 't1' })).message, 'No other Claude account has room.')
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  // From here on it is an ordinary wait for a reset: the panel no longer shows it as held on screen.
+  const plain = w.rotator.snapshot().waiting[0]
+  assert.ok(plain && plain.activeSince === undefined && plain.asked === undefined && plain.wakeAt > 1_000_000, JSON.stringify(plain))
+  // A session that is not waiting.
+  assert.match((await worker.request('rotator.handoffNow', { terminalId: 't9' })).message ?? '', /no longer waiting/)
+  // When it does hand off, there is nothing to explain.
+  delete w.rotator.state.health['claude:c2']
+  const done = await worker.request('rotator.handoffNow', { terminalId: 't1' })
+  assert.equal(done.message, undefined)
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('paused: a waiting session the user goes on with stops waiting, so un-pausing does not hand it off', async () => {
+  for (const off of ['paused', 'service'] as const) {
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+      state: { health: { 'claude:c2': { cooldownUntil: 1_000_000 + 10 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 20 * MIN } } }
+    })
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    assert.equal(stored(w).waiting.length, 1, off)
+    if (off === 'paused') await worker.request('rotator.pause', { paused: true })
+    else await worker.request('rotator.setService', { provider: 'claude', enabled: false })
+    // The user continues in it: a turn ends with no limit as its latest output.
+    w.tails.t1!.push('❯ carry on', '⏺ Done.', '  All 12 tests pass.', '  Nothing else is left to do.', '  The branch is ready for review.', '  See the summary above.')
+    await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+    assert.equal(stored(w).waiting.length, 0, off)
+    if (off === 'paused') await worker.request('rotator.pause', { paused: false })
+    else await worker.request('rotator.setService', { provider: 'claude', enabled: true })
+    // Once the accounts are free again, nothing wakes it: it is no longer waiting. (The tick may
+    // still move it as any idle session on a used-up account; that is not the wait.)
+    w.advance(30 * MIN)
+    await w.rotator.tick()
+    assert.equal(stored(w).history.filter((h) => h.reason === 'reset').length, 0, off)
+    await worker.deactivate()
+  }
+})
+
+test('live (Orca 1.4.263): a waiting background pane listed without its terminal id is neither idle nor closed', async () => {
+  const waiting = { terminalId: 't1', workspaceId: 'w1', agent: 'claude' as const, sessionId: 's1', fromSeat: 'claude:c1', wakeAt: 1_000_000 - 1000 }
+  // Working: the user went on there, so the wait ends (not "closed").
+  const busy = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'working', sessionId: 's1', unlisted: true }],
+    tails: { t1: ['⏺ Working…'] },
+    claudeUsage: { session: 5, weekly: 5 },
+    state: { waiting: [waiting] }
+  })
+  let worker = await busy.mount()
+  await busy.rotator.tick()
+  assert.equal(busy.host.callsOf('terminal.close').length, 0)
+  assert.equal(stored(busy).waiting.length, 0)
+  assert.equal(stored(busy).history.some((h) => h.result === 'closed'), false)
+  await worker.deactivate()
+  // Between turns: it is there, so the wake goes on with it (its own account has room again, so
+  // in the pane it is in).
+  const idle = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', unlisted: true }],
+    tails: { t1: ['⏺ Done.'] },
+    claudeUsage: { session: 5, weekly: 5 },
+    state: { waiting: [waiting] }
+  })
+  worker = await idle.mount()
+  await idle.rotator.tick()
+  assert.equal(stored(idle).history.some((h) => h.result === 'closed'), false)
+  assert.equal(stored(idle).waiting.length, 0)
+  assert.deepEqual(idle.typed, [{ terminalId: 't1', text: 'Continue.' }])
+  await worker.deactivate()
+  // Another account has room, its own does not: it is handed off there.
+  const other = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', unlisted: true }],
+    tails: { t1: ['⏺ Done.'] },
+    inactiveClaude: { c2: { session: 5, weekly: 5 } },
+    state: { waiting: [waiting] }
+  })
+  worker = await other.mount()
+  await other.rotator.tick()
+  assert.equal(stored(other).history.some((h) => h.result === 'closed'), false)
+  assert.equal(other.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('the session on screen: one countdown notice and one "not handed off" notice per hold, however often you come and go', async () => {
+  const { w } = onTab()
+  const worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  for (let i = 0; i < 3; i++) {
+    // You show up (the countdown stops), then leave again (it starts over).
+    await worker.request('rotator.clearCooldown', { seatKey: 'claude:c9' })
+    w.advance(20_000)
+    await w.rotator.tick()
+    w.advance(301_000)
+    await w.rotator.tick()
+    await worker.request('rotator.clearCooldown', { seatKey: 'claude:c9' })
+    await w.rotator.tick()
+  }
+  assert.equal(bodies(w).filter((b) => /hands off to .* in 60 s/.test(b)).length, 1, bodies(w).join(' | '))
+  assert.equal(bodies(w).filter((b) => /was not handed off/.test(b)).length, 1, bodies(w).join(' | '))
+  await worker.deactivate()
+})
+
+test('a hand-off by hand takes plain unsent text along and puts it back; no question is asked', async () => {
+  const w = idleInTab({ drafts: { t1: 'also update the docs' }, settings: { restore_unsent_text: true } })
+  const worker = await w.mount()
+  const answer = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+  assert.equal(answer.draft, undefined)
+  assert.match(answer.message, /this session was handed off/)
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.ok(w.typed.some((t) => t.terminalId === 't2' && t.text === '\u001b[200~also update the docs\u001b[201~'), JSON.stringify(w.typed))
+  // No first message after a hand-off by hand.
+  assert.equal(w.typed.some((t) => t.text === 'Continue.'), false)
+  assert.ok(bodies(w).some((b) => b.startsWith('Claude: handed off to two, as you chose.')), bodies(w).join(' | '))
+  await worker.deactivate()
+})
+
+test('notifications name the service and say times in local clock words', async () => {
+  const p = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    state: { health: { 'claude:c2': { cooldownUntil: 1_000_000 + 10 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 20 * MIN } } }
+  })
+  const worker = await p.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  const { clockWords } = await import('./labels')
+  const waited = stored(p).history.at(-1)
+  assert.equal(waited?.result, 'waiting')
+  assert.match(waited?.detail ?? '', /^until \d{1,2}:\d\d (am|pm)$|^until \w{3} \d{1,2}:\d\d (am|pm)$/)
+  assert.ok(!/\d{4}-\d\d-\d\dT/.test(waited?.detail ?? ''), 'no ISO time')
+  assert.ok(bodies(p).some((b) => b.startsWith('Claude: every account is used up. The session continues at ') && b.includes(clockWords(1_000_000 + 10 * MIN, 1_000_000))), bodies(p).join(' | '))
+  await worker.deactivate()
+})
+
+test('settings: "Keep the session on screen waiting" is 5 minutes in the engine’s defaults too', () => {
+  assert.equal(DEFAULT_CONFIG.presenceSeconds, 300)
+  assert.equal(configFrom({}).presenceSeconds, 300)
+})
+
+test('session on screen: an answer given while the hand-off is under way is kept (Not now, Don\u2019t hand off, pausing)', async () => {
+  for (const answer of ['rotator.declineHandoff', 'rotator.cancelWaiting', 'rotator.pause'] as const) {
+    let worker: Awaited<ReturnType<ReturnType<typeof world>['mount']>> | undefined
+    let armed = false
+    const { w } = onTab({
+      settings: { active_terminal: 'ask' },
+      // The last look waits a second between its two reads of the input box: the user answers then.
+      onSleep: (ms) => {
+        if (!armed || ms !== 1000) return
+        armed = false
+        return (answer === 'rotator.pause' ? worker!.request(answer, { paused: true }) : worker!.request(answer, { terminalId: 't1' })) as never
+      }
+    })
+    worker = await w.mount()
+    w.advance(301_000)
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    // The countdown ran out with no sign of the user: the hand-off starts.
+    w.advance(61_000)
+    armed = true
+    await w.rotator.tick()
+    assert.equal(armed, false, `${answer}: the hand-off was under way`)
+    assert.equal(w.host.callsOf('terminal.close').length, 0, `${answer}: the session is not closed`)
+    assert.equal(w.host.callsOf('agent.resume').length, 0, answer)
+    const waiting = w.rotator.snapshot().waiting
+    if (answer === 'rotator.cancelWaiting') assert.deepEqual(waiting, [])
+    else assert.equal(waiting.length, 1, `${answer}: it still waits`)
+    // Nor at the next look: the answer stands.
+    w.advance(30_000)
+    await w.rotator.tick()
+    assert.equal(w.host.callsOf('agent.resume').length, 0, `${answer}: not handed off later either`)
+    await worker.deactivate()
+  }
+})
+
+test('a service that starts a new session: text typed while the summary is put together keeps the old session', async () => {
+  const drafts: Record<string, string> = {}
+  let typing = true
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'codex', state: 'done', sessionId: 'cs1', title: 'fix parser' }],
+    tails: { t1: fx.CODEX_USAGE_LIMIT },
+    drafts,
+    // Reading git for the summary takes a moment (live: up to seconds): the user starts typing.
+    onGit: () => {
+      if (typing) drafts.t1 = 'and one more th'
+    }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.launch').length, 0, 'no new session over text being typed')
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.ok(!w.cliCalls.some((c) => c.startsWith('close')), w.cliCalls.join(','))
+  // Still pending: once the text is gone, it is handed off.
+  typing = false
+  delete drafts.t1
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.launch').length, 1)
+  await worker.deactivate()
+})
+
+test('early when away: running one of the plugin\u2019s commands is a sign of you', async () => {
+  const w = calm({ session: 50, weekly: 40 }, { settings: { away_minutes: 10 } })
+  const worker = await w.mount()
+  w.advance(11 * 60_000)
+  await w.rotator.tick()
+  assert.equal(w.rotator.snapshot().userHere, undefined)
+  await worker.command('rotator.refresh')
+  assert.equal(w.rotator.snapshot().userHere, true)
+  await worker.deactivate()
+})
+
+// ---- review round 2 ---------------------------------------------------------------------------
+
+test('a hold over queued messages is said as that, not as text being typed', async () => {
+  const drafts: Record<string, string> = { t1: 'Press up to edit queued messages' }
+  const w = world({
+    settings: { restore_unsent_text: true },
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, '╭──────────────╮', '│ >', '╰──────────────╯'] },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    drafts
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(stored(w).waiting[0]?.queued, true)
+  assert.match(lastNote(w), /The session has queued messages, which cannot go along\. Once they are sent or cleared, the session hands off to /)
+  assert.ok(!/text you were typing/.test(lastNote(w)), lastNote(w))
+  assert.match(stored(w).history.at(-1)?.why ?? '', /once its queued messages are sent or cleared/)
+  // Typed text is still said as typed text.
+  drafts.t1 = '[Image #1] look at this'
+  const typed = world({
+    settings: { restore_unsent_text: true },
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET, '╭──────────────╮', '│ >', '╰──────────────╯'] },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    drafts: { t1: '[Image #1] look at this' }
+  })
+  const tw = await typed.mount()
+  await tw.emit('agent.status.changed', statusEvent('t1'))
+  assert.match(lastNote(typed), /Send or clear the text you were typing/)
+  assert.equal(stored(typed).waiting[0]?.queued, undefined)
+  // The queued messages are gone: the mark goes with the hold, and the session is handed off.
+  delete drafts.t1
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(stored(w).waiting, [])
+  await worker.deactivate()
+  await tw.deactivate()
+})
+
+test('model cap: pausing while the session is looked at stops the fallback model from being typed', async () => {
+  const drafts: Record<string, string> = {}
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_MODEL_CAP] },
+    settings: { model_fallback: 'claude=fable,sonnet' },
+    drafts
+  })
+  // The user pauses while Orca is asked for unsent text (live: a CLI process).
+  Object.defineProperty(drafts, 't1', {
+    get: () => {
+      w.rotator.state.paused = true
+      return undefined
+    }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(w.typed, [])
+  assert.equal(w.cliCalls.filter((c) => c.startsWith('send')).length, 0)
+  assert.deepEqual(selects(w), [])
+  // The fallback model is still there for the next time.
+  assert.equal(stored(w).modelStep.t1 ?? 0, 0)
+  await worker.deactivate()
+})
+
+test('session on screen: Don’t hand off pressed while the last look stops the hand-off ends the wait for good', async () => {
+  let worker: Awaited<ReturnType<ReturnType<typeof world>['mount']>> | undefined
+  let armed = false
+  const drafts: Record<string, string> = {}
+  const { w } = onTab({
+    settings: { active_terminal: 'ask' },
+    drafts,
+    // Between the two reads of the input box the user starts typing and presses Don't hand off.
+    onSleep: (ms) => {
+      if (!armed || ms !== 1000) return
+      armed = false
+      drafts.t1 = 'wait, one more th'
+      return worker!.request('rotator.cancelWaiting', { terminalId: 't1' }) as never
+    }
+  })
+  worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  w.advance(61_000)
+  armed = true
+  await w.rotator.tick()
+  assert.equal(armed, false, 'the hand-off was under way')
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.deepEqual(w.rotator.snapshot().waiting, [], 'the wait is not started again')
+  delete drafts.t1
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  await worker.deactivate()
+})
+
+test('unsent text shown on screen: what Orca reports is the whole of it, and that is what goes with the session', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    // The screen shows one line of it in the input box.
+    tails: { t1: [...fx.CLAUDE_SESSION_LIMIT, '╭──────────────╮', '│ > fix the parser', '╰──────────────╯'] },
+    drafts: { t1: 'fix the parser\nthen run the tests' },
+    settings: { restore_unsent_text: true }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.ok(w.typed.some((t) => t.text === '\u001b[200~fix the parser\nthen run the tests\u001b[201~'), JSON.stringify(w.typed))
+  await worker.deactivate()
+  // Orca cannot be asked: the text on screen still counts as unsent text (and is what is known).
+  const blind = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: [...fx.CLAUDE_SESSION_LIMIT, '╭──────────────╮', '│ > fix the parser', '╰──────────────╯'] },
+    drafts: { t1: '!' },
+    settings: { restore_unsent_text: false }
+  })
+  const bw = await blind.mount()
+  await bw.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(blind.host.callsOf('terminal.close').length, 0)
+  assert.ok(stored(blind).waiting[0]?.draftAt)
+  assert.equal(stored(blind).waiting[0]?.unchecked, undefined)
+  await bw.deactivate()
+})
+
+test('panel requests: a value that is no yes or no changes nothing; the arrows and Skip show at once', async () => {
+  const w = world({ panes: [], tails: {}, settings: { pick: 'my-order', chain: 'claude:c3, claude:c1' } })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  // Paused stays paused when a request names no state.
+  await worker.request('rotator.pause', { paused: true })
+  await assert.rejects(worker.request('rotator.pause', {} as never))
+  await assert.rejects(worker.request('rotator.pause', { paused: 'no' } as never))
+  assert.equal(w.rotator.state.paused, true)
+  await worker.request('rotator.pause', { paused: false })
+  // A service's switch takes true or false only (anything else would be stored and read as on).
+  await worker.request('rotator.setService', { provider: 'claude', enabled: false })
+  await assert.rejects(worker.request('rotator.setService', { provider: 'claude', enabled: 'off' } as never))
+  await assert.rejects(worker.request('rotator.setService', { provider: 'claude' } as never))
+  assert.equal(w.host.data().settings.service_claude, false)
+  assert.equal(w.rotator.services.claude, false)
+  await assert.rejects(worker.request('rotator.cancelWaiting', {} as never))
+  await assert.rejects(worker.request('rotator.clearCooldown', {} as never))
+  await assert.rejects(worker.request('rotator.switchTo', {} as never))
+  // The answer to an arrow or Skip already has the new order and the switch (no tick in between).
+  assert.deepEqual(w.rotator.snapshot().order?.claude?.slice(0, 2), ['claude:c3', 'claude:c1'])
+  await worker.request('rotator.moveSeat', { seatKey: 'claude:c1', by: -1 })
+  assert.deepEqual(w.rotator.snapshot().order?.claude?.slice(0, 2), ['claude:c1', 'claude:c3'])
+  await worker.request('rotator.setExcluded', { seatKey: 'claude:c2', excluded: true })
+  assert.equal(w.rotator.snapshot().seats.find((x) => x.key === 'claude:c2')?.excluded, true)
+  await worker.deactivate()
+})
+
+test('what is kept in memory per session goes once Orca no longer lists the session', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }, { terminalId: 't9', agent: 'claude', state: 'done', sessionId: 's9' }],
+    tails: { t1: ['⏺ Done.'], t9: ['⏺ Done.'] },
+    claudeUsage: { session: 5, weekly: 5 }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  await worker.emit('agent.status.changed', statusEvent('t9'))
+  const states = (w.rotator as unknown as { paneStates: Map<string, string> }).paneStates
+  assert.deepEqual([...states.keys()].sort(), ['t1', 't9'])
+  // t9 is closed; the next look at the panes (at most every 10 minutes) drops it.
+  w.panes.splice(1, 1)
+  w.advance(11 * 60_000)
+  await w.rotator.tick()
+  assert.deepEqual([...states.keys()], ['t1'])
+  await worker.deactivate()
+})
+
+// ---- fix round 3 (0.3.0) --------------------------------------------------------------------------
+
+test('Skip: a session Orca started before the plugin is not handed off to the account in use when that account is one to Skip', async () => {
+  const w = world({
+    panes: [{ terminalId: 'old', agent: 'claude', state: 'done', sessionId: 's9' }],
+    tails: { old: fx.CLAUDE_SESSION_LIMIT },
+    // The account in use (c1) has plenty of room, so the limited session runs on some other one.
+    claudeUsage: { session: 7, weekly: 18 },
+    settings: { exclude: 'claude:c1' }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('old'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(stored(w).paneSeat.t2, 'claude:c2')
+  await worker.deactivate()
+})
+
+test('When everything is used up: Stop. A session held on screen whose account to go to fills up meanwhile does not start waiting for a reset', async () => {
+  const { w } = onTab({ settings: { active_terminal: 'wait', when_all_used: 'stop' } })
+  const worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.rotator.snapshot().waiting.length, 1)
+  // Every other account is limited by the time the user says to hand off.
+  w.rotator.state.health['claude:c2'] = { cooldownUntil: 1_000_000 + 10 * 3_600_000 }
+  w.rotator.state.health['claude:c3'] = { cooldownUntil: 1_000_000 + 10 * 3_600_000 }
+  assert.equal((await worker.request('rotator.handoffNow', { terminalId: 't1' })).message, 'No other Claude account has room.')
+  assert.deepEqual(w.rotator.snapshot().waiting, [])
+  assert.equal(lastNote(w), 'Claude: no other account has room, and When everything is used up is set to Stop. The session stays where it is.')
+  assert.equal(stored(w).history.at(-1)?.result, 'failed')
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  await worker.deactivate()
+})
+
+test('a hand-off at a limit that fails before the session is closed tries the next account at the next tick', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    failSelect: ['c2']
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).history.at(-1)?.result, 'failed')
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.rotator.snapshot().waiting[0]?.failures, 1)
+  assert.equal(lastNote(w), 'Claude: hand-off to two failed: account c2 needs sign-in. The session was not closed; another account is tried next.')
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2', 'select claude c3'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Continue.' }])
+  assert.deepEqual(w.rotator.snapshot().waiting, [])
+  await worker.deactivate()
+})
+
+test('hand-offs that keep failing are not tried forever: the third failure ends the wait', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    failSelect: ['c2', 'c3']
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2', 'select claude c3'])
+  assert.equal(w.rotator.snapshot().waiting[0]?.failures, 2)
+  // Both are set aside for ten minutes: the session waits for the first of them.
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.equal(selects(w).length, 2)
+  w.advance(11 * MIN)
+  await w.rotator.tick()
+  assert.equal(selects(w).length, 3)
+  assert.deepEqual(w.rotator.snapshot().waiting, [])
+  assert.ok(!/another account is tried next/.test(lastNote(w)), lastNote(w))
+  w.advance(11 * MIN)
+  await w.rotator.tick()
+  assert.equal(selects(w).length, 3)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  await worker.deactivate()
+})
+
+test('Skip: a waiting session whose own account is one to Skip continues on it once it has room again', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_LIMIT_NO_RESET },
+    settings: { exclude: 'claude:c1' },
+    state: { paneSeat: { t1: 'claude:c1' }, health: { 'claude:c2': { cooldownUntil: 1_000_000 + 10 * 3_600_000 }, 'claude:c3': { cooldownUntil: 1_000_000 + 10 * 3_600_000 } } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  // Every other account is limited: it waits, for its own account's reset (an hour away).
+  assert.equal(w.rotator.snapshot().waiting[0]?.wakeAt, 1_000_000 + 3_600_000)
+  w.advance(61 * MIN)
+  await w.rotator.tick()
+  // Nothing is closed and no account is chosen: the session goes on where it is.
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Continue.' }])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.deepEqual(selects(w), [])
+  assert.deepEqual(w.rotator.snapshot().waiting, [])
+  assert.match(lastNote(w), /^Claude: one has reset; the session continues there\.$/)
+  await worker.deactivate()
+})
+
+test('session on screen: the tick comes when a countdown runs out, not up to a tick later', async () => {
+  const { w } = onTab()
+  const worker = await w.mount()
+  assert.equal(w.rotator.countdownDueIn(), undefined)
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.rotator.countdownDueIn(), 60_000)
+  w.advance(45_000)
+  assert.equal(w.rotator.countdownDueIn(), 15_000)
+  assert.equal(nextTickMs(30_000, w.rotator.countdownDueIn()), 15_250)
+  // Paused, nothing counts down; one that has run out is the ordinary tick's.
+  await w.rotator.setPaused(true)
+  assert.equal(w.rotator.countdownDueIn(), undefined)
+  await w.rotator.setPaused(false)
+  w.advance(20_000)
+  assert.equal(w.rotator.countdownDueIn(), undefined)
+  assert.equal(nextTickMs(30_000, undefined), 30_000)
+  assert.equal(nextTickMs(30_000, 60_000), 30_000)
+  assert.equal(nextTickMs(30_000, 0), 1000)
+  await worker.deactivate()
+})
+
+test('session on screen: the other pane of a split tab is on screen too, and is held like the one with the cursor', async () => {
+  // t9 has the cursor; t1 is the pane beside it in the same tab.
+  const { w } = onTab({ activeTerminals: ['t9'], visibleTerminals: ['t9', 't1'], focusedTerminals: ['t1', 't9'] })
+  const worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.ok(w.rotator.snapshot().waiting[0]?.activeSince !== undefined, JSON.stringify(w.rotator.snapshot().waiting))
+  await worker.deactivate()
+})
+
+// ---- Fix round 4 (0.3.0) ------------------------------------------------------------------------
+
+test('unsent text: a Codex session that waits for it says so once, also with Put unsent text back on', async () => {
+  // Plain text goes along only with a session that resumes as itself. A Codex session starts
+  // anew, so it waits: one notice and one History line, however many ticks look at it again.
+  const w = world({
+    panes: [{ terminalId: 'k1', agent: 'codex', state: 'done', sessionId: 'cs1' }],
+    tails: { k1: [...fx.CODEX_USAGE_LIMIT, '', '› and bump the version', '  gpt-5 default · ~/projects/demo'] },
+    settings: { restore_unsent_text: true }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('k1'))
+  for (let i = 0; i < 3; i++) {
+    w.advance(30_000)
+    await w.rotator.tick()
+  }
+  await worker.emit('agent.status.changed', statusEvent('k1'))
+  assert.equal(w.host.callsOf('agent.launch').length, 0)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(notes(w).filter((n) => /Send or clear/.test(n)).length, 1, notes(w).join('\n'))
+  assert.equal(stored(w).history.filter((h) => h.result === 'waiting').length, 1)
+  assert.ok(stored(w).waiting[0]?.draftAt !== undefined)
+  // Once the text is gone the session is handed off.
+  w.tails.k1 = [...fx.CODEX_USAGE_LIMIT, '', '› Ask Codex to do anything', '  gpt-5 default · ~/projects/demo']
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.launch').length, 1)
+  await worker.deactivate()
+})
+
+test('Codex hand-off after a wait: the summary names the limit and never repeats its banner as a line of its own', async () => {
+  // Held as the session on screen, the hand-off comes from the tick, which has no banner in hand.
+  const w = world({
+    panes: [{ terminalId: 'k1', agent: 'codex', state: 'done', sessionId: 'cs1' }],
+    tails: { k1: fx.CODEX_USAGE_LIMIT },
+    settings: { active_terminal: 'wait' },
+    activeTerminals: ['k1'],
+    focusedTerminals: ['k1']
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('k1'))
+  assert.equal(w.host.callsOf('agent.launch').length, 0)
+  assert.equal(await w.rotator.handoffNow('k1'), undefined)
+  const prompt = (w.host.callsOf('agent.launch') as { prompt: string }[])[0]!.prompt
+  assert.match(prompt, /It stopped because: ■ You've hit your usage limit/)
+  // No line of the summary is a limit banner: echoed in the new session it must not read as a limit there.
+  for (const line of prompt.split('\n')) assert.equal(classifyLine('codex', line), null, line)
+  await worker.deactivate()
+})
+
+test('a waiting session that goes on where it is: a first message that cannot be typed is said, and the tick goes on', async () => {
+  const usage = { session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }
+  let fail = false
+  const w = calm(usage, { tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] }, refuseHostSend: true, failSend: () => fail })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting[0]?.hold, 'short')
+  w.advance(4 * MIN + 1000)
+  usage.session = 0
+  usage.sessionReset = 1_000_000 + 5 * 3_600_000
+  fail = true
+  await w.rotator.tick()
+  assert.deepEqual(w.typed, [])
+  assert.match(lastNote(w), /has reset\. The first message could not be typed, so the session is left for you to continue\.$/)
+  assert.equal(stored(w).waiting.length, 0)
+  assert.notEqual(stored(w).history.at(-1)?.result, 'retried')
+  await worker.deactivate()
+})
+
+test('pause stops a waiting session from going on where it is, also when it comes while the accounts are read', async () => {
+  const usage = { session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }
+  // The tick reads the accounts first; the look at the waiting session reads them again, afresh.
+  let pauseNow = false
+  let reads = 0
+  let w!: ReturnType<typeof calm>
+  w = calm(usage, {
+    tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] },
+    onListAccounts: async () => {
+      if (pauseNow && ++reads === 2) await w.rotator.setPaused(true)
+    }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting[0]?.hold, 'short')
+  w.advance(4 * MIN + 1000)
+  usage.session = 0
+  usage.sessionReset = 1_000_000 + 5 * 3_600_000
+  pauseNow = true
+  await w.rotator.tick()
+  assert.equal(reads, 2)
+  assert.equal(w.rotator.state.paused, true)
+  assert.deepEqual(w.typed, [])
+  assert.equal(stored(w).waiting.length, 1)
+  // Un-paused, it goes on at the next tick.
+  pauseNow = false
+  await w.rotator.setPaused(false)
+  w.advance(30_000)
+  await w.rotator.tick()
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Continue.' }])
+  await worker.deactivate()
+})
+
+function classifyLine(provider: 'codex' | 'claude', line: string) {
+  return classify(provider, [line], 0)
+}
+
+/** A clock with timers a test fires by hand. */
+function fakeClock(options: { run: () => Promise<void>; due?: () => number | undefined }) {
+  const timers: { fn: () => void; ms: number; cleared: boolean }[] = []
+  const logs: string[] = []
+  const clock = ticker({
+    period: async () => 30_000,
+    due: () => options.due?.(),
+    run: options.run,
+    log: (m) => logs.push(m),
+    setTimer: (fn, ms) => {
+      const t = { fn, ms, cleared: false }
+      timers.push(t)
+      return t
+    },
+    clearTimer: (handle) => {
+      ;(handle as { cleared: boolean }).cleared = true
+    }
+  })
+  const pending = () => timers.filter((t) => !t.cleared)
+  return {
+    clock,
+    logs,
+    pending,
+    /** Fires the one timer that is set. */
+    fire() {
+      const [t] = pending()
+      assert.ok(t, 'no timer is set')
+      t.cleared = true
+      t.fn()
+    },
+    settle: async () => {
+      for (let i = 0; i < 20; i++) await Promise.resolve()
+    }
+  }
+}
+
+test('the tick clock: one timer at a time, and it goes on after a tick that fails', async () => {
+  let runs = 0
+  const c = fakeClock({
+    run: async () => {
+      if (++runs === 1) throw new Error('boom')
+    }
+  })
+  await c.clock.schedule()
+  await c.clock.schedule()
+  assert.deepEqual(c.pending().map((t) => t.ms), [30_000])
+  c.fire()
+  await c.settle()
+  assert.equal(runs, 1)
+  assert.deepEqual(c.logs, ['tick failed: boom'])
+  assert.deepEqual(c.pending().map((t) => t.ms), [30_000])
+  c.fire()
+  await c.settle()
+  assert.equal(runs, 2)
+  assert.equal(c.pending().length, 1)
+  c.clock.stop()
+})
+
+test('the tick clock: a countdown that runs out sooner sets the tick to then', async () => {
+  let due: number | undefined = 12_000
+  const c = fakeClock({ run: async () => undefined, due: () => due })
+  await c.clock.schedule()
+  assert.deepEqual(c.pending().map((t) => t.ms), [12_250])
+  due = undefined
+  c.fire()
+  await c.settle()
+  assert.deepEqual(c.pending().map((t) => t.ms), [30_000])
+  c.clock.stop()
+})
+
+test('the tick clock: two ticks never run at once; one that comes due while another runs waits for it', async () => {
+  let runningNow = 0
+  let most = 0
+  let runs = 0
+  const releases: (() => void)[] = []
+  const c = fakeClock({
+    run: async () => {
+      runs++
+      most = Math.max(most, ++runningNow)
+      await new Promise<void>((resolve) => releases.push(resolve))
+      runningNow--
+    }
+  })
+  await c.clock.schedule()
+  c.fire()
+  await c.settle()
+  assert.equal(runs, 1)
+  // While that tick runs (a hand-off takes a while), the tick is set afresh twice (a setting
+  // changed, a countdown began) and comes due each time.
+  await c.clock.schedule()
+  c.fire()
+  await c.clock.schedule()
+  c.fire()
+  await c.settle()
+  assert.equal(runs, 1)
+  releases.shift()!()
+  await c.settle()
+  // The two that came due meanwhile are one run, after the first.
+  assert.equal(runs, 2)
+  assert.equal(most, 1)
+  releases.shift()!()
+  await c.settle()
+  assert.equal(runs, 2)
+  assert.equal(c.pending().length, 1)
+  c.clock.stop()
+})
+
+test('the tick clock: stopped (the worker is deactivated), no timer is left and a tick under way sets none', async () => {
+  let release!: () => void
+  let runs = 0
+  const c = fakeClock({
+    run: async () => {
+      runs++
+      await new Promise<void>((resolve) => (release = resolve))
+    }
+  })
+  await c.clock.schedule()
+  c.fire()
+  await c.settle()
+  const setting = c.clock.schedule()
+  c.clock.stop()
+  await setting
+  release()
+  await c.settle()
+  assert.equal(c.pending().length, 0)
+  await c.clock.schedule()
+  await c.clock.now()
+  assert.equal(c.pending().length, 0)
+  assert.equal(runs, 1)
+})
+
+test('Skip and the account order: two quick presses both count', async () => {
+  const w = world({ panes: [], tails: {}, settings: { pick: 'my-order' } })
+  const worker = await w.mount()
+  await Promise.all([
+    worker.request('rotator.setExcluded', { seatKey: 'claude:c2', excluded: true }),
+    worker.request('rotator.setExcluded', { seatKey: 'claude:c3', excluded: true })
+  ])
+  assert.equal(w.host.data().settings.exclude, 'claude:c2, claude:c3')
+  const before = w.rotator.snapshot().order!.claude!
+  // The last account moved up twice ends two places higher, not one.
+  const last = before.at(-1)!
+  await Promise.all([worker.request('rotator.moveSeat', { seatKey: last, by: -1 }), worker.request('rotator.moveSeat', { seatKey: last, by: -1 })])
+  const after = w.rotator.snapshot().order!.claude!
+  assert.equal(after.indexOf(last), before.length - 3, `${before.join(',')} → ${after.join(',')}`)
+  await worker.deactivate()
+})
+
+test('API error: pausing while the input box is read stops the retry', async () => {
+  let w!: ReturnType<typeof world>
+  let pauseNow = false
+  const drafts = {
+    get t1() {
+      if (pauseNow) void w.rotator.setPaused(true)
+      return ''
+    }
+  }
+  w = world({ panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }], tails: { t1: fx.CLAUDE_API_ERROR }, drafts, onSleep: () => (pauseNow = true) })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.rotator.state.paused, true)
+  assert.deepEqual(w.typed, [])
+  await worker.deactivate()
+})
+
+test('Wait and resume: a session whose own account resets first goes on in the pane it is in; nothing is closed', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_LIMIT_NO_RESET },
+    state: { health: { 'claude:c2': { cooldownUntil: 1_000_000 + 180 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 180 * MIN }, 'claude:system': { cooldownUntil: 1_000_000 + 180 * MIN } } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting[0]?.fromSeat, 'claude:c1')
+  w.advance(61 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Continue.' }])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(stored(w).waiting.length, 0)
+  assert.deepEqual(stored(w).history.at(-1), { ...stored(w).history.at(-1), reason: 'reset', result: 'retried', from: 'claude:c1', to: 'claude:c1' })
+  assert.equal(lastNote(w), 'Claude: one has reset; the session continues there.')
+  await worker.deactivate()
+})
+
+test('Wait and resume, a service that cannot resume: a Codex session whose own account resets keeps its conversation (no new session from a summary)', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'codex', state: 'done', sessionId: 'cs1' }],
+    tails: { t1: fx.CODEX_USAGE_LIMIT },
+    state: { health: { 'codex:x2': { cooldownUntil: 1_000_000 + 5 * 1440 * MIN }, 'codex:system': { cooldownUntil: 1_000_000 + 5 * 1440 * MIN } } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting.length, 1)
+  w.advance(3 * 1440 * MIN)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.launch').length, 0)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Continue.' }])
+  assert.equal(lastNote(w), 'Codex: one has reset; the session continues there.')
+  await worker.deactivate()
+})
+
+test('Wait and resume: with text typed in the session whose own account reset, Claude is handed off as before and the text goes along; no first message set says so', async () => {
+  const health = { 'claude:c2': { cooldownUntil: 1_000_000 + 180 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 180 * MIN }, 'claude:system': { cooldownUntil: 1_000_000 + 180 * MIN } }
+  const drafts: Record<string, string> = {}
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_LIMIT_NO_RESET },
+    settings: { restore_unsent_text: true },
+    drafts,
+    state: { health }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  drafts.t1 = 'and then the tests'
+  w.advance(61 * MIN)
+  await w.rotator.tick()
+  // Typing "Continue." there would send the text with it: the session is resumed, and the text put back.
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.ok(w.typed.some((t) => t.text.includes('and then the tests')), JSON.stringify(w.typed))
+  await worker.deactivate()
+
+  const quiet = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_LIMIT_NO_RESET },
+    settings: { auto_message: '' },
+    state: { health }
+  })
+  const qw = await quiet.mount()
+  await qw.emit('agent.status.changed', statusEvent('t1'))
+  quiet.advance(61 * MIN)
+  await quiet.rotator.tick()
+  assert.deepEqual(quiet.typed, [])
+  assert.equal(quiet.host.callsOf('terminal.close').length, 0)
+  assert.equal(lastNote(quiet), 'Claude: one has reset. No first message is set, so the session is left for you to continue.')
+  await qw.deactivate()
+})
+
+test('restart: the state 0.2.1 stored loads as it is; its waiting session is resumed at its time', async () => {
+  const old = {
+    paused: false,
+    health: { 'claude:c1': { cooldownUntil: 1_000_000 + 30 * MIN, reason: 'rate_limit: 5-hour limit reached', resetKnown: true }, 'claude:c2': { cooldownUntil: 1_000_000 + 10 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 20 * MIN }, 'claude:system': { cooldownUntil: 1_000_000 + 20 * MIN } },
+    paneSeat: { t1: 'claude:c1' },
+    seen: { 'session:s1': { fingerprint: classify('claude', fx.CLAUDE_SESSION_LIMIT, 1_000_000)!.fingerprint, occurrences: 1 } },
+    apiRetries: {},
+    modelStep: {},
+    waiting: [{ terminalId: 't1', workspaceId: 'w1', agent: 'claude', sessionId: 's1', fromSeat: 'claude:c1', wakeAt: 1_000_000 + 10 * MIN }],
+    history: [{ at: 1_000_000 - MIN, terminalId: 't1', provider: 'claude', from: 'claude:c1', reason: 'rate_limit', result: 'waiting', detail: 'until 9:00 am' }],
+    lastAutoSwitchAt: {},
+    // 0.2.1 only: the note about its `custom` mode.
+    customNoticeSeen: true
+  }
+  const w = world({ panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }], tails: { t1: fx.CLAUDE_SESSION_LIMIT }, state: old as never })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  const snap = w.rotator.snapshot()
+  assert.equal(snap.waiting.length, 1)
+  assert.equal(snap.history.length, 1)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  // The old banner is still on screen: its event is not a new limit.
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).history.length, 1)
+  w.advance(11 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(stored(w).history.at(-1)?.result, 'resumed')
+  assert.equal(stored(w).waiting.length, 0)
+  await worker.deactivate()
+})
+
+test('restart: stored state with a part that is not what it should be starts that part empty, never stops the worker', async () => {
+  const broken = { paused: 'yes', health: null, paneSeat: [], waiting: [{ terminalId: 't9' }, null, { terminalId: 't1', workspaceId: 'w1', agent: 'gemini', wakeAt: 1 }], history: 'none' }
+  const w = world({ panes: [], tails: {}, state: broken as never })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  assert.deepEqual(w.rotator.state.waiting, [])
+  assert.deepEqual(w.rotator.state.history, [])
+  assert.deepEqual(w.rotator.state.health, {})
+  assert.equal(w.rotator.state.paused, false)
+  assert.equal(w.rotator.snapshot().seats.length > 0, true)
+  await worker.deactivate()
+})
+
+test('restart while the session on screen counts down: you are taken to be here, so it is not handed off at once; the countdown starts again once you are away', async () => {
+  const { w } = onTab({
+    settings: { active_terminal: 'ask' },
+    state: {
+      health: { 'claude:c1': { cooldownUntil: 1_000_000 + 60 * MIN, reason: 'rate_limit: 5-hour limit reached', resetKnown: true } },
+      paneSeat: { t1: 'claude:c1' },
+      seen: { 'session:s1': { fingerprint: classify('claude', fx.CLAUDE_SESSION_LIMIT, 1_000_000)!.fingerprint, occurrences: 1 } },
+      // The countdown ran out while the worker was down.
+      waiting: [{ terminalId: 't1', workspaceId: 'w1', agent: 'claude', sessionId: 's1', fromSeat: 'claude:c1', wakeAt: 1_000_000 - 120_000, reason: 'rate_limit', activeSince: 1_000_000 - 120_000, asked: true, toldHeld: true, toldCountdown: true, countdownFrom: 1_000_000 - 70_000, countdownUntil: 1_000_000 - 10_000 }]
+    }
+  })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(stored(w).waiting.length, 1)
+  assert.equal(stored(w).waiting[0]!.countdownUntil, undefined)
+  assert.equal(w.rotator.countdownDueIn(), undefined)
+  // Still asked in the panel, and nothing said twice.
+  assert.equal(stored(w).waiting[0]!.asked, true)
+  assert.equal(bodies(w).length, 0, bodies(w).join(' | '))
+  // No sign of you for 5 minutes: it counts down again, and the tick is set to its end.
+  w.advance(301_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.rotator.countdownDueIn(), 60_000)
+  w.advance(61_000)
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.equal(stored(w).waiting.length, 0)
+  await worker.deactivate()
+})
+
+test('restart while paused: it stays paused, and waiting sessions stay where they are', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    inactiveClaude: { c2: { session: 5, weekly: 5 } },
+    state: { paused: true, waiting: [{ terminalId: 't1', workspaceId: 'w1', agent: 'claude', sessionId: 's1', fromSeat: 'claude:c1', wakeAt: 1_000_000 - 1000 }] }
+  })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  assert.equal(w.rotator.snapshot().paused, true)
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.deepEqual(w.typed, [])
+  assert.equal(stored(w).waiting.length, 1)
+  await worker.deactivate()
+})
+
+test('Custom order with a Skipped account: a limit hands off to the highest account in the order with room that is not skipped', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { pick: 'my-order', chain: 'claude:c3, claude:c2, claude:c1', exclude: 'claude:c3' },
+    inactiveClaude: { c2: { session: 20, weekly: 20 }, c3: { session: 5, weekly: 5 } }
+  })
+  const worker = await w.mount()
+  assert.deepEqual(w.rotator.snapshot().order?.claude?.slice(0, 3), ['claude:c3', 'claude:c2', 'claude:c1'])
+  assert.equal(w.rotator.snapshot().seats.find((s) => s.key === 'claude:c3')?.excluded, true)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(stored(w).history.at(-1)?.to, 'claude:c2')
+  // Nor is the skipped account gone back to afterwards, though it is first in the order.
+  w.advance(10 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  await worker.deactivate()
+})
+
+test('session on screen: a held session whose own account resets is not typed into while you are using Orca; it goes on there once the hold ends', async () => {
+  const usage = { session: 100, weekly: 40 }
+  const { w } = onTab({ claudeUsage: usage, inactiveClaude: { c2: { session: 5, weekly: 5 } }, state: { paneSeat: { t1: 'claude:c1' } } })
+  const worker = await w.mount()
+  // Past the start-up (you are taken to be here for 5 minutes): the limit starts a countdown.
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.ok(stored(w).waiting[0]?.countdownUntil !== undefined)
+  // You come back (using the panel), and meanwhile the session's own account has reset while the
+  // account it was to go to is set aside.
+  w.advance(20_000)
+  w.rotator.notePresence()
+  usage.session = 0
+  w.rotator.state.health = { 'claude:c2': { cooldownUntil: 1_000_000 + 600 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 600 * MIN }, 'claude:system': { cooldownUntil: 1_000_000 + 600 * MIN } }
+  await w.rotator.tick()
+  assert.deepEqual(w.typed, [], 'nothing is typed into the session on screen while you are here')
+  assert.equal(stored(w).waiting.length, 1)
+  assert.equal(stored(w).waiting[0]!.countdownUntil, undefined)
+  assert.equal(lastNote(w), 'Claude: one is free again. The session on screen was left as it is. It continues there when you switch to another tab or step away, or press Hand off now in Auto Hand-off.')
+  // No sign of you for 5 minutes, then the countdown: it goes on in the pane it is in.
+  w.advance(301_000)
+  await w.rotator.tick()
+  assert.deepEqual(w.typed, [])
+  w.advance(61_000)
+  await w.rotator.tick()
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Continue.' }])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(stored(w).waiting.length, 0)
+  await worker.deactivate()
+})
+
+// ---- safety rules, checked on everything the plugin does -----------------------------------------
+
+/** What must hold for every act of the plugin when nothing was asked for by hand (no panel
+ *  switch, no command): the safety rules, as the fake Orca saw them at the moment of each act. */
+function checkActs(w: ReturnType<typeof world>, restore: boolean, where: string): void {
+  const says = (a: Act, rule: string) => `${where}: ${rule}: ${JSON.stringify(a)}\nall acts: ${JSON.stringify(w.acts)}`
+  const between = (a: Act) => a.state === 'waiting' || a.state === 'done'
+  /** What the session's input box held: text, '' when empty, or undefined when Orca could not say. */
+  const box = (a: Act): string | undefined => {
+    if (a.screenDraft) return a.draft && a.draft !== '!' && a.draft !== '?' ? a.draft : a.screenDraft
+    return a.draft === '!' || a.draft === '?' ? undefined : (a.draft ?? '')
+  }
+  const plain = (text: string) => !/\[(Image|Pasted text)[^\]]*#\d+/.test(text) && !/press up to edit queued messages/i.test(text) && text.length <= 4000 && !text.includes('\u001b')
+  // Nothing was asked of Orca that it refuses for its size (a notification never shown, a first
+  // message never sent), and what is stored and what the panel is sent stay within Orca's limits.
+  assert.deepEqual(w.refused, [], `${where}: Orca would have refused these`)
+  assert.ok(JSON.stringify(w.host.data().storage.state ?? null).length * 3 <= 256 * 1024, `${where}: the stored state is too large for Orca's storage`)
+  assert.ok(JSON.stringify(w.rotator.snapshot()).length * 3 <= 64 * 1024, `${where}: the snapshot is too large for a panel message`)
+  w.acts.forEach((a, i) => {
+    // Pause, and a service's Automatic hand-off off, stop every automatic action.
+    assert.equal(a.paused, false, says(a, 'acted while paused'))
+    assert.equal(a.serviceOn, true, says(a, 'acted for a service whose automatic hand-off is off'))
+    if (a.kind === 'close') {
+      // Never mid-turn; never over unsent text or queued messages, nor when Orca cannot say.
+      assert.ok(between(a), says(a, 'closed a session in the middle of a turn'))
+      const text = box(a)
+      assert.notEqual(text, undefined, says(a, 'closed a session whose input box Orca could not report'))
+      if (text) {
+        assert.ok(restore && a.agent === 'claude' && !!a.sessionId && plain(text), says(a, 'closed a session over unsent text that cannot go along'))
+        // Text that went along is put back, or kept in History.
+        const back = w.acts.slice(i + 1).some((b) => b.kind === 'paste' && (b.text ?? '').includes(text))
+        const kept = w.rotator.state.history.some((h) => h.unsent === text)
+        assert.ok(back || kept, says(a, 'unsent text neither put back nor kept in History'))
+      }
+      // The same session, on the same service: resumed as itself right after, or started anew
+      // right before, by an agent of that service.
+      const next = w.acts[i + 1]
+      const prev = w.acts[i - 1]
+      if (next?.kind === 'resume') {
+        assert.equal(next.agent, a.agent, says(a, 'resumed with another service'))
+        assert.equal(next.sessionId, a.sessionId, says(a, 'resumed another session'))
+      } else assert.ok(prev?.kind === 'launch' && prev.agent === a.agent, says(a, 'closed without a new session of the same service'))
+    }
+    if (a.kind === 'resume') assert.equal(w.acts[i - 1]?.kind, 'close', says(a, 'resumed without closing'))
+    if (a.kind === 'type') {
+      // Typing with Enter sends whatever is in the input box, and lands in a running turn.
+      assert.ok(between(a), says(a, 'typed into a session in the middle of a turn'))
+      assert.equal(box(a), '', says(a, 'typed into a session whose input box was not known to be empty'))
+    }
+    if (a.kind === 'paste') assert.equal(box(a), '', says(a, 'put text into an input box that was not known to be empty'))
+    if (a.kind === 'select') {
+      // Only ever an account of the same service.
+      const family = a.accountId === 'system' ? a.agent : a.accountId?.startsWith('c') ? 'claude' : a.accountId?.startsWith('x') ? 'codex' : undefined
+      assert.equal(family, a.agent, says(a, 'selected an account of another service'))
+    }
+  })
+}
+
+/** A small seeded generator (mulberry32), so a failing case can be run again by its seed. */
+function seeded(seed: number) {
+  let a = seed >>> 0
+  const next = () => {
+    a = (a + 0x6d2b79f5) >>> 0
+    let t = a
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+  const pick = <T,>(items: readonly T[]): T => items[Math.floor(next() * items.length)]!
+  return { next, pick, chance: (p: number) => next() < p }
+}
+
+/** One made-up situation: sessions of Claude and Codex in any state, limits, API errors and model
+ *  limits on their screens, text (or queued messages, or no answer from Orca) in their input boxes,
+ *  any settings, sessions already waiting; then events, ticks and time, with the user typing,
+ *  starting turns, pausing and switching services on and off in between, and in the seconds a
+ *  hand-off takes. Nothing is asked for by hand, so every act is the plugin's own. */
+async function madeUp(seed: number, hard = false) {
+  const r = seeded(seed)
+  const DRAFTS = ['', '', '', '', 'half a prompt', 'fix the\nparser', '[Image #1] look at this', 'Press up to edit queued messages', '!', '?']
+  // `hard`: also text in other scripts and with shell syntax, text too long to go along or with a
+  // control sequence in it, accounts set to Skip, an account list that changes under the plugin
+  // (accounts removed, an empty or broken answer, no answer), settings changed in Orca while
+  // sessions wait, the same event many times over, and events and ticks at the same moment.
+  if (hard) DRAFTS.push('修正 parser 🐛 "q" $(id) `x` \\ --enter', 'y'.repeat(4500), 'odd\u001b[201~\nrm -rf build')
+  const LISTS = ['ok', 'ok', 'ok', 'ok', 'empty', 'null', 'fails', 'no-c1', 'no-c2', 'only-c1', 'rows', 'nothing-selected'] as const
+  let listing: (typeof LISTS)[number] = 'ok'
+  // …and Orca, for a while, not saying which agents run.
+  let agentsDown = false
+  const listed = (list: Record<string, any>): any => {
+    const claude = (change: Record<string, unknown>) => ({ ...list, claude: { ...list.claude, ...change } })
+    const without = (id: string) => list.claude.accounts.filter((a: any) => a.id !== id)
+    switch (listing) {
+      case 'empty':
+        return {}
+      case 'null':
+        return null
+      case 'fails':
+        throw new Error('orca account list: runtime_unavailable')
+      case 'no-c1':
+        return claude({ accounts: without('c1'), ...(list.claude.activeAccountId === 'c1' ? { activeAccountId: 'c2' } : {}) })
+      case 'no-c2':
+        return claude({ accounts: without('c2'), ...(list.claude.activeAccountId === 'c2' ? { activeAccountId: null } : {}) })
+      case 'only-c1':
+        return claude({ accounts: list.claude.accounts.slice(0, 1), activeAccountId: 'c1', systemDefaultHome: null })
+      case 'rows':
+        return claude({ accounts: [null, 7, { email: 'no-id@example.test' }, { id: 42 }, ...list.claude.accounts.map((a: any) => (a.id === 'c2' ? { ...a, email: { odd: true } } : a))] })
+      case 'nothing-selected':
+        return claude({ activeAccountId: 'c9' })
+      default:
+        return list
+    }
+  }
+  const TAILS: Record<string, string[][]> = {
+    claude: [fx.CLAUDE_SESSION_LIMIT, fx.CLAUDE_LIMIT_NO_RESET, fx.CLAUDE_MODEL_CAP, fx.CLAUDE_API_ERROR, fx.CLAUDE_TALKING_ABOUT_LIMITS, [...fx.CLAUDE_LIMIT_NO_RESET, '❯ typed on screen']],
+    codex: [fx.CODEX_USAGE_LIMIT, fx.CODEX_OLLAMA_CREDITS, ['• Edited src/app.ts (+4 -1)', '', '› Ask Codex to do anything']]
+  }
+  const STATES = ['done', 'done', 'done', 'waiting', 'working', 'blocked'] as const
+  const panes: Pane[] = []
+  const tails: Record<string, string[]> = {}
+  const drafts: Record<string, string> = {}
+  const count = 1 + Math.floor(r.next() * 3)
+  for (let i = 1; i <= count; i++) {
+    const agent = r.chance(0.65) ? 'claude' : 'codex'
+    const id = `p${i}`
+    panes.push({ terminalId: id, agent, state: r.pick(STATES), ...(r.chance(0.85) ? { sessionId: `s-${id}` } : {}) })
+    tails[id] = r.pick(TAILS[agent]!)
+    const text = r.pick(DRAFTS)
+    if (text) drafts[id] = text
+  }
+  const ids = panes.map((p) => p.terminalId)
+  const restore = r.chance(0.5)
+  const settings: Record<string, string | number | boolean> = {
+    timing: r.pick(['early', 'early', 'at-limit']),
+    pick: r.pick(['smart', 'smart', 'my-order']),
+    chain: r.chance(0.3) ? 'claude:c2, claude:c1, claude:c3' : '',
+    when_all_used: r.pick(['wait', 'wait', 'stop']),
+    active_terminal: r.pick(['ask', 'careful', 'wait', 'now']),
+    restore_unsent_text: restore,
+    away_minutes: r.pick([0, 0, 10]),
+    idle_minutes: r.pick([15, 15, 0]),
+    model_fallback: r.chance(0.4) ? 'claude=sonnet,haiku' : '',
+    auto_message: r.chance(0.85) ? 'Continue.' : '',
+    max_api_retries: r.pick([6, 6, 0]),
+    service_claude: r.chance(0.8),
+    service_codex: r.chance(0.8),
+    ...(hard ? { exclude: r.pick(['', '', 'claude:c2', 'claude:c2, claude:c3', 'claude:*', 'claude:c1', 'codex:x2, codex:system', 'two@example.test']) } : {})
+  }
+  const cooling = () => ({ cooldownUntil: 1_000_000 + r.pick([5, 30, 90, 400]) * MIN, ...(r.chance(0.5) ? { resetKnown: true } : {}) })
+  const health: RotatorState['health'] = {}
+  for (const key of ['claude:c2', 'claude:c3', 'claude:system', 'codex:x2', 'codex:system']) if (r.chance(0.35)) health[key] = cooling()
+  const paneSeat: Record<string, string> = {}
+  for (const p of panes) if (r.chance(0.7)) paneSeat[p.terminalId] = p.agent === 'claude' ? 'claude:c1' : 'codex:x1'
+  const waiting: RotatorState['waiting'] = []
+  for (const p of panes) {
+    if (!r.chance(0.3)) continue
+    const from = p.agent === 'claude' ? 'claude:c1' : 'codex:x1'
+    const base = { terminalId: p.terminalId, workspaceId: 'w1', agent: p.agent as 'claude' | 'codex', ...(p.sessionId ? { sessionId: p.sessionId } : {}), fromSeat: from, wakeAt: 1_000_000 + r.pick([-1000, 5 * MIN, 61 * MIN]) }
+    waiting.push(
+      r.pick([
+        base,
+        { ...base, hold: 'short' as const },
+        { ...base, reason: 'rate_limit' as const, draftAt: 1_000_000 - 1000 },
+        { ...base, reason: 'rate_limit' as const, draftAt: 1_000_000 - 1000, unchecked: true },
+        { ...base, reason: 'rate_limit' as const, activeSince: 1_000_000 - 120_000, countdownFrom: 1_000_000 - 70_000, countdownUntil: 1_000_000 - 10_000 },
+        { ...base, reason: 'rate_limit' as const, activeSince: 1_000_000 - 120_000, asked: true, declined: true },
+        { ...base, reason: 'model_cap' as const, model: 'fable' }
+      ])
+    )
+  }
+  const claudeUsage = r.pick([{ session: 100, weekly: 40 }, { session: 98, weekly: 40 }, { session: 50, weekly: 20 }, { session: 5, weekly: 5 }])
+  const shown = ids.filter(() => r.chance(0.4))
+  // The user, in the seconds a hand-off takes: starts a turn, types, or Orca stops answering.
+  // Only in the waits the plugin looks again after: not in the 1.5 s after its own message (waited
+  // out, not looked at again), and not in the waits of the usage read that follows a switch in
+  // the background (8 s and 62 s), which end at any moment of whatever else is going on.
+  let meddle = r.chance(0.5)
+  let w!: ReturnType<typeof world>
+  const options: Parameters<typeof world>[0] = {
+    panes,
+    tails,
+    drafts,
+    settings,
+    claudeUsage,
+    ...(r.chance(0.5) ? { inactiveClaude: { c2: r.pick([{ session: 5, weekly: 5 }, { session: 100, weekly: 50 }, { session: 60, weekly: 96 }]) } } : {}),
+    activeTerminals: shown,
+    focusedTerminals: r.chance(0.8) ? shown : ids,
+    ...(r.chance(0.3) ? { visibleTerminals: ids } : {}),
+    refuseHostSend: r.chance(0.2),
+    redraw: r.pick([false, true, 'late'] as const),
+    state: { paused: r.chance(0.25), health, paneSeat, waiting },
+    ...(hard ? { accounts: listed, agentsListFails: () => agentsDown } : {}),
+    onSleep: (ms) => {
+      if (!meddle || ms === 1500 || ms === 8000 || ms === 62_000 || !r.chance(0.3)) return
+      const p = r.pick(w.panes)
+      if (!p) return
+      if (r.chance(0.5)) p.state = r.pick(['working', 'blocked'] as const)
+      else drafts[p.terminalId] = r.pick(DRAFTS.filter(Boolean))
+    }
+  }
+  w = world(options)
+  const worker = await w.mount()
+  const steps = 8 + Math.floor(r.next() * 8)
+  /** A turn of `p` ends, or the timer comes: what can happen at the same moment as another. */
+  const eventOrTick = async (i: number): Promise<void> => {
+    const p = w.panes.length ? r.pick(w.panes) : undefined
+    if (!p || r.chance(0.4)) return w.rotator.tick()
+    const event = { ...statusEvent(p.terminalId, r.pick(['done', 'waiting'] as const), i + 2), ...(p.sessionId ? { sessionId: p.sessionId } : {}) }
+    // Sometimes the same event several times over.
+    await Promise.all(Array.from({ length: r.chance(0.3) ? 4 : 1 }, () => worker.emit('agent.status.changed', event)))
+  }
+  for (let i = 0; i < steps; i++) {
+    const p = w.panes.length ? r.pick(w.panes) : undefined
+    const what = r.next()
+    if (hard && r.chance(0.35)) {
+      const kind = r.next()
+      if (kind < 0.45) await Promise.all([eventOrTick(i), eventOrTick(i + 50), ...(r.chance(0.5) ? [eventOrTick(i + 100)] : [])])
+      else if (kind < 0.65) listing = r.pick(LISTS)
+      else if (kind < 0.72) agentsDown = !agentsDown
+      else {
+        const [key, value] = r.pick([
+          ['timing', 'early'],
+          ['timing', 'at-limit'],
+          ['pick', 'smart'],
+          ['pick', 'my-order'],
+          ['when_all_used', 'wait'],
+          ['when_all_used', 'stop'],
+          ['active_terminal', 'ask'],
+          ['active_terminal', 'careful'],
+          ['active_terminal', 'wait'],
+          ['active_terminal', 'now'],
+          ['exclude', ''],
+          ['exclude', 'claude:c2'],
+          ['exclude', 'claude:c3, claude:c2'],
+          ['exclude', 'claude:*, codex:*'],
+          ['chain', 'claude:c3, claude:c1']
+        ] as const)
+        await w.set(key, value)
+      }
+      continue
+    }
+    if (what < 0.3 && p) {
+      // A turn ends (often on a new copy of what its screen showed).
+      if (r.chance(0.4)) w.tails[p.terminalId] = [...(w.tails[p.terminalId] ?? []), '❯ continue', ...(w.tails[p.terminalId] ?? r.pick(TAILS.claude!))]
+      if (r.chance(0.7)) p.state = r.pick(['done', 'waiting'] as const)
+      await worker.emit('agent.status.changed', { ...statusEvent(p.terminalId, r.pick(['done', 'waiting'] as const), i + 2), ...(p.sessionId ? { sessionId: p.sessionId } : {}) })
+    } else if (what < 0.6) {
+      await w.rotator.tick()
+    } else if (what < 0.75) {
+      w.advance(r.pick([30_000, 61_000, 5 * MIN + 1000, 16 * MIN, 61 * MIN, 6 * 60 * MIN]))
+    } else if (what < 0.82 && p) {
+      p.state = r.pick(STATES)
+      w.touch(p.terminalId)
+    } else if (what < 0.89 && p) {
+      const text = r.pick(DRAFTS)
+      if (text) drafts[p.terminalId] = text
+      else delete drafts[p.terminalId]
+    } else if (what < 0.93) {
+      options.activeTerminals = w.panes.map((x) => x.terminalId).filter(() => r.chance(0.4))
+      options.focusedTerminals = options.activeTerminals
+    } else if (what < 0.96) {
+      await worker.request('rotator.pause', { paused: !w.rotator.state.paused })
+    } else if (what < 0.98) {
+      const provider = r.pick(['claude', 'codex'] as const)
+      await worker.request('rotator.setService', { provider, enabled: w.host.data().settings[`service_${provider}`] === false })
+    } else meddle = !meddle
+  }
+  checkActs(w, restore, `seed ${seed}${hard ? ' (hard)' : ''}`)
+  // A session is closed at most once (its pane is gone after that), and resumed once per close.
+  const closedIds = w.acts.filter((a) => a.kind === 'close').map((a) => a.terminalId)
+  assert.equal(new Set(closedIds).size, closedIds.length, `seed ${seed}${hard ? ' (hard)' : ''}: a session was closed twice: ${closedIds.join(',')}`)
+  const acts = w.acts
+  await worker.deactivate()
+  return acts
+}
+
+test('safety, in 1000 made-up situations: nothing is ever closed mid-turn or over text that cannot go along, typed into a busy session or a full input box, handed to another service, or done at all while paused or with the service off', async () => {
+  const done: Record<string, number> = {}
+  for (let seed = 1; seed <= 1000; seed++) for (const a of await madeUp(seed)) done[a.kind] = (done[a.kind] ?? 0) + 1
+  // The situations are not idle ones: the rules above were checked on plenty of each kind of act.
+  for (const kind of ['select', 'close', 'resume', 'launch', 'type', 'paste']) assert.ok((done[kind] ?? 0) >= 10, `only ${done[kind] ?? 0} × ${kind}: ${JSON.stringify(done)}`)
+})
+
+test('session on screen, Not now: the session stays as it is when its own account resets, until another tab is shown', async () => {
+  const usage = { session: 100, weekly: 40 }
+  const { options, w } = onTab({ claudeUsage: usage, inactiveClaude: { c2: { session: 5, weekly: 5 } }, settings: { active_terminal: 'ask' }, state: { paneSeat: { t1: 'claude:c1' } } })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  await worker.request('rotator.declineHandoff', { terminalId: 't1' })
+  usage.session = 0
+  w.rotator.state.health = { 'claude:c2': { cooldownUntil: 1_000_000 + 600 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 600 * MIN }, 'claude:system': { cooldownUntil: 1_000_000 + 600 * MIN } }
+  for (let i = 0; i < 4; i++) {
+    w.advance(10 * MIN)
+    await w.rotator.tick()
+  }
+  assert.deepEqual(w.typed, [])
+  assert.equal(stored(w).waiting.length, 1)
+  // Another tab is shown: it goes on where it is, on its own account. Nothing is closed.
+  options.activeTerminals = ['t9']
+  await w.rotator.tick()
+  assert.deepEqual(w.typed, [{ terminalId: 't1', text: 'Continue.' }])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(stored(w).waiting.length, 0)
+  await worker.deactivate()
+})
+
+test('an early hand-off that the switch cooldown or the room on the other account rules out starts no orca process to look at the session', async () => {
+  // Low, and the account was changed a moment ago: within the cooldown nothing moves early.
+  const w = calm({ session: 97, weekly: 40 }, { state: { paneSeat: { t1: 'claude:c1' }, lastAutoSwitchAt: { claude: 1_000_000 - 1000 } } })
+  const worker = await w.mount()
+  const before = w.lookups.length
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), [])
+  // (One look at the layout per event, for the service in focus: as in 0.2.)
+  assert.deepEqual(w.lookups.slice(before), ['terminals'])
+  // After the cooldown the session is looked at, and handed off.
+  w.advance(6 * MIN)
+  await worker.emit('agent.status.changed', statusEvent('t1', 'done', 2))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.ok(w.lookups.some((l) => l === 'draft t1'))
+  await worker.deactivate()
+})
+
+test('restart: one stored entry that is not what it should be is dropped; the tick and a limit go on as usual', async () => {
+  const broken = { health: { 'claude:c2': null, 'claude:c3': 'limited', 'claude:system': { cooldownUntil: 1_000_000 + 60 * MIN } }, seen: { t7: null }, probation: { claude: null }, leftLow: { 'claude:c2': 5 } }
+  const w = world({ panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }], tails: { t1: fx.CLAUDE_SESSION_LIMIT }, state: broken as never })
+  const worker = await w.mount()
+  await w.rotator.tick()
+  // What was valid is kept.
+  assert.deepEqual(Object.keys(w.rotator.state.health), ['claude:system'])
+  assert.deepEqual(w.rotator.state.probation, {})
+  assert.deepEqual(w.rotator.state.leftLow, {})
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  await worker.deactivate()
+})
+
+test('upgrade: "Switch at usage threshold" off in 0.2 carries over as At limit, where 0.2 ran it', () => {
+  assert.equal(up({ auto_switch_on_threshold: false }).timing, 'at-limit')
+  assert.equal(up({ mode: 'custom', auto_switch_on_threshold: false }).timing, 'at-limit')
+  assert.equal(configFrom(up({ mode: 'custom', auto_switch_on_threshold: false })).runningSessions, 'limit')
+  // Smart or My order chosen in 0.2 overrode it.
+  assert.equal(up({ mode: 'smart', auto_switch_on_threshold: false }).timing, 'early')
+  assert.equal(up({ auto_switch_on_threshold: false, timing: 'early' }).timing, 'at-limit', 'early is the default: untouched')
+  assert.equal(up({ auto_switch_on_threshold: true }).timing, 'early')
+})
+
+test('pause, and a service’s Automatic hand-off off, stop every automatic path: each one acts when on, and does nothing to any session or to the selection when stopped', async () => {
+  type W = ReturnType<typeof world>
+  type Worker = Awaited<ReturnType<W['mount']>>
+  type Path = { name: string; service?: 'claude' | 'codex'; make: () => W; arm?: (w: W, worker: Worker) => Promise<void>; fire: (w: W, worker: Worker) => Promise<void> }
+  const claude = (tail: string[], extra: Partial<Parameters<typeof world>[0]> = {}) => world({ panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }], tails: { t1: tail }, ...extra })
+  const turnEnds = async (_w: W, worker: Worker) => {
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+  }
+  const later = (ms: number) => async (w: W) => {
+    w.advance(ms)
+    await w.rotator.tick()
+  }
+  const othersCooling = { 'claude:c2': { cooldownUntil: 1_000_000 + 180 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 180 * MIN }, 'claude:system': { cooldownUntil: 1_000_000 + 180 * MIN } }
+  const shortReset = { session: 100, weekly: 40, sessionReset: 1_000_000 + 4 * MIN }
+  const drafts: Record<string, string> = {}
+  const paths: Path[] = [
+    { name: 'a limit at a turn end (Claude: resumed)', make: () => claude(fx.CLAUDE_SESSION_LIMIT), fire: turnEnds },
+    { name: 'a limit at a turn end (Codex: a new session)', service: 'codex', make: () => world({ panes: [{ terminalId: 't1', agent: 'codex', state: 'done' }], tails: { t1: fx.CODEX_USAGE_LIMIT }, state: { paneSeat: { t1: 'codex:x1' } } }), fire: turnEnds },
+    { name: 'an API error (retried)', make: () => claude(fx.CLAUDE_API_ERROR), fire: turnEnds },
+    { name: 'a model limit (the fallback model)', make: () => claude(fx.CLAUDE_MODEL_CAP, { settings: { model_fallback: 'claude=sonnet' } }), fire: turnEnds },
+    { name: 'early: a turn ends on an account that is running low', make: () => calm({ session: 97, weekly: 40 }), fire: turnEnds },
+    { name: 'early: an idle session on an account that is running low', make: () => calm({ session: 97, weekly: 40 }), fire: later(16 * MIN) },
+    { name: 'Custom order: back to a higher account', make: () => behind({ health: { 'claude:c2': { resetKnown: true, freedAt: 1_000_000 - 1000 } } }), fire: turnEnds },
+    {
+      name: 'the account for new sessions, while a session is mid-turn on one that is running low',
+      make: () => world({ panes: [{ terminalId: 't1', agent: 'claude', state: 'working', sessionId: 's1' }], tails: { t1: ['⏺ Working on it…'] }, claudeUsage: { session: 97, weekly: 40 }, inactiveClaude: { c2: { session: 5, weekly: 5 } }, state: { paneSeat: { t1: 'claude:c1' } } }),
+      fire: later(30_000)
+    },
+    { name: 'a waiting session whose time has come (handed off)', make: () => parkedWorld(), arm: turnEnds, fire: later(11 * MIN) },
+    { name: 'a waiting session whose own account reset (goes on where it is)', make: () => claude(fx.CLAUDE_LIMIT_NO_RESET, { state: { health: othersCooling } }), arm: turnEnds, fire: later(61 * MIN) },
+    { name: 'a short wait for its own account', make: () => calm({ ...shortReset }, { tails: { t1: [...fx.CLAUDE_LIMIT_NO_RESET] }, laterClaudeUsage: { session: 5, weekly: 5 }, state: { paneSeat: { t1: 'claude:c1' }, health: { 'claude:c1': { cooldownUntil: 1_000_000 + 4 * MIN, resetKnown: true } } } }), arm: turnEnds, fire: later(4 * MIN + 1000) },
+    {
+      name: 'a hand-off that waited for unsent text, once the text is gone',
+      make: () => {
+        drafts.t1 = 'half a prompt'
+        return claude(fx.CLAUDE_SESSION_LIMIT, { drafts, state: { paneSeat: { t1: 'claude:c1' } } })
+      },
+      arm: turnEnds,
+      fire: async (w) => {
+        delete drafts.t1
+        w.advance(30_000)
+        await w.rotator.tick()
+      }
+    },
+    {
+      name: 'the session on screen, once its countdown has run out',
+      make: () => onTab().w,
+      arm: async (w, worker) => {
+        w.advance(301_000)
+        await worker.emit('agent.status.changed', statusEvent('t1'))
+      },
+      fire: later(61_000)
+    }
+  ]
+  for (const path of paths) {
+    for (const stop of ['on', 'paused', 'service off'] as const) {
+      const w = path.make()
+      const worker = await w.mount()
+      await path.arm?.(w, worker)
+      const before = w.acts.length
+      const waiting = stored(w)?.waiting.length ?? 0
+      if (stop === 'paused') await worker.request('rotator.pause', { paused: true })
+      if (stop === 'service off') await worker.request('rotator.setService', { provider: path.service ?? 'claude', enabled: false })
+      await path.fire(w, worker)
+      // Twice more, later: nothing that was put off comes through either.
+      if (stop !== 'on') for (let i = 0; i < 2; i++) await later(20 * MIN)(w)
+      const acts = w.acts.slice(before)
+      if (stop === 'on') assert.ok(acts.length > 0, `${path.name}: nothing was done with automatic hand-off on`)
+      else {
+        assert.deepEqual(acts, [], `${path.name}, ${stop}`)
+        // A session that was waiting still waits, for when automatic hand-off is on again.
+        assert.equal(stored(w)?.waiting.length ?? 0, waiting, `${path.name}, ${stop}: waiting sessions`)
+      }
+      await worker.deactivate()
+    }
+  }
+})
+
+test('upgrade: runs once at the first start of 0.3: 0.2 settings (read by name) become the new ones, then are never read again', async () => {
+  // Real Orca: get() returns declared settings with their defaults and leaves 0.2 keys out; get(key) still has them.
+  const stored: Record<string, unknown> = { switch_early: 'earlier' }
+  const declared = { pick: 'smart', timing: 'early', early_minutes: 10, chain: 'claude:c2, claude:c1' }
+  const sets: [string, unknown][] = []
+  const fakeSettings = {
+    get: async (key?: string) => (key === undefined ? { ...declared } : (stored[key] ?? (declared as Record<string, unknown>)[key])),
+    set: async (key: string, value: unknown) => {
+      sets.push([key, value])
+      ;(declared as Record<string, unknown>)[key] = value
+    },
+    onDidChange: () => ({ dispose() {} })
+  }
+  const { storedSettings } = await import('./worker')
+  const s = await storedSettings({ settings: fakeSettings } as never)
+  assert.equal(s.switch_early, 'earlier', 'a 0.2 key is read by name')
+  const changes = upgradedValues(s)
+  assert.deepEqual(changes, { pick: 'my-order', early_minutes: 25 })
+  for (const [k, v] of Object.entries(changes)) await fakeSettings.set(k, v)
+  assert.deepEqual(sets, [['pick', 'my-order'], ['early_minutes', 25]])
+  // Later, the user picks Auto (the default): the stored 0.2 order must not bring My order back,
+  // because the upgrade never runs again (worker.ts keeps an "upgraded" flag in storage).
+  await fakeSettings.set('pick', 'smart')
+  assert.equal(settingValues(await fakeSettings.get() as Record<string, unknown>).pick, 'smart')
+})
+
+// ---- review round 7: settings as live Orca serves them (fixtures.ts `likeOrca`) -----------------
+
+const limitedClaude = (extra: Partial<Parameters<typeof world>[0]> = {}) =>
+  world({ panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }], tails: { t1: fx.CLAUDE_SESSION_LIMIT }, ...extra })
+const soon = () => new Promise<void>((resolve) => setTimeout(resolve, 5))
+
+test('upgrade, through the worker: 0.2 settings Orca no longer lists are read by name, written as the new ones, and never read again', async () => {
+  const w = limitedClaude({
+    settings: { switch_early: 'at-limit', strategy: 'priority', chain: 'claude:c2, claude:c1', wait_for_reset: false, retry_on_api_error: false, auto_swap_idle_after_seconds: 1800 }
+  })
+  let worker = await w.mount()
+  const s = w.host.data().settings
+  assert.deepEqual([s.pick, s.timing, s.when_all_used, s.max_api_retries, s.idle_minutes], ['my-order', 'at-limit', 'stop', 0, 30])
+  assert.equal(w.host.data().storage['upgraded-0.3'], true)
+  // The panel is told what was carried over, at once.
+  assert.equal(w.rotator.snapshot().mode, 'my-order')
+  assert.equal(w.rotator.snapshot().atLimitOnly, true)
+  assert.deepEqual(await worker.request('rotator.settings', {}).then((v) => [v.pick, v.timing, v.when_all_used]), ['my-order', 'at-limit', 'stop'])
+  // Later the user goes back to the defaults: at the next start the 0.2 values do not return.
+  await worker.request('rotator.settings', { key: 'pick', value: 'smart' })
+  await worker.request('rotator.settings', { key: 'timing', value: 'early' })
+  assert.equal(w.rotator.snapshot().mode, 'smart', 'a change in the Settings tab reaches the badge without waiting for Orca to report it')
+  assert.equal(w.rotator.snapshot().atLimitOnly, undefined)
+  await worker.deactivate()
+  worker = await w.mount()
+  assert.deepEqual([w.host.data().settings.pick, w.host.data().settings.timing], ['smart', 'early'])
+  await worker.deactivate()
+})
+
+test('upgrade: a setup with nothing from 0.2 writes no setting and is marked done; "manual" pauses even when a setting cannot be written', async () => {
+  // (The test world itself sets three settings; none of them is a 0.2 one.)
+  const fresh = world({ panes: [], tails: {}, settings: {} })
+  let worker = await fresh.mount()
+  assert.deepEqual(fresh.host.callsOf('settings.set'), [])
+  assert.equal(fresh.host.data().storage['upgraded-0.3'], true)
+  await worker.deactivate()
+
+  let broken = true
+  const faults: SettingsFaults = { set: () => broken }
+  const w = limitedClaude({ settings: { mode: 'manual', switch_early: 'at-limit' }, storage: { 'migrated-manual': false }, settingsFaults: faults })
+  worker = await w.mount()
+  assert.equal(stored(w).paused, true, 'the pause does not depend on the settings being written')
+  assert.equal(w.host.data().storage['upgraded-0.3'], undefined, 'not done: the At limit choice was not stored')
+  broken = false
+  faults.changed?.('timing')
+  await soon()
+  assert.equal(w.host.data().settings.timing, 'at-limit')
+  assert.equal(w.host.data().storage['upgraded-0.3'], true)
+  assert.equal(w.host.callsOf('notifications.show').filter((n: any) => /kept Auto Hand-off from handing/.test(String(n.body))).length, 1, 'told once')
+  await worker.deactivate()
+})
+
+test('fail closed: while Orca cannot say what the 0.2 settings were, nothing is handed off; once it can, the upgrade is done and hand-offs go on', async () => {
+  let down = true
+  const faults: SettingsFaults = { get: () => down }
+  const w = limitedClaude({ settings: { switch_early: 'at-limit' }, settingsFaults: faults })
+  const worker = await w.mount()
+  assert.equal(w.host.data().storage['upgraded-0.3'], undefined)
+  assert.deepEqual(Object.values(w.rotator.snapshot().services ?? {}).filter(Boolean), [], 'every service counts as off')
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  await w.rotator.tick()
+  assert.deepEqual(w.acts, [], 'no hand-off on settings nobody chose')
+  await worker.deactivate()
+
+  // Orca answers again before the limit: the upgrade is done at the next settings change (or tick).
+  const again: SettingsFaults = { get: () => down }
+  const later = limitedClaude({ settings: { switch_early: 'at-limit' }, settingsFaults: again })
+  const second = await later.mount()
+  down = false
+  again.changed?.('timing')
+  await soon()
+  assert.equal(later.host.data().storage['upgraded-0.3'], true)
+  assert.equal(later.host.data().settings.timing, 'at-limit')
+  assert.equal(later.rotator.snapshot().services?.claude, true)
+  await second.emit('agent.status.changed', statusEvent('t1'))
+  assert.ok(later.cliCalls.includes('select claude c2'), later.cliCalls.join(','))
+  await second.deactivate()
+})
+
+test('fail closed: settings that cannot be read stay as last read; a service that was off is not turned on by the failure', async () => {
+  const { configReader } = await import('./worker')
+  let fail = false
+  let value: Record<string, unknown> = { service_claude: false, timing: 'at-limit' }
+  const logged: string[] = []
+  const read = configReader({ settings: { get: async () => (fail ? Promise.reject(new Error('no host')) : value) } } as never, () => false, (m) => logged.push(m))
+  assert.equal((await read()).services.claude, false)
+  fail = true
+  value = {}
+  const stale = await read()
+  await read()
+  assert.equal(stale.services.claude, false)
+  assert.equal(stale.runningSessions, 'limit')
+  assert.equal(logged.length, 1, 'said once')
+  // What the worker itself stored meanwhile counts, though it cannot be read back.
+  read.wrote('service_codex', false)
+  assert.deepEqual([(await read()).services.codex, (await read()).services.claude, (await read()).services.devin], [false, false, true])
+  // Never read at all: every service off, so no automatic action runs on defaults.
+  const blind = await configReader({ settings: { get: async () => Promise.reject(new Error('no host')) } } as never)()
+  assert.deepEqual(Object.values(blind.services), [false, false, false, false, false])
+})
+
+test('upgrade: "Wait for reset" off and an order followed in 0.2 custom mode carry over; leftovers under Smart do not', () => {
+  assert.equal(up({ wait_for_reset: false }).when_all_used, 'stop')
+  assert.equal(up({ mode: 'custom', wait_for_reset: false }).when_all_used, 'stop')
+  assert.equal(up({ mode: 'smart', wait_for_reset: false }).when_all_used, 'wait', '0.2 Smart ran "When everything is used up", not the old switch')
+  assert.equal(up({ mode: 'custom', chain: 'claude:c2, claude:c1' }).pick, 'my-order')
+  assert.equal(up({ mode: 'custom', chain: 'claude:c2', strategy: 'soonest-reset' }).pick, 'smart')
+  assert.equal(up({ mode: 'smart', chain: 'claude:c2, claude:c1' }).pick, 'smart')
+})
+
+test('"Hand off this workspace\'s session": a background pane Orca lists without a terminal id is not the one meant', async () => {
+  const w = world({ panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1', unlisted: true }], tails: { t1: ['❯ '] } })
+  const worker = await w.mount()
+  assert.equal(await worker.command('rotator.swapThisPane'), 'No agent in the focused workspace')
+  assert.deepEqual(w.acts, [])
+  await worker.deactivate()
+})
+
+// ---- review round 8: the hold on the settings is said in the panel, and ends by itself ----------
+
+test('fail closed, said: while the settings cannot be read the snapshot says why every service is off; the first read that works ends it', async () => {
+  let down = true
+  let fire: (() => void) | undefined
+  const timers = { setTimer: (fn: () => void) => ((fire = fn), 1), clearTimer: () => undefined }
+  const w = limitedClaude({ settings: {}, settingsFaults: { get: () => down }, timers })
+  const worker = await w.mount()
+  await soon()
+  assert.equal(w.rotator.snapshot().held, 'settings')
+  assert.deepEqual(Object.values(w.rotator.snapshot().services).filter(Boolean), [])
+  // The Settings tab is not given the defaults as if they were chosen.
+  await assert.rejects(worker.request('rotator.settings', {}))
+  // Skip and the custom order start from the stored lists: no change while they cannot be read.
+  await assert.rejects(worker.request('rotator.setExcluded', { seatKey: 'claude:c2', excluded: true }), /could not be read yet/)
+  await assert.rejects(worker.request('rotator.moveSeat', { seatKey: 'claude:c2', by: -1 }), /could not be read yet/)
+  assert.deepEqual(w.host.callsOf('settings.set'), [])
+  // The worker's next tick asks again (the upgrade check waited on the same answer).
+  down = false
+  fire!()
+  await soon()
+  assert.equal(w.rotator.snapshot().held, undefined)
+  assert.equal(w.rotator.snapshot().services.claude, true)
+  assert.equal(w.host.data().storage['upgraded-0.3'], true)
+  assert.equal((await worker.request('rotator.settings', {})).timing, 'early')
+  await worker.deactivate()
+})
+
+test('fail closed, said: an upgrade that cannot be finished is said in the snapshot, tried again by the worker\'s own tick, and over once it is done', async () => {
+  let broken = true
+  let fire: (() => void) | undefined
+  const timers = { setTimer: (fn: () => void) => ((fire = fn), 1), clearTimer: () => undefined }
+  const faults: SettingsFaults = { set: () => broken }
+  const w = limitedClaude({ settings: { switch_early: 'at-limit' }, settingsFaults: faults, timers })
+  const worker = await w.mount()
+  await soon()
+  assert.equal(w.rotator.snapshot().held, 'upgrade')
+  assert.equal(w.host.data().storage['upgraded-0.3'], undefined)
+  // *Hand off now* does not say "turn it on": nobody turned it off.
+  w.rotator.state.waiting.push({ terminalId: 't1', workspaceId: 'w1', agent: 'claude', wakeAt: 2_000_000 })
+  assert.equal(await w.rotator.handoffNow('t1'), 'Auto Hand-off is finishing the upgrade. Nothing is handed off until then.')
+  w.rotator.state.waiting.length = 0
+  // A hand-off by hand still works, and the choice is kept for when the hold ends: the service's
+  // automatic hand-off is stored as off (that setting can be written here; the 0.2 ones cannot).
+  broken = false
+  const failing = new Set(['timing'])
+  faults.set = (key) => failing.has(key)
+  const said = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+  assert.match(said.message, /automatic hand-off is now off, because you chose an account yourself/)
+  assert.equal(w.host.data().settings.service_claude, false)
+  assert.ok(w.cliCalls.includes('select claude c2'), w.cliCalls.join(','))
+  assert.equal(w.rotator.snapshot().held, 'upgrade')
+  w.acts.length = 0
+  // Still failing at the next tick: still held, nothing done.
+  fire!()
+  await soon()
+  assert.equal(w.rotator.snapshot().held, 'upgrade')
+  assert.deepEqual(w.acts, [])
+  // Orca takes the settings again: the next tick finishes the upgrade, with no settings change needed.
+  failing.clear()
+  fire!()
+  await soon()
+  assert.equal(w.host.data().storage['upgraded-0.3'], true)
+  assert.equal(w.host.data().settings.timing, 'at-limit')
+  assert.equal(w.rotator.snapshot().held, undefined)
+  // The hold is over: Codex is on again, Claude stays off as chosen by hand.
+  assert.equal(w.rotator.snapshot().services.codex, true)
+  assert.equal(w.rotator.snapshot().services.claude, false)
+  await worker.deactivate()
+})
+
+test('fail closed: a service turned off in the panel while the settings cannot be read back is off at once', async () => {
+  let down = false
+  const w = limitedClaude({ settings: {}, settingsFaults: { get: () => down } })
+  const worker = await w.mount()
+  assert.equal(w.rotator.snapshot().services.claude, true)
+  down = true
+  const { services } = await worker.request('rotator.setService', { provider: 'claude', enabled: false })
+  assert.equal(services.claude, false)
+  assert.equal(w.rotator.snapshot().held, undefined, 'the settings as last read stay in effect: no hold')
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  await w.rotator.tick()
+  assert.deepEqual(w.acts, [], 'nothing is handed off for a service that was turned off')
+  // Skip likewise: the account is skipped though the list cannot be read back.
+  await worker.request('rotator.setExcluded', { seatKey: 'claude:c2', excluded: true })
+  assert.equal(w.rotator.snapshot().seats.find((x) => x.key === 'claude:c2')?.excluded, true)
+  await worker.deactivate()
+})
+
+// ---- round 9: combinations meant to break a safety rule ------------------------------------------
+
+/** What Orca's host API takes (1.4.263, its own schemas): a notification body, a text typed into a
+ *  terminal and an agent's first message; and one stored value. */
+const ORCA_NOTE_MAX = 1000
+const ORCA_TEXT_MAX = 4096
+const ORCA_VALUE_MAX_BYTES = 256 * 1024
+const closed = (w: { acts: Act[] }) => w.acts.filter((a) => a.kind === 'close').map((a) => a.terminalId)
+
+test('a service that starts a new session: the summary is never longer than Orca takes as a first message, whatever the setting', async () => {
+  const output = Array.from({ length: 60 }, (_, i) => `• Edited src/file-${i}.ts ${'x'.repeat(150)}`)
+  for (const max of [6000, 50000]) {
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'codex', state: 'done', sessionId: 'cs1', title: 'fix parser' }],
+      tails: { t1: [...output, ...fx.CODEX_USAGE_LIMIT] },
+      settings: { handoff_max_chars: max }
+    })
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    const launches = w.host.callsOf('agent.launch') as { prompt: string }[]
+    assert.equal(launches.length, 1, `${max}: ${bodies(w).join(' | ')}`)
+    assert.ok(launches[0]!.prompt.length <= ORCA_TEXT_MAX, `${max}: ${launches[0]!.prompt.length} characters`)
+    // Cut from the middle of the old output, so what tells the new session what to do stays.
+    assert.match(launches[0]!.prompt, /^You are taking over a coding session/)
+    assert.match(launches[0]!.prompt, /Do not redo finished work\.$/)
+    assert.equal(stored(w).history.at(-1)?.result, 'handoff')
+    await worker.deactivate()
+  }
+})
+
+test('unsent text that could not be put back: the notification is one Orca shows (not over its size), and says where the text is', async () => {
+  const text = `please ${'look at the parser and the tests '.repeat(60)}end` // about 2000 characters
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    // The new pane's box is not empty (the user is typing there already): nothing is put back.
+    drafts: { t1: text, t2: 'already typing here' },
+    settings: { restore_unsent_text: true }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.equal(stored(w).history.find((h) => h.unsent)?.unsent, text, 'kept in full in History')
+  const notes = w.host.callsOf('notifications.show') as { title: string; body: string }[]
+  const said = notes.find((n) => n.body.includes('could not be put back'))
+  assert.ok(said, notes.map((n) => n.body).join(' | '))
+  for (const n of notes) assert.ok(n.body.length <= ORCA_NOTE_MAX, `${n.body.length} characters: ${n.body.slice(0, 80)}`)
+  assert.match(said!.body, /kept in History/)
+  await worker.deactivate()
+})
+
+test('fail closed: a limit on an SSH target while Orca cannot list the workspaces is not taken for one on this computer', async () => {
+  let down = false
+  const w = sshWorld({ workspaceListFails: () => down })
+  const worker = await w.mount()
+  // Orca stops answering where the workspaces run: nobody knows this session is on an SSH target.
+  down = true
+  await worker.emit('agent.status.changed', w.event(2))
+  assert.deepEqual(w.cliCalls, [], 'no account of this computer is selected for it')
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  // Orca answers again: the limit is noted as one on an SSH target, and the session left alone.
+  down = false
+  await worker.emit('agent.status.changed', w.event(3))
+  assert.deepEqual(w.cliCalls, [])
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.ok((w.host.callsOf('notifications.show') as { body: string }[]).some((n) => /SSH target build-box/.test(n.body)))
+  await worker.deactivate()
+})
+
+test('two sessions of one service hit a limit at once, one of them on screen: the other is handed off, the one on screen is held, and each is closed once', async () => {
+  const options: Parameters<typeof world>[0] = {
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
+      { terminalId: 't2', agent: 'claude', state: 'done', sessionId: 's2' }
+    ],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT, t2: fx.CLAUDE_SESSION_LIMIT },
+    activeTerminals: ['t1'],
+    focusedTerminals: ['t1']
+  }
+  const w = world(options)
+  const worker = await w.mount()
+  w.advance(301_000)
+  // Both events and a tick in the same moment.
+  await Promise.all([
+    worker.emit('agent.status.changed', { ...statusEvent('t1'), sessionId: 's1' }),
+    worker.emit('agent.status.changed', { ...statusEvent('t2'), sessionId: 's2' }),
+    w.rotator.tick()
+  ])
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(closed(w), ['t2'])
+  assert.deepEqual(w.rotator.snapshot().waiting.map((x) => [x.terminalId, x.asked]), [['t1', true]])
+  // The same events again, and ticks, while it is held: nothing more.
+  await Promise.all([worker.emit('agent.status.changed', { ...statusEvent('t1', 'done', 2), sessionId: 's1' }), w.rotator.tick(), w.rotator.tick()])
+  assert.deepEqual(closed(w), ['t2'])
+  // Another tab is shown: the held session follows, onto the account already selected.
+  options.activeTerminals = []
+  options.focusedTerminals = []
+  await Promise.all([w.rotator.tick(), w.rotator.tick()])
+  assert.deepEqual(closed(w), ['t2', 't1'])
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(w.acts.filter((a) => a.kind === 'resume').map((a) => a.sessionId), ['s2', 's1'])
+  assert.deepEqual(w.rotator.snapshot().waiting, [])
+  checkActs(w, false, 'two at once')
+  await worker.deactivate()
+})
+
+test('a session is handed off while another of the same service waits over text that cannot go along, with ticks in the seconds that takes: the waiting one is never closed', async () => {
+  const drafts: Record<string, string> = { t2: '[Image #1] what is wrong here?' }
+  const ticks: Promise<void>[] = []
+  let w!: ReturnType<typeof world>
+  w = world({
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
+      { terminalId: 't2', agent: 'claude', state: 'done', sessionId: 's2' }
+    ],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT, t2: fx.CLAUDE_SESSION_LIMIT },
+    drafts,
+    settings: { restore_unsent_text: true },
+    // Each wait of the hand-off (the last look, the resumed pane getting ready) lets a tick in.
+    onSleep: () => {
+      if (ticks.length < 6) ticks.push(w.rotator.tick())
+    }
+  })
+  const worker = await w.mount()
+  await Promise.all([
+    worker.emit('agent.status.changed', { ...statusEvent('t2'), sessionId: 's2' }),
+    worker.emit('agent.status.changed', { ...statusEvent('t1'), sessionId: 's1' })
+  ])
+  await Promise.all(ticks)
+  await w.rotator.tick()
+  assert.deepEqual(closed(w), ['t1'])
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.ok(w.rotator.snapshot().waiting.find((x) => x.terminalId === 't2')?.draftAt, JSON.stringify(w.rotator.snapshot().waiting))
+  // One notice for the waiting session, however many looks there were.
+  assert.equal(bodies(w).filter((b) => /Send or clear the text you were typing/.test(b)).length, 1, bodies(w).join(' | '))
+  // The text is sent or cleared: now it follows, once.
+  delete drafts.t2
+  await Promise.all([w.rotator.tick(), w.rotator.tick()])
+  assert.deepEqual(closed(w), ['t1', 't2'])
+  assert.deepEqual(w.acts.filter((a) => a.kind === 'resume').map((a) => a.sessionId), ['s1', 's2'])
+  checkActs(w, true, 'one moves, one waits')
+  await worker.deactivate()
+})
+
+test('Skip on every other account (Custom order too), or on all of them: a limit selects nothing and closes nothing; the session goes on where it is once its own account resets', async () => {
+  for (const exclude of ['claude:c2, claude:c3', 'claude:c1, claude:c2, claude:c3', 'claude:*']) {
+    for (const pick of ['smart', 'my-order']) {
+      const w = world({
+        panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+        tails: { t1: fx.CLAUDE_LIMIT_NO_RESET },
+        settings: { exclude, pick, ...(pick === 'my-order' ? { chain: 'claude:c3, claude:c2, claude:c1' } : {}) }
+      })
+      const where = `${pick}, Skip ${exclude}`
+      const worker = await w.mount()
+      await worker.emit('agent.status.changed', statusEvent('t1'))
+      await w.rotator.tick()
+      assert.equal(w.acts.length, 0, where)
+      assert.equal(stored(w).waiting.length, 1, where)
+      w.advance(61 * MIN)
+      await w.rotator.tick()
+      assert.deepEqual(w.acts.map((a) => [a.kind, a.terminalId, a.text]), [['type', 't1', 'Continue.']], where)
+      assert.equal(stored(w).waiting.length, 0, where)
+      checkActs(w, false, where)
+      await worker.deactivate()
+    }
+  }
+  // With "When everything is used up: Stop" it is said, and the session is left as it is.
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_LIMIT_NO_RESET },
+    settings: { exclude: 'claude:*', when_all_used: 'stop' }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  w.advance(61 * MIN)
+  await w.rotator.tick()
+  assert.equal(w.acts.length, 0, JSON.stringify(w.acts))
+  assert.equal(stored(w).waiting.length, 0)
+  assert.equal(bodies(w).filter((b) => /set to Stop/.test(b)).length, 1, bodies(w).join(' | '))
+  await worker.deactivate()
+})
+
+/** `orca account list` with one Claude account only, and no login of Claude's own. */
+const onlyOne = (list: Record<string, any>) => ({ ...list, claude: { ...list.claude, accounts: list.claude.accounts.slice(0, 1), systemDefaultHome: null, systemDefaultEmail: null } })
+
+test('one account only: a limit selects nothing, closes nothing and never goes to another service; the session waits and goes on there', async () => {
+  const w = world({
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
+      { terminalId: 't9', agent: 'codex', state: 'done', sessionId: 'cs9' }
+    ],
+    tails: { t1: fx.CLAUDE_LIMIT_NO_RESET, t9: ['• Edited src/app.ts (+4 -1)', '', '› Ask Codex to do anything'] },
+    codexUsage: { session: 5, weekly: 5 },
+    accounts: onlyOne
+  })
+  const worker = await w.mount()
+  assert.deepEqual(w.rotator.snapshot().seats.filter((s) => s.provider === 'claude').map((s) => s.key), ['claude:c1'])
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  await w.rotator.tick()
+  assert.equal(w.acts.length, 0, JSON.stringify(w.acts))
+  assert.equal(stored(w).waiting[0]?.terminalId, 't1')
+  assert.ok(bodies(w).some((b) => /Claude: every account is used up\. The session continues at /.test(b)), bodies(w).join(' | '))
+  w.advance(61 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(w.acts.map((a) => [a.kind, a.terminalId]), [['type', 't1']])
+  checkActs(w, false, 'one account')
+  await worker.deactivate()
+})
+
+test('the account a session runs on is removed from Orca: its limit hands it off to an account that is still there, of the same service', async () => {
+  let gone = false
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    state: { paneSeat: { t1: 'claude:c1' } },
+    // c1 is removed; Orca then has c2 selected.
+    accounts: (list) => (gone ? { ...list, claude: { ...list.claude, accounts: list.claude.accounts.filter((a: any) => a.id !== 'c1'), activeAccountId: 'c2' } } : list)
+  })
+  const worker = await w.mount()
+  gone = true
+  await w.rotator.tick()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(closed(w), ['t1'])
+  const moved = stored(w).history.at(-1)
+  assert.equal(moved?.result, 'resumed')
+  assert.ok(moved?.to === 'claude:c2' || moved?.to === 'claude:c3', JSON.stringify(moved))
+  assert.ok(selects(w).every((c) => !c.endsWith(' c1') && c.startsWith('select claude ')), selects(w).join(','))
+  // Nothing is remembered against an account that is not there.
+  assert.equal(stored(w).health['claude:c1'], undefined)
+  checkActs(w, false, 'account removed')
+  await worker.deactivate()
+})
+
+test('a waiting session whose own account is removed from Orca meanwhile is handed off to one that is there when it frees up', async () => {
+  let gone = false
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    state: { health: { 'claude:c2': { cooldownUntil: 1_000_000 + 10 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 20 * MIN } } },
+    accounts: (list) => (gone ? { ...list, claude: { ...list.claude, accounts: list.claude.accounts.filter((a: any) => a.id !== 'c1'), activeAccountId: null, systemDefaultHome: null } } : list)
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.equal(stored(w).waiting[0]?.fromSeat, 'claude:c1')
+  gone = true
+  w.advance(5 * MIN)
+  await w.rotator.tick()
+  assert.equal(w.acts.length, 0, JSON.stringify(w.acts))
+  w.advance(6 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(closed(w), ['t1'])
+  checkActs(w, false, 'own account removed while waiting')
+  await worker.deactivate()
+})
+
+test('an account list that is empty or broken is never taken for "no accounts": nothing is forgotten, nothing odd is selected, and the tick goes on', async () => {
+  const broken: unknown[] = [
+    null,
+    undefined,
+    {},
+    [],
+    'not json at all',
+    42,
+    { claude: 'x', codex: 7 },
+    { rateLimits: { claude: { status: 'ok' } } }
+  ]
+  for (const answer of broken) {
+    let bad = false
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'working', sessionId: 's1' }],
+      tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+      claudeUsage: { session: 50, weekly: 20 },
+      inactiveClaude: { c2: { session: 5, weekly: 5 } },
+      state: { leftLow: { 'claude:c2': { at: 1_000_000 - 1000, until: 1_000_000 + 4 * 60 * MIN } }, health: { 'claude:c3': { cooldownUntil: 1_000_000 + 60 * MIN } } },
+      accounts: (list) => (bad ? answer : list)
+    })
+    const what = JSON.stringify(answer) ?? 'undefined'
+    const worker = await w.mount()
+    const before = JSON.stringify(w.host.data().storage['usage-samples'])
+    assert.ok(before && before.includes('claude:c1'), what)
+    bad = true
+    w.advance(2 * MIN)
+    await w.rotator.tick()
+    await worker.request('rotator.snapshot', { refresh: true })
+    const snap = w.rotator.snapshot()
+    // The accounts as last read stay, with the reason said; what is known about them stays too.
+    assert.deepEqual(snap.seats.filter((s) => s.provider === 'claude').map((s) => s.key), ['claude:c1', 'claude:c2', 'claude:c3'], what)
+    assert.match(snap.error ?? '', /orca account list failed/, what)
+    assert.equal(JSON.stringify(w.host.data().storage['usage-samples']), before, what)
+    assert.ok(stored(w).leftLow?.['claude:c2'], what)
+    assert.equal(w.acts.length, 0, what)
+    // The answer is good again: the error goes.
+    bad = false
+    await worker.request('rotator.snapshot', { refresh: true })
+    assert.equal(w.rotator.snapshot().error, undefined, what)
+    await worker.deactivate()
+  }
+})
+
+test('an account list with broken rows: only accounts that have an id become accounts, names are text, and a limit is handed off to one of them', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    settings: { pick: 'my-order', chain: 'claude:c2, claude:c1', exclude: 'nobody@example.test' },
+    accounts: (list) => ({
+      ...list,
+      claude: {
+        ...list.claude,
+        accounts: [null, 7, 'c9', { email: 'no-id@example.test' }, { id: null }, { id: '' }, { id: 42 }, list.claude.accounts[0], { id: 'c2', email: { odd: true } }]
+      },
+      rateLimits: { ...list.rateLimits, inactiveClaudeAccounts: [null, 'x', { accountId: 'c2', rateLimits: 'broken' }] }
+    })
+  })
+  const worker = await w.mount()
+  const claude = w.rotator.snapshot().seats.filter((s) => s.provider === 'claude')
+  assert.deepEqual(claude.map((s) => [s.key, s.label]), [['claude:c1', 'one@example.test'], ['claude:c2', 'c2'], ['claude:system', 'system (me@example.test)']])
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  await w.rotator.tick()
+  // (Neither has numbers, so they are tried in turn: the one after c1 in the order.)
+  assert.deepEqual(selects(w), ['select claude system'])
+  assert.deepEqual(closed(w), ['t1'])
+  checkActs(w, false, 'broken rows')
+  await worker.deactivate()
+})
+
+test('a paired server that cannot be reached: a limit in a session there selects no account of this computer and closes nothing; it is handed off there once the server answers', async () => {
+  let down = false
+  const w = twoServers({
+    panes: [{ terminalId: 'tr1', agent: 'claude', state: 'done', sessionId: 'sr1', ws: 'w-remote' }],
+    tails: { tr1: [...fx.CLAUDE_SESSION_LIMIT] },
+    onList: async (server) => {
+      if (server && down) throw new Error('remote-box is unreachable')
+    }
+  })
+  const worker = await w.mount()
+  down = true
+  await worker.emit('agent.status.changed', w.event('tr1', 'w-remote'))
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), [], 'nothing is selected, here or there')
+  assert.equal(w.host.callsOf('terminal.close').length, 0)
+  assert.equal(stored(w).waiting[0]?.server, 'remote-box')
+  down = false
+  w.advance(2 * MIN)
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select@remote-box claude c2'])
+  assert.deepEqual(w.host.callsOf('agent.resume'), [{ workspaceId: 'w-remote', agent: 'claude', sessionId: 'sr1' }])
+  await worker.deactivate()
+})
+
+test('session on screen: leaving it and coming back during the countdown is a sign of you, so the countdown does not hand it off; it starts again once you are away', async () => {
+  const { w, options } = onTab({
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
+      { terminalId: 't2', agent: 'claude', state: 'working', sessionId: 's2' }
+    ],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT, t2: ['⏺ Working on it…'] }
+  })
+  const worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.ok(w.rotator.snapshot().waiting[0]?.countdownUntil)
+  // Ten seconds in, the other tab is looked at for a moment (a panel poll sees it), then this one again.
+  w.advance(10_000)
+  options.activeTerminals = ['t2']
+  options.focusedTerminals = ['t2']
+  await worker.request('rotator.snapshot', {})
+  options.activeTerminals = ['t1']
+  options.focusedTerminals = ['t1']
+  await worker.request('rotator.snapshot', {})
+  // The countdown's time comes: not handed off.
+  w.advance(55_000)
+  await w.rotator.tick()
+  assert.deepEqual(w.acts.filter((a) => a.kind !== 'select'), [])
+  assert.equal(w.rotator.snapshot().waiting[0]?.countdownUntil, undefined)
+  // No sign of you for five minutes: a new countdown, and then it goes.
+  w.advance(301_000)
+  await w.rotator.tick()
+  assert.ok(w.rotator.snapshot().waiting[0]?.countdownUntil, JSON.stringify(w.rotator.snapshot().waiting))
+  assert.deepEqual(closed(w), [])
+  w.advance(61_000)
+  await w.rotator.tick()
+  assert.deepEqual(closed(w), ['t1'])
+  checkActs(w, false, 'back during the countdown')
+  await worker.deactivate()
+})
+
+test('settings changed while a session on screen is held: Session on screen and Skip count from the next look on', async () => {
+  const { w } = onTab()
+  const worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.ok(w.rotator.snapshot().waiting[0]?.countdownUntil)
+  // (Using the panel is a sign of you; these changes are made in Orca's own settings.)
+  await w.set('active_terminal', 'wait')
+  w.advance(61_000)
+  await w.rotator.tick()
+  assert.deepEqual(closed(w), [], '"Wait for me": the countdown that ran is not acted on')
+  assert.equal(w.rotator.snapshot().waiting[0]?.countdownUntil, undefined)
+  // The account it was going to is set to Skip, then "Move right away": it goes to another one.
+  await w.set('exclude', 'claude:c2')
+  await w.set('active_terminal', 'now')
+  await w.rotator.tick()
+  assert.deepEqual(closed(w), ['t1'])
+  assert.equal(stored(w).history.at(-1)?.to, 'claude:c3')
+  assert.ok(!selects(w).includes('select claude c2'), selects(w).join(','))
+  checkActs(w, false, 'settings changed while held')
+  await worker.deactivate()
+})
+
+test('Skip turned on for the account a session is being handed off to, in the seconds that takes: not handed off there; the next tick takes another account', async () => {
+  let w!: ReturnType<typeof world>
+  let skipped = false
+  w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    onSleep: (ms) => {
+      // The last look's pause, a second before the session would be closed.
+      if (ms !== 1000 || skipped) return
+      skipped = true
+      return w.set('exclude', 'claude:c2') as unknown as void
+    }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(closed(w), [], 'not closed for an account that is now one to Skip')
+  assert.equal(stored(w).waiting.length, 1)
+  await w.rotator.tick()
+  assert.deepEqual(closed(w), ['t1'])
+  assert.equal(stored(w).history.at(-1)?.to, 'claude:c3')
+  assert.equal(stored(w).paneSeat.t2, 'claude:c3')
+  checkActs(w, false, 'Skip in the last second')
+  await worker.deactivate()
+})
+
+test('very long unsent text: up to 4000 characters it goes along whole; longer, the session is kept where it is and nothing large is stored or said', async () => {
+  const exact = `first line\n${'é'.repeat(4000 - 11)}`
+  assert.equal(exact.length, 4000)
+  const fits = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    drafts: { t1: exact },
+    settings: { restore_unsent_text: true }
+  })
+  const a = await fits.mount()
+  await a.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(closed(fits), ['t1'])
+  assert.equal(fits.acts.find((x) => x.kind === 'paste')?.text, `\u001b[200~${exact}\u001b[201~`)
+  checkActs(fits, true, '4000 characters')
+  await a.deactivate()
+
+  for (const text of [`${exact}!`, 'x'.repeat(300_000)]) {
+    const w = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+      drafts: { t1: text },
+      settings: { restore_unsent_text: true }
+    })
+    const worker = await w.mount()
+    await worker.emit('agent.status.changed', statusEvent('t1'))
+    await w.rotator.tick()
+    assert.deepEqual(closed(w), [], `${text.length} characters`)
+    assert.ok(stored(w).waiting[0]?.draftAt)
+    assert.ok(bodies(w).some((b) => /Send or clear the text you were typing/.test(b)), bodies(w).join(' | '))
+    assert.ok(JSON.stringify(stored(w)).length < 20_000, 'the text is not stored')
+    // By hand the panel asks first, as for a pasted image: the text comes back to be shown.
+    const asked = await worker.request('rotator.switchTo', { seatKey: 'claude:c2' })
+    assert.deepEqual(closed(w), [])
+    assert.equal(w.rotator.snapshot().waiting.length, 1)
+    assert.ok(asked.draft === undefined || asked.draft.text.length === text.length)
+    checkActs(w, true, `${text.length} characters`)
+    await worker.deactivate()
+  }
+})
+
+test('unsent text with emoji, other scripts, quotes, backslashes and shell syntax goes along exactly as typed; text that holds an escape sequence does not go along', async () => {
+  const text = '修正 parser 🐛 — “quotes” \'single\' "double" \\n \\ $(rm -rf ~) `id` ${HOME} %s --enter\n第二行 👩‍👩‍👧 ✅'
+  const label = '二號 🐙 "work" $(id) \\@example.test'
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    drafts: { t1: text },
+    settings: { restore_unsent_text: true },
+    // Outside the focused workspace: everything goes through the `orca` CLI.
+    refuseHostSend: true,
+    accounts: (list) => ({ ...list, claude: { ...list.claude, accounts: list.claude.accounts.map((a: any) => (a.id === 'c2' ? { ...a, email: label } : a)) } })
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  assert.deepEqual(closed(w), ['t1'])
+  assert.deepEqual(w.typed.map((t) => t.text), ['Continue.', `\u001b[200~${text}\u001b[201~`])
+  // (The panel's short name: the part before the @.)
+  assert.ok(bodies(w).some((b) => b.includes(`handed off to ${label.split('@')[0]}.`) && b.includes('Your unsent text was put back')), bodies(w).join(' | '))
+  assert.equal(stored(w).history.at(-1)?.to, 'claude:c2')
+  checkActs(w, true, 'unicode')
+  await worker.deactivate()
+
+  // A notification never ends in half an emoji.
+  const cutAt = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    drafts: { t1: `${'x'.repeat(78)}🐛🐛🐛 and more` },
+    settings: { restore_unsent_text: true }
+  })
+  const c = await cutAt.mount()
+  await c.emit('agent.status.changed', statusEvent('t1'))
+  for (const b of bodies(cutAt)) assert.equal(/[\ud800-\udbff](?![\udc00-\udfff])/.test(b), false, b)
+  assert.ok(bodies(cutAt).some((b) => b.includes(`“${'x'.repeat(78)}…”`)), bodies(cutAt).join(' | '))
+  await c.deactivate()
+
+  // The end-of-paste mark inside the text would end the paste early; the line after it would be sent.
+  for (const odd of ['harmless\u001b[201~\nrm -rf build', 'escape \u001b[2J']) {
+    const held = world({
+      panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+      tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+      drafts: { t1: odd },
+      settings: { restore_unsent_text: true }
+    })
+    const h = await held.mount()
+    await h.emit('agent.status.changed', statusEvent('t1'))
+    assert.equal(held.acts.length, 0, JSON.stringify(odd))
+    assert.ok(held.rotator.snapshot().waiting[0]?.draftAt, JSON.stringify(odd))
+    await h.deactivate()
+  }
+})
+
+test('the same status event many times over, with ticks in between: one hand-off, one first message', async () => {
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    redraw: true
+  })
+  const worker = await w.mount()
+  const burst = (from: number) =>
+    Promise.all([
+      ...Array.from({ length: 25 }, (_, i) => worker.emit('agent.status.changed', { ...statusEvent('t1', i % 2 ? 'done' : 'waiting', from + i), sessionId: 's1' })),
+      w.rotator.tick(),
+      w.rotator.tick(),
+      w.rotator.tick()
+    ])
+  await burst(1)
+  // The resumed pane redraws the old banner, and events for both panes keep coming.
+  await burst(100)
+  await Promise.all(Array.from({ length: 10 }, (_, i) => worker.emit('agent.status.changed', { ...statusEvent('t2', 'done', 200 + i), sessionId: 's1' })))
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(closed(w), ['t1'])
+  assert.deepEqual(w.typed, [{ terminalId: 't2', text: 'Continue.' }])
+  assert.equal(stored(w).history.filter((h) => h.result === 'resumed').length, 1)
+  assert.equal(bodies(w).length, 1, bodies(w).join(' | '))
+  checkActs(w, false, 'event burst')
+  await worker.deactivate()
+})
+
+test('safety, in 400 harder made-up situations: Skip, an account list that changes or breaks, settings changed while sessions wait, odd and long unsent text, and events and ticks at the same moment', async () => {
+  const done: Record<string, number> = {}
+  // (More of them, or others, when looking for trouble: HANDOFF_SEEDS=20000 HANDOFF_SEED_FROM=1 orca plugin test)
+  const from = Number(process.env.HANDOFF_SEED_FROM ?? 1)
+  const count = Number(process.env.HANDOFF_SEEDS ?? 400)
+  for (let seed = from; seed < from + count; seed++) for (const a of await madeUp(seed, true)) done[a.kind] = (done[a.kind] ?? 0) + 1
+  for (const kind of ['select', 'close', 'resume', 'launch', 'type', 'paste']) assert.ok((done[kind] ?? 0) >= 10, `only ${done[kind] ?? 0} × ${kind}: ${JSON.stringify(done)}`)
+})
+
+test('a waiting session shows a new limit just as the tick comes for it: it is handed off once, not twice (no second session is started)', async () => {
+  for (const agent of ['codex', 'claude'] as const) {
+    const from = agent === 'codex' ? 'codex:x1' : 'claude:c1'
+    const w = world({
+      panes: [{ terminalId: 't1', agent, state: 'done', sessionId: 's1' }],
+      tails: { t1: agent === 'codex' ? fx.CODEX_USAGE_LIMIT : fx.CLAUDE_SESSION_LIMIT },
+      // It waited (for unsent text that is gone now), and its time has come.
+      state: { paneSeat: { t1: from }, waiting: [{ terminalId: 't1', workspaceId: 'w1', agent, sessionId: 's1', fromSeat: from, wakeAt: 1_000_000 - 1000, reason: 'rate_limit' }] }
+    })
+    const worker = await w.mount()
+    // The tick's look and the event's are both under way; one waits for the other.
+    await Promise.all([w.rotator.tick(), worker.emit('agent.status.changed', { ...statusEvent('t1'), sessionId: 's1' }), w.rotator.tick()])
+    assert.deepEqual(closed(w), ['t1'], agent)
+    assert.equal(w.acts.filter((a) => a.kind === 'launch' || a.kind === 'resume').length, 1, `${agent}: ${JSON.stringify(w.acts)}`)
+    assert.equal(selects(w).length, 1, agent)
+    assert.equal(stored(w).history.filter((h) => h.result === 'failed').length, 0, agent)
+    assert.equal(bodies(w).length, 1, bodies(w).join(' | '))
+    checkActs(w, false, `waiting and limited at once (${agent})`)
+    await worker.deactivate()
+  }
+})
+
+test('a state that has grown for months still fits what Orca stores, and its History what the panel is sent; the newest entries and every waiting session stay', async () => {
+  const why = 'one hit its 5-hour limit and two had the most room left at the pace it is being used; '.repeat(3).slice(0, 240)
+  const history = Array.from({ length: 1000 }, (_, i) => ({
+    at: 1_000_000 - (1000 - i) * 1000,
+    provider: 'claude' as const,
+    terminalId: `terminal-0000-${i}`,
+    reason: 'rate_limit' as const,
+    result: 'resumed' as const,
+    from: 'claude:00000000-0000-4000-8000-000000000001',
+    to: 'claude:00000000-0000-4000-8000-000000000002',
+    why,
+    ...(i % 100 === 99 ? { unsent: `第${i}段 ${'文字'.repeat(1500)}` } : {})
+  }))
+  const banner = (n: number) => ({ fingerprint: `rate_limit:5-hour limit reached ∙ resets ${n}pm`, occurrences: 1, line: `  ⎿  5-hour limit reached ∙ resets ${n}pm` })
+  const seen = Object.fromEntries(Array.from({ length: 500 }, (_, i) => [`session:00000000-0000-4000-8000-${String(i).padStart(12, '0')}`, { ...banner(0), earlier: Array.from({ length: 12 }, (_, n) => banner(n + 1)) }]))
+  const waiting = [{ terminalId: 't1', workspaceId: 'w1', agent: 'claude' as const, sessionId: 's1', fromSeat: 'claude:c1', wakeAt: 1_000_000 + 60 * MIN }]
+  const w = world({
+    panes: [{ terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' }],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT },
+    state: { history, seen, waiting, health: { 'claude:c2': { cooldownUntil: 1_000_000 + 60 * MIN }, 'claude:c3': { cooldownUntil: 1_000_000 + 60 * MIN } } }
+  })
+  const worker = await w.mount()
+  const bytes = (v: unknown) => new TextEncoder().encode(JSON.stringify(v)).length
+  assert.ok(bytes({ state: { history, seen, waiting } }) > 1024 * 1024, 'as loaded it is far over')
+  // Any change is stored (here: pausing and resuming).
+  await worker.request('rotator.pause', { paused: true })
+  await worker.request('rotator.pause', { paused: false })
+  const state = stored(w)
+  assert.ok(bytes(state) <= ORCA_VALUE_MAX_BYTES, `${bytes(state)} bytes stored`)
+  assert.deepEqual(state.waiting, waiting)
+  assert.equal(state.history.at(-1)?.terminalId, 'terminal-0000-999')
+  assert.ok(state.history.length >= 20)
+  // The panel is sent less than a message may hold, newest entries first to stay, with their unsent text whole.
+  const snap = await worker.request('rotator.snapshot', {})
+  assert.ok(bytes(snap) <= 64 * 1024, `${bytes(snap)} bytes sent`)
+  assert.equal(snap.history.at(-1)?.terminalId, 'terminal-0000-999')
+  assert.equal(snap.history.at(-1)?.unsent, history.at(-1)!.unsent)
+  assert.ok(snap.history.length >= 10, `${snap.history.length} entries`)
+  // And it still works: the waiting session is looked at, and a limit is handled.
+  await w.rotator.tick()
+  assert.equal(stored(w).waiting.length, 1)
+  await worker.deactivate()
+})
+
+test('a session that is open in two panes is not closed at a limit: Orca would not resume it while the other pane runs it', async () => {
+  const w = world({
+    panes: [
+      { terminalId: 't1', agent: 'claude', state: 'done', sessionId: 's1' },
+      { terminalId: 't2', agent: 'claude', state: 'working', sessionId: 's1' }
+    ],
+    tails: { t1: fx.CLAUDE_SESSION_LIMIT, t2: ['⏺ Working on it…'] },
+    state: { paneSeat: { t1: 'claude:c1', t2: 'claude:c1' } }
+  })
+  const worker = await w.mount()
+  await worker.emit('agent.status.changed', { ...statusEvent('t1'), sessionId: 's1' })
+  await w.rotator.tick()
+  assert.deepEqual(closed(w), [])
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(stored(w).history.filter((h) => h.result === 'failed').length, 0)
+  checkActs(w, false, 'one session, two panes')
+  await worker.deactivate()
+})
+
+// ---- review round 10 ---------------------------------------------------------------------------
+
+/** The test world's one workspace, with Orca unable to list the workspaces while `down()` says so. */
+function workspacesDown(w: ReturnType<typeof world>, down: () => boolean): void {
+  const listed = { workspaces: [{ id: 'w1', kind: 'worktree', name: 'w1', path: '/repo', branch: 'feat/x', hostId: 'local' }], truncated: false }
+  w.host.respond('workspace.list', () => {
+    if (down()) throw Object.assign(new Error('runtime_unavailable'), { code: 'action_failed' })
+    return listed
+  })
+}
+
+test('fail closed, then looked at again: a limit that came while Orca could not say where the workspace runs is handed off at the first tick after Orca answers, once', async () => {
+  const w = limitedClaude()
+  const worker = await w.mount()
+  let down = true
+  workspacesDown(w, () => down)
+  // No further event comes from a session that sits at its limit: this one is all there is.
+  await worker.emit('agent.status.changed', { ...statusEvent('t1'), sessionId: 's1' })
+  assert.deepEqual(selects(w), [], 'nothing is selected while nobody knows where the session runs')
+  assert.deepEqual(closed(w), [])
+  // Still down at the next tick: still left alone, and still remembered.
+  await w.rotator.tick()
+  assert.deepEqual(closed(w), [])
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  // Orca answers again: the tick looks at the session, and hands it off.
+  down = false
+  await w.rotator.tick()
+  assert.deepEqual(selects(w), ['select claude c2'])
+  assert.deepEqual(closed(w), ['t1'])
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  // Once: later ticks have nothing left to look at.
+  await w.rotator.tick()
+  await w.rotator.tick()
+  assert.equal(w.host.callsOf('agent.resume').length, 1)
+  assert.deepEqual(selects(w), ['select claude c2'])
+  checkActs(w, false, 'placed late')
+  await worker.deactivate()
+})
+
+test('fail closed, then looked at again: not when the user went on in the session meanwhile, and paused it is only noted', async () => {
+  // The user sends a prompt before Orca answers: the turn that runs is never closed.
+  const w = limitedClaude()
+  let worker = await w.mount()
+  let down = true
+  workspacesDown(w, () => down)
+  await worker.emit('agent.status.changed', { ...statusEvent('t1'), sessionId: 's1' })
+  w.panes[0]!.state = 'working'
+  await worker.emit('agent.status.changed', { ...statusEvent('t1'), state: 'working', sessionId: 's1' } as never)
+  down = false
+  await w.rotator.tick()
+  // (The account for new sessions may change, as for any account that is used up while a turn
+  // runs on it; the session itself is not touched.)
+  assert.deepEqual(closed(w), [])
+  assert.equal(w.host.callsOf('agent.resume').length, 0)
+  assert.equal(stored(w).waiting.length, 0)
+  await worker.deactivate()
+
+  // Paused before Orca answers: the banner is noted, nothing is handed off, and turning
+  // automatic hand-off on again does not act on it either.
+  const p = limitedClaude()
+  worker = await p.mount()
+  down = true
+  workspacesDown(p, () => down)
+  await worker.emit('agent.status.changed', { ...statusEvent('t1'), sessionId: 's1' })
+  await worker.request('rotator.pause', { paused: true })
+  down = false
+  await p.rotator.tick()
+  assert.deepEqual(closed(p), [])
+  assert.equal(Object.keys(stored(p).seen).length, 1, 'noted')
+  await worker.request('rotator.pause', { paused: false })
+  await p.rotator.tick()
+  assert.deepEqual(closed(p), [])
+  assert.deepEqual(selects(p), [])
+  await worker.deactivate()
+})
+
+test('unsent text kept in History stays when the History is cut to size, in what is stored and in what the panel is sent', async () => {
+  const text = (i: number) => `draft ${i}: ${'please keep this '.repeat(200)}`
+  const why = 'one hit its 5-hour limit and two had the most room left at the pace it is being used; '.repeat(3).slice(0, 240)
+  // A busy week: 900 entries, three of the oldest with unsent text that could not be put back.
+  const history = Array.from({ length: 900 }, (_, i) => ({
+    at: 1_000_000 - (900 - i) * 1000,
+    provider: 'claude' as const,
+    terminalId: `terminal-0000-${i}`,
+    reason: 'rate_limit' as const,
+    result: 'resumed' as const,
+    from: 'claude:00000000-0000-4000-8000-000000000001',
+    to: 'claude:00000000-0000-4000-8000-000000000002',
+    why,
+    ...(i === 3 || i === 40 || i === 300 ? { unsent: text(i) } : {})
+  }))
+  const w = world({ panes: [], tails: {}, state: { history } })
+  const worker = await w.mount()
+  const bytes = (v: unknown) => new TextEncoder().encode(JSON.stringify(v)).length
+  assert.ok(bytes({ history }) > ORCA_VALUE_MAX_BYTES, 'as loaded it is over what Orca stores')
+  await worker.request('rotator.pause', { paused: true })
+  const state = stored(w)
+  assert.ok(bytes(state) <= ORCA_VALUE_MAX_BYTES, `${bytes(state)} bytes stored`)
+  assert.ok(state.history.length < 900, 'older entries went')
+  assert.deepEqual(state.history.filter((h) => h.unsent).map((h) => h.unsent), [text(3), text(40), text(300)], 'none of the unsent text went with them, and none was shortened')
+  assert.equal(state.history.at(-1)?.terminalId, 'terminal-0000-899')
+  // The panel: the newest entries, and the unsent text although over a hundred entries came after it.
+  const snap = await worker.request('rotator.snapshot', {})
+  assert.ok(bytes(snap) <= 64 * 1024, `${bytes(snap)} bytes sent`)
+  assert.equal(snap.history.at(-1)?.terminalId, 'terminal-0000-899')
+  assert.deepEqual(snap.history.filter((h) => h.unsent).map((h) => h.unsent), [text(3), text(40), text(300)])
+  assert.ok(snap.history.length >= 30, `${snap.history.length} entries`)
+  assert.deepEqual(snap.history.map((h) => h.at), [...snap.history.map((h) => h.at)].sort((a, b) => a - b), 'in the order they happened')
+  await worker.deactivate()
+})
+
+test('session on screen, Not now pressed twice: the answer is written once', async () => {
+  const { w } = onTab({ settings: { active_terminal: 'ask' } })
+  const worker = await w.mount()
+  w.advance(301_000)
+  await worker.emit('agent.status.changed', statusEvent('t1'))
+  const deps = (w.rotator as unknown as { deps: { saveState(state: RotatorState): Promise<void> } }).deps
+  const save = deps.saveState
+  let saves = 0
+  deps.saveState = async (state) => {
+    saves++
+    await save(state)
+  }
+  await worker.request('rotator.declineHandoff', { terminalId: 't1' })
+  assert.equal(saves, 1)
+  await worker.request('rotator.declineHandoff', { terminalId: 't1' })
+  await worker.request('rotator.declineHandoff', { terminalId: 't1' })
+  assert.equal(saves, 1, 'a second press changes nothing, so nothing is written')
+  assert.equal(w.rotator.snapshot().waiting[0]?.declined, true)
   await worker.deactivate()
 })

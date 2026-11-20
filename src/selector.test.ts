@@ -1,6 +1,6 @@
 import { assert, test } from 'orca/testing'
 import { parseAccounts } from './accounts'
-import { activeTerminalsIn } from './cli'
+import { activeTerminalsIn, shownTerminalsIn } from './cli'
 import { accountList } from './fixtures'
 import { blindCooldownMs, buildChain, earliestReset, enoughGap, pickNext, preferredOver, strikesOf, tier } from './selector'
 import { DEFAULT_CONFIG, SMART_CONFIG, type Config, type Seat, type SeatHealth } from './types'
@@ -62,6 +62,33 @@ test('drain takes the next seat in chain order, skipping limited ones', () => {
   assert.equal(pickNext(chain, 'claude:c3', {}, cfg(), NOW)?.key, 'claude:c1')
 })
 
+test('Custom order is a ranking: from a lower account a session goes to the highest one with room, not on down the list', () => {
+  const seat = (id: string, session: number | null): Seat => ({
+    key: `claude:${id}`,
+    provider: 'claude',
+    accountId: id,
+    label: `${id}@example.test`,
+    active: false,
+    usage: session === null ? { known: false } : { known: true, source: 'live', session: { usedPercent: session, resetsAt: NOW + 3_600_000 }, weekly: { usedPercent: 10, resetsAt: NOW + 86_400_000 } }
+  })
+  // The session is on b (second); a (first) is free again, c (third) is free too.
+  const known = [seat('a', 5), seat('b', 100), seat('c', 5)]
+  for (const mode of ['hard', 'advisory'] as const) {
+    assert.equal(pickNext(known, 'claude:b', {}, cfg(), NOW, { mode, sourceExhausted: true })?.accountId, 'a', mode)
+  }
+  // a still cooling down: the next one down.
+  assert.equal(pickNext(known, 'claude:b', { 'claude:a': { cooldownUntil: NOW + 1 } }, cfg(), NOW)?.accountId, 'c')
+  // An account presumed reset (its cooldown ended at a real reset time) counts as the known ones do.
+  const presumed = [seat('a', null), seat('b', 100), seat('c', null)]
+  assert.equal(pickNext(presumed, 'claude:b', { 'claude:a': { resetKnown: true, freedAt: NOW - 1 } }, cfg(), NOW)?.accountId, 'a')
+  // Accounts without numbers are tried in turn, so one that may still be limited is not gone back
+  // to before the others had their turn; and the next-account command goes round as before.
+  const blind = [seat('a', null), seat('b', 100), seat('c', null)]
+  assert.equal(pickNext(blind, 'claude:b', {}, cfg(), NOW)?.accountId, 'c')
+  assert.equal(pickNext(known, 'claude:b', {}, cfg(), NOW, { mode: 'manual' })?.accountId, 'c')
+  assert.equal(pickNext(known, 'claude:c', {}, cfg(), NOW, { mode: 'manual' })?.accountId, 'a')
+})
+
 test('exhausted seats by usage are skipped; null when all are limited', () => {
   const { seats } = parseAccounts(accountList())
   const chain = buildChain(seats, 'codex', cfg())
@@ -88,20 +115,7 @@ test('chain orders accounts within one service and never includes another servic
   assert.deepEqual(buildChain(seats, 'codex', c).map((s) => s.key), ['codex:x2', 'codex:x1', 'codex:system'])
 })
 
-test('balanced prefers the least used known seat; manual never picks', () => {
-  const { seats } = parseAccounts(accountList({ inactiveCodex: { x2: 10 } }))
-  const chain = buildChain(seats, 'codex', cfg())
-  assert.equal(pickNext(chain, 'codex:system', {}, cfg({ strategy: 'balanced' }), NOW)?.key, 'codex:x1')
-  assert.equal(pickNext(chain, 'codex:x1', {}, cfg({ strategy: 'manual' }), NOW), null)
-})
-
-test('thresholds make a busy seat ineligible', () => {
-  const { seats } = parseAccounts(accountList({ claudeUsage: { session: 85, weekly: 10 } }))
-  const chain = buildChain(seats, 'claude', cfg({ thresholdFiveHour: 80 }))
-  assert.equal(pickNext(chain, 'claude:c3', {}, cfg({ thresholdFiveHour: 80, strategy: 'priority' }), NOW)?.key, 'claude:c2')
-})
-
-test('switch back: the first healthy seat ahead in the chain, for drain and priority only', () => {
+test('switch back: the first healthy seat ahead in the chain, for the account order only', () => {
   const { seats } = parseAccounts(accountList())
   const chain = buildChain(seats, 'claude', cfg())
   // On c3 with c1 limited: c2 is ahead and healthy.
@@ -113,23 +127,10 @@ test('switch back: the first healthy seat ahead in the chain, for drain and prio
   const ahead = { 'claude:c1': { cooldownUntil: NOW + 1 }, 'claude:c2': { cooldownUntil: NOW + 1 } }
   assert.equal(preferredOver(chain, 'claude:c3', ahead, cfg(), NOW), null)
   assert.equal(preferredOver(chain, 'claude:c3', {}, cfg({ switchBack: false }), NOW), null)
-  assert.equal(preferredOver(chain, 'claude:c3', {}, cfg({ strategy: 'balanced' }), NOW), null)
-  assert.equal(preferredOver(chain, 'claude:c3', {}, cfg({ strategy: 'priority' }), NOW)?.key, 'claude:c1')
+  assert.equal(preferredOver(chain, 'claude:c3', {}, cfg({ strategy: 'smart' }), NOW), null)
   // Excluded seats are never a target, for switch-back or rotation.
   assert.equal(preferredOver(chain, 'claude:c3', {}, cfg({ exclude: 'one@example.test' }), NOW)?.key, 'claude:c2')
   assert.equal(pickNext(chain, 'claude:c3', {}, cfg({ exclude: 'claude:c1, two@example.test' }), NOW), null)
-})
-
-test('soonest-reset spends the usage that expires first', () => {
-  const { seats } = parseAccounts(accountList({ inactiveCodex: { x2: 10 } }))
-  for (const s of seats) {
-    if (s.key === 'codex:x2') s.usage.weekly = { usedPercent: 10, resetsAt: NOW + 1000 }
-    if (s.key === 'codex:x1') s.usage.weekly = { usedPercent: 0, resetsAt: NOW + 5000 }
-  }
-  const chain = buildChain(seats, 'codex', cfg())
-  assert.equal(pickNext(chain, 'codex:system', {}, cfg({ strategy: 'soonest-reset' }), NOW)?.key, 'codex:x2')
-  // Unknown resets sort last.
-  assert.equal(pickNext(chain, 'codex:x2', {}, cfg({ strategy: 'soonest-reset' }), NOW)?.key, 'codex:x1')
 })
 
 test('headroom gap: a threshold move needs a clearly better seat; exhausted seats may always leave', () => {
@@ -184,6 +185,15 @@ test('activeTerminalsIn picks the active leaf of each workspace\u2019s active ta
   }
   assert.deepEqual(activeTerminalsIn(result), ['term_c', 'term_d'])
   assert.deepEqual(activeTerminalsIn({}), [])
+  // Every pane of a split tab is on screen: the session on screen is any of them.
+  assert.deepEqual(activeTerminalsIn(result, true), ['term_b', 'term_c', 'term_d'])
+  assert.deepEqual(shownTerminalsIn(result, true), ['term_b', 'term_c', 'term_d'])
+  // The CLI's answer: layouts that are there (even none) are an answer; an answer without them
+  // is not "nothing is shown", so the engine is not told that.
+  assert.deepEqual(shownTerminalsIn(result), ['term_c', 'term_d'])
+  assert.deepEqual(shownTerminalsIn({ terminals: [], visualLayouts: [] }), [])
+  assert.throws(() => shownTerminalsIn({ terminals: [{ handle: 'term_c' }] }), /no layouts/)
+  assert.throws(() => shownTerminalsIn(undefined), /no layouts/)
 })
 
 // ---- deciding with no data: tiers A / B+ / B ----------------------------------------------------
@@ -205,27 +215,26 @@ function mk(id: string, weekly?: number, weeklyReset: number | null = null): Sea
 }
 /** A seat whose cooldown ended at a real reset time: presumed reset. */
 const FREED: SeatHealth = { resetKnown: true, freedAt: NOW - 1000 }
-const STRATEGIES = ['drain', 'priority', 'balanced', 'soonest-reset'] as const
+const STRATEGIES = ['drain', 'smart'] as const
 
-test('tiers: A known, B+ presumed reset, B unknown; cooled and over-threshold seats are out', () => {
-  const c = cfg({ thresholdSevenDay: 80 })
-  assert.equal(tier(mk('a', 10), undefined, c, NOW), 'A')
-  assert.equal(tier(mk('a', 90), undefined, c, NOW), null)
-  assert.equal(tier(mk('a', 10), { cooldownUntil: NOW + 1 }, c, NOW), null)
-  assert.equal(tier(mk('b'), undefined, c, NOW), 'B')
-  assert.equal(tier(mk('b'), { cooldownUntil: NOW + 1, resetKnown: true }, c, NOW), null)
-  assert.equal(tier(mk('b'), FREED, c, NOW), 'B+')
+test('tiers: A known, B+ presumed reset, B unknown; cooled and used-up seats are out', () => {
+  assert.equal(tier(mk('a', 10), undefined, NOW), 'A')
+  assert.equal(tier(mk('a', 100), undefined, NOW), null)
+  assert.equal(tier(mk('a', 10), { cooldownUntil: NOW + 1 }, NOW), null)
+  assert.equal(tier(mk('b'), undefined, NOW), 'B')
+  assert.equal(tier(mk('b'), { cooldownUntil: NOW + 1, resetKnown: true }, NOW), null)
+  assert.equal(tier(mk('b'), FREED, NOW), 'B+')
   // Expired but not yet swept by the tick: the same.
-  assert.equal(tier(mk('b'), { cooldownUntil: NOW - 1, resetKnown: true }, c, NOW), 'B+')
+  assert.equal(tier(mk('b'), { cooldownUntil: NOW - 1, resetKnown: true }, NOW), 'B+')
   // A guessed cooldown that expired says nothing; neither does a seat with a strike.
-  assert.equal(tier(mk('b'), { freedAt: NOW - 1000 }, c, NOW), 'B')
-  assert.equal(tier(mk('b'), { ...FREED, strikes: 1, strikeAt: NOW - HOUR }, c, NOW), 'B')
+  assert.equal(tier(mk('b'), { freedAt: NOW - 1000 }, NOW), 'B')
+  assert.equal(tier(mk('b'), { ...FREED, strikes: 1, strikeAt: NOW - HOUR }, NOW), 'B')
   // Strikes lapse after 24 h.
   assert.equal(strikesOf({ strikes: 3, strikeAt: NOW - 23 * HOUR }, NOW), 3)
   assert.equal(strikesOf({ strikes: 3, strikeAt: NOW - 24 * HOUR }, NOW), 0)
-  assert.equal(tier(mk('b'), { ...FREED, strikes: 1, strikeAt: NOW - 25 * HOUR }, c, NOW), 'B+')
+  assert.equal(tier(mk('b'), { ...FREED, strikes: 1, strikeAt: NOW - 25 * HOUR }, NOW), 'B+')
   // A known reading always wins, whatever the history.
-  assert.equal(tier(mk('a', 10), { strikes: 2, strikeAt: NOW - 1 }, c, NOW), 'A')
+  assert.equal(tier(mk('a', 10), { strikes: 2, strikeAt: NOW - 1 }, NOW), 'A')
 })
 
 test('hard limit, every strategy: a known seat first, then presumed reset, then unknown', () => {
@@ -260,25 +269,11 @@ test('hard limit among unknown seats: fewest strikes first, then the strategy or
   }
 })
 
-test('the strategy still orders seats within one tier', () => {
+test('the account order still orders seats within one tier', () => {
   const chain = [mk('cur', 100), mk('u'), mk('k1', 60, NOW + 9 * HOUR), mk('k2', 20, NOW + 5 * HOUR), mk('k3', 40, NOW + 2 * HOUR)]
-  const pick = (strategy: Config['strategy'], from = 'claude:cur') => pickNext(chain, from, {}, cfg({ strategy }), NOW)?.key
-  assert.equal(pick('drain'), 'claude:k1')
-  assert.equal(pick('drain', 'claude:k1'), 'claude:k2')
-  assert.equal(pick('priority'), 'claude:k1')
-  assert.equal(pick('balanced'), 'claude:k2')
-  assert.equal(pick('soonest-reset'), 'claude:k3')
-})
-
-test('balanced and soonest-reset: an unknown seat no longer competes as 50 %', () => {
-  const chain = [mk('cur', 100), mk('u'), mk('k', 80)]
-  // 80 % known is worse than "50", but it is the only seat with numbers.
-  assert.equal(pickNext(chain, 'claude:cur', {}, cfg({ strategy: 'balanced' }), NOW)?.key, 'claude:k')
-  assert.equal(pickNext(chain, 'claude:cur', {}, cfg({ strategy: 'soonest-reset' }), NOW)?.key, 'claude:k')
-  // Within the presumed-reset and unknown tiers there are no numbers: chain order.
-  const blind = [mk('cur', 100), mk('u1'), mk('u2'), mk('p')]
-  assert.equal(pickNext(blind, 'claude:cur', { 'claude:p': FREED }, cfg({ strategy: 'balanced' }), NOW)?.key, 'claude:p')
-  assert.equal(pickNext(blind, 'claude:cur', {}, cfg({ strategy: 'soonest-reset' }), NOW)?.key, 'claude:u1')
+  const pick = (from = 'claude:cur') => pickNext(chain, from, {}, cfg(), NOW)?.key
+  assert.equal(pick(), 'claude:k1')
+  assert.equal(pick('claude:k1'), 'claude:k2')
 })
 
 test('threshold or idle move, every strategy: only onto a known seat, unless the source is at 100 % and none exists', () => {
@@ -298,11 +293,10 @@ test('threshold or idle move, every strategy: only onto a known seat, unless the
   }
 })
 
-test('a manual pick ignores tiers: chain and strategy order as before', () => {
+test('a manual pick ignores tiers: chain order as before', () => {
   const chain = [mk('cur', 100), mk('u'), mk('k', 60)]
   const health = { 'claude:u': { strikes: 3, strikeAt: NOW - 1 } }
   assert.equal(pickNext(chain, 'claude:cur', health, cfg(), NOW, { mode: 'manual' })?.key, 'claude:u')
-  assert.equal(pickNext(chain, 'claude:cur', health, cfg({ strategy: 'balanced' }), NOW, { mode: 'manual' })?.key, 'claude:u')
   assert.equal(pickNext(chain, 'claude:cur', health, cfg(), NOW)?.key, 'claude:k')
 })
 
@@ -338,7 +332,7 @@ test('guessed cooldown for a seat without numbers doubles per strike, capped at 
   assert.deepEqual([1, 2].map((n) => minutes(n, 480)), [480, 480])
 })
 
-test('legacy strategies are unchanged by Smart: its context and its settings mean nothing to them', () => {
+test('the account order is unchanged by Auto: its context and its settings mean nothing to it', () => {
   const seat = (id: string, session: number | null, weekly = 10, weeklyReset = NOW + 86_400_000): Seat => ({
     key: `claude:${id}`,
     provider: 'claude',
@@ -350,7 +344,7 @@ test('legacy strategies are unchanged by Smart: its context and its settings mea
   // b is nearly full (Low for Smart), c has the most room, d resets soonest, e is unknown.
   const chain = [seat('a', 100), seat('b', 98, 20), seat('c', 5, 5), seat('d', 50, 60, NOW + 3_600_000), seat('e', null)]
   const health: Record<string, SeatHealth> = {}
-  const expected = { drain: 'b', priority: 'b', balanced: 'c', 'soonest-reset': 'd' } as const
+  const expected = { drain: 'b' } as const
   // What Smart would be told: b was left as Low, c is crowded.
   const smart = { samples: {}, panes: { 'claude:c': 9 }, avoid: new Set(['claude:b']) }
   for (const [strategy, id] of Object.entries(expected) as [Config['strategy'], string][]) {
@@ -358,12 +352,11 @@ test('legacy strategies are unchanged by Smart: its context and its settings mea
     for (const mode of ['hard', 'advisory', 'manual'] as const) {
       assert.equal(pickNext(chain, 'claude:a', health, config, NOW, { mode })?.accountId, id, `${strategy} ${mode}`)
       assert.equal(pickNext(chain, 'claude:a', health, config, NOW, { mode, smart })?.accountId, id, `${strategy} ${mode} with context`)
-      // The Smart-only settings are not read by a legacy strategy either.
+      // The Smart-only settings are not read by the account order either.
       const looking = { ...config, horizonMinutes: 25, lowFiveHour: 90, lowSevenDay: 97 }
       assert.equal(pickNext(chain, 'claude:a', health, looking, NOW, { mode, smart })?.accountId, id, `${strategy} ${mode} with Smart settings`)
     }
   }
-  assert.equal(pickNext(chain, 'claude:a', health, cfg({ strategy: 'manual' }), NOW, { smart }), null)
   // Smart itself reads all of it: d, whose weekly quota is about to expire, and never the nearly full b.
   assert.equal(pickNext(chain, 'claude:a', health, SMART_CONFIG, NOW, { smart })?.accountId, 'd')
   // Switch-back: unchanged without an `avoid` set, which only Smart and my-order ever pass.
@@ -371,4 +364,16 @@ test('legacy strategies are unchanged by Smart: its context and its settings mea
   assert.equal(preferredOver(back, 'claude:q', {}, cfg(), NOW, 'pane')?.accountId, 'p')
   assert.equal(preferredOver(back, 'claude:q', {}, cfg(), NOW, 'pane', new Set())?.accountId, 'p')
   assert.equal(preferredOver(back, 'claude:q', {}, cfg(), NOW, 'pane', new Set(['claude:p'])), null)
+})
+
+test('exclude: an account by its label, or by service and label (claude:work@example.com)', async () => {
+  const { isExcluded, namesAny } = await import('./selector')
+  const seat = { key: 'claude:a1', provider: 'claude', accountId: 'a1', label: 'work@example.com', active: false, usage: { known: false } } as const
+  const cfg = (exclude: string) => ({ ...DEFAULT_CONFIG, exclude })
+  assert.equal(isExcluded(seat as never, cfg('work@example.com')), true)
+  assert.equal(isExcluded(seat as never, cfg('claude:work@example.com')), true)
+  assert.equal(isExcluded(seat as never, cfg('codex:work@example.com')), false)
+  assert.equal(isExcluded(seat as never, cfg('claude:a1')), true)
+  assert.equal(namesAny([seat as never], ' Claude:Work@Example.com '), true)
+  assert.equal(namesAny([seat as never], 'claude:other'), false)
 })

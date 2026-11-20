@@ -1,5 +1,6 @@
 // Terminal tails and `orca account list --json` results used by the tests.
 // REAL = captured from the real CLIs (2026-11-18); the rest follow each CLI's known banner wording.
+import { readFileSync } from 'node:fs'
 
 /** REAL: Codex on Ollama Cloud out of credits (orchestration review worker). */
 export const CODEX_OLLAMA_CREDITS = [
@@ -134,4 +135,58 @@ export function accountList(options: {
       }))
     }
   }
+}
+
+// ---- Orca's settings, as the real app serves them ------------------------------------------------
+
+type Declared = { key: string; type: 'string' | 'number' | 'integer' | 'boolean'; default?: unknown; enum?: unknown[] }
+let declaredSettings: Declared[] | undefined
+const declared = (): Declared[] =>
+  (declaredSettings ??= JSON.parse(readFileSync(new URL('../orca-plugin.json', import.meta.url) as never, 'utf8')).contributes.settings as Declared[])
+
+type SettingsLike = {
+  get(key?: string): Promise<unknown>
+  set(key: string, value: unknown): Promise<void>
+  onDidChange(listener: (change: { key: string }) => void): { dispose(): void }
+}
+
+/**
+ * The worker API with settings that behave as live Orca's do (checked on Orca 1.4.263), where the
+ * test host's plain store does not:
+ * - `settings.get()` returns only the settings orca-plugin.json declares, each as its declared
+ *   default until it is changed; a stored key that is not declared (a 0.2 one) is left out;
+ * - `settings.get(key)` returns a stored value even when the key is not declared;
+ * - `settings.set` refuses a declared setting's value of the wrong type with `action_failed`.
+ * `failing` makes reads (`get`) or writes (`set`) fail, as when Orca cannot be asked; its
+ * `changed` is filled in with a way to tell the worker's listeners that a setting changed.
+ */
+export type SettingsFaults = { get?: () => boolean; set?: (key: string) => boolean; changed?: (key: string) => void }
+export function likeOrca<T extends { settings: unknown }>(orca: T, failing: SettingsFaults = {}): T {
+  const real = orca.settings as SettingsLike
+  const refuse = (message: string) => Object.assign(new Error(message), { code: 'action_failed', retryable: false })
+  const settings: SettingsLike = {
+    async get(key?: string) {
+      if (failing.get?.()) throw refuse('settings are not available')
+      const stored = (await real.get()) as Record<string, unknown>
+      if (key !== undefined) return stored[key] ?? declared().find((d) => d.key === key)?.default
+      return Object.fromEntries(declared().map((d) => [d.key, stored[d.key] ?? d.default]))
+    },
+    async set(key, value) {
+      if (failing.set?.(key)) throw refuse('settings cannot be written')
+      const spec = declared().find((d) => d.key === key)
+      const type = spec?.type === 'integer' ? 'number' : spec?.type
+      if (spec && typeof value !== type) throw refuse(`${key} takes a ${type}`)
+      await real.set(key, value)
+    },
+    onDidChange: (listener) => {
+      const before = failing.changed
+      failing.changed = (key) => {
+        before?.(key)
+        listener({ key })
+      }
+      return real.onDidChange(listener)
+    }
+  }
+  // A copy with the settings replaced (the worker API is frozen, so it cannot be changed in place).
+  return Object.create(Object.getPrototypeOf(orca), { ...Object.getOwnPropertyDescriptors(orca), settings: { value: settings, enumerable: true } }) as T
 }

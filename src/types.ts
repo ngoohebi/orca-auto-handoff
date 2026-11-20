@@ -136,6 +136,10 @@ export type HistoryEntry = {
   /** Why it happened, in one line a person can read ("work is over its usage threshold (used
    *  97 % of 5h); moved to personal (used 12 % of 5h)"). Entries from older versions have none. */
   why?: string
+  /** Text the user had typed and not sent, which went with the session and could not be put
+   *  back (the hand-off failed, or the new session's input box was not free): kept here in full
+   *  so it is never lost. The panel shows it with the entry, to copy. */
+  unsent?: string
 }
 
 /** A session parked until a seat frees up (every seat exhausted, wait_for_reset on). */
@@ -162,16 +166,42 @@ export type WaitingEntry = {
   /** With `draftAt`: held because Orca could not say whether the pane is between turns with an
    *  empty input box, not because text was seen there. */
   unchecked?: boolean
+  /** With `draftAt`: what is there is Claude's hint for queued messages (sent, waiting in the
+   *  session), not text being typed. */
+  queued?: boolean
   /** The limit whose move waits for that text (absent for a wait for a reset). */
   reason?: SwapReason
+  /** Held because the pane is in the terminal tab the user is on (`Config.activeTerminal`): since
+   *  when. Every tick looks again; the pane moves once that tab is no longer the one shown, or
+   *  once the countdown below runs out with no sign of the user. */
+  activeSince?: number
+  /** The countdown before an active pane is moved anyway: started at `countdownFrom`, moves at
+   *  `countdownUntil`. Absent while the user shows signs of being there. */
+  countdownFrom?: number
+  countdownUntil?: number
+  /** The user pressed *Hand off now*: the hold is over. */
+  forceAt?: number
+  /** Hand-offs of this session that failed before its pane was closed (the account could not be
+   *  selected, the new session not started): another account is tried, a few times at most. */
+  failures?: number
+  /** The one reminder for a long hold was given. */
+  reminded?: boolean
+  /** "Ask me first": the panel asks whether to move it now. */
+  asked?: boolean
+  /** The user answered *Not now*: it waits for another tab to be shown, with no countdown. */
+  declined?: boolean
+  /** This hold already said that a countdown runs, and that the session was not handed off:
+   *  each is said at most once per hold, however often the user comes and goes. */
+  toldCountdown?: boolean
+  toldHeld?: boolean
 }
 
-/** How the plugin decides (the `mode` setting, with `auto` resolved; see `resolveSettings`). */
-export type Mode = 'smart' | 'my-order' | 'manual' | 'custom'
+/** How the plugin picks the next account (the `pick` setting). */
+export type Mode = 'smart' | 'my-order'
 
 export type Config = {
-  /** `smart`: forecast and rank (smart.ts). `my-order`: the account order, with the same early
-   *  leave. `manual`: never automatically. `custom`: the legacy settings exactly as stored. */
+  /** `smart` (Auto): forecast and rank (smart.ts). `my-order` (Custom order): the account order,
+   *  with the same early leave. */
   mode: Mode
   /** A seat counts as Low when it would run out within this many minutes at its current pace.
    *  0 = no forecast. */
@@ -180,17 +210,14 @@ export type Config = {
   lowFiveHour: number
   /** …or of its weekly window. */
   lowSevenDay: number
-  /** `move`: sessions move when idle or between turns. `limit`: only at a limit. `launches`:
-   *  running sessions are never moved; only new launches change account. */
-  runningSessions: 'move' | 'limit' | 'launches'
-  /** Set when `auto` kept the earlier settings as `custom`: the panel says so once. */
-  notice?: string
-  thresholdFiveHour: number
-  thresholdSevenDay: number
-  /** `smart` is never stored: it is what `mode: smart` resolves to. */
-  strategy: 'drain' | 'balanced' | 'priority' | 'soonest-reset' | 'manual' | 'smart'
+  /** A seat is Low from this much use of its 5-hour window whatever its pace (100 = never). */
+  floorFiveHour: number
+  /** `move`: sessions move when idle or between turns. `limit`: only at a limit. */
+  runningSessions: 'move' | 'limit'
+  /** `smart` for Auto, `drain` (the account order) for Custom order. */
+  strategy: 'drain' | 'smart'
   autoSwitchOnThreshold: boolean
-  /** Go back to an earlier seat in the chain once it is healthy again (drain, priority). */
+  /** Go back to an earlier seat in the chain once it is healthy again (Custom order). */
   switchBack: boolean
   /** Minimum time between automatic selection changes of one provider (threshold, switch-back,
    *  idle moves); hard limits ignore it. */
@@ -202,8 +229,6 @@ export type Config = {
   autoSwapIdleAfterSeconds: number
   /** Comma-separated seats never switched *to* automatically (same tokens as `chain`). */
   exclude: string
-  autoSwitchOnRateLimit: boolean
-  autoResume: boolean
   autoMessage: string
   waitForReset: boolean
   retryOnApiError: boolean
@@ -220,22 +245,44 @@ export type Config = {
   orcaCliPath: string
   /** Automatic hand-off per service; a service that is off is never touched automatically. */
   services: Record<Provider, boolean>
+  /** The session on screen (the pane in the terminal tab the user is on). `ask`: as `careful`,
+   *  and the panel asks first. `careful`: only a limit moves it, after a countdown with no sign
+   *  of the user. `wait`: it waits until the tab is left or the user says so. `now`: moved like
+   *  any other pane. */
+  activeTerminal: 'ask' | 'careful' | 'wait' | 'now'
+  /** `careful`: how long the countdown before an active pane moves anyway lasts. */
+  countdownSeconds: number
+  /** Typing, a tab switch or using the panel counts as the user being there for this long. */
+  presenceSeconds: number
+  /** One reminder when an active pane has been held this long; 0 = none. */
+  reminderMinutes: number
+  /** Put plain unsent text from the input box back into the moved session's input box. */
+  restoreUnsent: boolean
+  /** "Early when away": early moves start only this long after the last sign of the user; 0 = always. */
+  awayMinutes: number
+  /** Set while the settings cannot be trusted, so every service counts as off whatever was chosen
+   *  (worker.ts `configReader`): `settings` = Orca could not be asked for them yet, `upgrade` = the
+   *  settings of an older version are not carried over yet. The panel says so. */
+  held?: Held
 }
+
+/** Why every service counts as off although none was turned off (`Config.held`). */
+export type Held = 'settings' | 'upgrade'
 
 export function allServices(on: boolean): Record<Provider, boolean> {
   return { claude: on, codex: on, antigravity: on, opencode: on, devin: on }
 }
 
-/** The legacy settings at their defaults, as `custom` mode reads them. What a fresh install runs
- *  is `SMART_CONFIG`. */
+/** The base every config is built on (worker.ts `configFrom` sets every field the settings
+ *  cover; a fresh install runs Auto with Early when away). Tests start from it, or from
+ *  `SMART_CONFIG` for Auto with the early-move thresholds. */
 export const DEFAULT_CONFIG: Config = {
-  mode: 'custom',
+  mode: 'my-order',
   horizonMinutes: 0,
   lowFiveHour: 100,
   lowSevenDay: 100,
+  floorFiveHour: 100,
   runningSessions: 'move',
-  thresholdFiveHour: 100,
-  thresholdSevenDay: 100,
   strategy: 'drain',
   autoSwitchOnThreshold: true,
   switchBack: true,
@@ -243,8 +290,6 @@ export const DEFAULT_CONFIG: Config = {
   minHeadroomGap: 10,
   autoSwapIdleAfterSeconds: 900,
   exclude: '',
-  autoSwitchOnRateLimit: true,
-  autoResume: true,
   autoMessage: 'Continue.',
   waitForReset: true,
   retryOnApiError: true,
@@ -256,10 +301,16 @@ export const DEFAULT_CONFIG: Config = {
   usageCacheMaxAgeHours: 168,
   handoffMaxChars: 6000,
   orcaCliPath: '',
-  services: allServices(true)
+  services: allServices(true),
+  activeTerminal: 'ask',
+  countdownSeconds: 60,
+  presenceSeconds: 300,
+  reminderMinutes: 10,
+  restoreUnsent: true,
+  awayMinutes: 10
 }
 
-/** What a fresh install runs: Smart, "just before the limit". */
+/** Auto (`pick: smart`) with the thresholds of Early when away, for tests. */
 export const SMART_CONFIG: Config = {
   ...DEFAULT_CONFIG,
   mode: 'smart',
@@ -294,8 +345,6 @@ export type RotatorState = {
   probation?: Record<string, Probation>
   /** Seats left as Low (smart.ts anti-flap), by seat key. */
   leftLow?: Record<string, LeftLow>
-  /** The one-time note about `custom` mode has been dismissed. */
-  customNoticeSeen?: boolean
 }
 
 export const HISTORY_CAP = 1000
@@ -318,25 +367,35 @@ export function emptyState(): RotatorState {
   }
 }
 
-/** What the panel and status bar show. */
+/** What the panel and the Claude console status line show. */
 export type Snapshot = {
   paused: boolean
   updatedAt: number
   seats: (Seat & {
     cooldownUntil?: number
     cooldownReason?: string
+    /** Never chosen automatically (the "Skip" switch, the `exclude` setting). */
+    excluded?: boolean
     /** How long until the first window is used up at the current pace (usage-history.ts); absent
      *  when the pace is unknown. Observed only: nothing switches on it yet. */
     runwayMs?: number
   })[]
   waiting: WaitingEntry[]
   history: HistoryEntry[]
-  /** Which services switch automatically. */
+  /** Which services hand off automatically. */
   services: Record<Provider, boolean>
-  /** How the plugin decides right now (`auto` resolved). */
+  /** Every service counts as off for now, and why (`Config.held`): nobody turned them off. */
+  held?: Held
+  /** How the plugin picks the next account. */
   mode?: Mode
-  /** A one-time note for the panel (settings carried over as `custom`), until dismissed. */
-  notice?: string
+  /** When to hand off is "At limit" (only at a limit). */
+  atLimitOnly?: boolean
+  /** "Early when away" is chosen, and the user is at Orca: sessions move only at a limit for now. */
+  userHere?: boolean
+  /** Session on screen, as set (the panel words its waiting lines by it). */
+  activeTerminal?: Config['activeTerminal']
+  /** Custom order: each service's accounts in that order, by seat key. */
+  order?: Partial<Record<Provider, string[]>>
   /** The service of the agent the user is working with: the most recently active agent in the
    *  focused workspace. The panel lists that service first. */
   focused?: Provider

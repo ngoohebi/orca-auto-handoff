@@ -206,14 +206,23 @@ export function nodeCli(getPath: () => Promise<string>): Cli {
       await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'close', '--terminal', terminalId, ...envArgs(server)])
     },
     async sendText(terminalId: string, text: string, server?: string) {
-      await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'send', '--terminal', terminalId, '--text', text, '--enter', ...envArgs(server)])
+      // `--text=…`: as a word of its own, a text that starts with `--` is read as another flag
+      // (live, Orca 1.4.263: `--text --enter` is refused as invalid_argument).
+      await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'send', '--terminal', terminalId, `--text=${text}`, '--enter', ...envArgs(server)])
+    },
+    async typeText(terminalId: string, text: string, server?: string) {
+      await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'send', '--terminal', terminalId, `--text=${text}`, ...envArgs(server)])
     },
     async git(cwd: string, args: string[]) {
       return run('git', ['-C', cwd, ...args], undefined, 10_000)
     },
     async activeTerminals(server?: string) {
       const result = await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'list', '--include-visual-layouts', ...envArgs(server)])
-      return activeTerminalsIn(result)
+      return shownTerminalsIn(result)
+    },
+    async visibleTerminals(server?: string) {
+      const result = await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'list', '--include-visual-layouts', ...envArgs(server)])
+      return shownTerminalsIn(result, true)
     },
     async draft(terminalId: string, server?: string) {
       const result = await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'read', '--terminal', terminalId, '--limit', '1', ...envArgs(server)])
@@ -229,9 +238,19 @@ export function nodeCli(getPath: () => Promise<string>): Cli {
   }
 }
 
-/** The terminal handles shown in each workspace's active tab (its active leaf when the tab is
- *  split), from `orca terminal list --include-visual-layouts`. */
-export function activeTerminalsIn(result: any): string[] {
+/** As `activeTerminalsIn`, for an answer of the CLI. An answer without layouts (an Orca that does
+ *  not know `--include-visual-layouts` lists the terminals and leaves them out) does not say
+ *  that no terminal is shown: it is no answer, so this throws, and the engine takes a session
+ *  for the one on screen rather than for one in another tab. */
+export function shownTerminalsIn(result: any, everyPane = false): string[] {
+  if (!Array.isArray(result?.visualLayouts)) throw new Error('orca terminal list gave no layouts')
+  return activeTerminalsIn(result, everyPane)
+}
+
+/** The terminal handles shown in each workspace's active tab, from `orca terminal list
+ *  --include-visual-layouts`: its active leaf when the tab is split (the pane the user works
+ *  in), or with `everyPane` every pane of that tab (all of them are on screen). */
+export function activeTerminalsIn(result: any, everyPane = false): string[] {
   const handles: string[] = []
   const layouts: any[] = Array.isArray(result?.visualLayouts) ? result.visualLayouts : []
   const terminals = (node: any, out: any[] = []): any[] => {
@@ -259,6 +278,10 @@ export function activeTerminalsIn(result: any): string[] {
       const tab = group.tabs.find((t: any) => t?.tabId === group.activeTabId) ?? group.tabs[0]
       if (!tab) continue
       const panes = terminals(tab.panes)
+      if (everyPane) {
+        handles.push(...panes.map((p) => p.handle))
+        continue
+      }
       const leaf = panes.find((p) => p.leafId && p.leafId === tab.activeLeafId) ?? panes.find((p) => p.active) ?? panes[0]
       if (leaf) handles.push(leaf.handle)
     }

@@ -1,4 +1,5 @@
 // The panel <-> worker contract, declared once: src/panel.tsx and src/worker.ts both read it.
+import type { SettingValues } from './settings'
 import type { Provider, Snapshot } from './types'
 
 /** What the panel's console status line switch shows: the focused workspace and whether the
@@ -7,8 +8,11 @@ export type ConsoleLineState = { installed: boolean; workspace?: string; reason?
 
 export type { Snapshot }
 
-/** Unsent text a pane shows in its input box (trimmed), and the pane. */
-export type UnsentDraft = { terminalId: string; text: string }
+export type { SettingValues } from './settings'
+
+/** Unsent text a pane shows in its input box (trimmed), and the pane. `queued`: it is Claude's
+ *  hint for queued messages (sent, waiting in the session), not text the user typed. */
+export type UnsentDraft = { terminalId: string; text: string; queued?: boolean }
 
 declare module 'orca' {
   interface PluginRequests {
@@ -25,22 +29,33 @@ declare module 'orca' {
     }
     /** The Claude console status line in the focused workspace: read it, or with `enabled` install or remove it. */
     'rotator.consoleLine': { input: { enabled?: boolean }; output: ConsoleLineState & { message?: string } }
-    /** Stop waiting to resume a parked session. */
+    /** The Settings tab: read every shown setting (settings.ts), or with `key` and `value` change one first. */
+    'rotator.settings': { input: { key?: string; value?: string | number | boolean }; output: SettingValues }
+    /** Custom order: move an account one place up (-1) or down (1) in its service's order. */
+    'rotator.moveSeat': { input: { seatKey: string; by: number }; output: { ok: true } }
     /** Re-reads which service the current terminal's agent belongs to; the panel polls this
      *  while open because switching terminal tabs raises no event. */
     'rotator.focus': { input: Record<string, never>; output: { focused?: Provider } }
-    /** The panel's *Manual switch*: select that account for its service, move the current
-     *  terminal's pane when it runs that service and is between turns, and turn the service's
-     *  automatic hand-off off so the choice is never undone; the panel offers the toggle. */
-    /** When the pane that would move shows unsent text, nothing is switched and the text comes
-     *  back as `draft`, with the pane it is in: the panel asks, and only its *Hand off anyway* sends
-     *  the request again with `acceptDraft: true` and that same `draft`. The pane then moves only
-     *  while it is that pane and its text is still exactly that; other text comes back as
-     *  `draft` again. */
+    /** The panel's *Hand off to this account*: select that account for its service, hand off the
+     *  session on screen when it runs that service and is between turns (plain unsent text goes
+     *  with it), and turn the service's automatic hand-off off so the choice is never undone.
+     *  When the session shows unsent text that cannot go along, nothing is handed off and the
+     *  text comes back as `draft`, with the pane it is in: the panel asks, and only its *Hand off
+     *  anyway* sends the request again with `acceptDraft: true` and that same `draft`. The pane
+     *  then moves only while it is that pane and its text is still exactly that; other text
+     *  comes back as `draft` again. */
     'rotator.switchTo': { input: { seatKey: string; acceptDraft?: boolean; draft?: UnsentDraft }; output: { message: string; draft?: UnsentDraft } }
     'rotator.cancelWaiting': { input: { terminalId: string }; output: { ok: true } }
-    /** The one-time note about `custom` mode was read. */
-    'rotator.dismissNotice': { input: Record<string, never>; output: { ok: true } }
+    /** An account card's "Skip" switch: the account is never chosen automatically. */
+    'rotator.setExcluded': { input: { seatKey: string; excluded: boolean }; output: { ok: true } }
+    /** *Not now* to "Ask me first": the session on screen waits for another tab, with no countdown. */
+    'rotator.declineHandoff': { input: { terminalId: string }; output: { ok: true } }
+    /** *Hand off now* for a waiting session (the one on screen, held for the user). `message`
+     *  says why it was not handed off, when it was not. */
+    'rotator.handoffNow': { input: { terminalId: string }; output: { ok: true; message?: string } }
+    /** For looking into a problem (`orca plugin dev request`), not used by the panel: the last
+     *  few status events, the focused workspace's agents and the workspaces Orca lists. */
+    'rotator.debug': { input: Record<string, never>; output: Record<string, unknown> }
   }
   interface PluginPanelEvents {
     /** Posted to every open panel when anything the panel shows changes. */
@@ -48,5 +63,7 @@ declare module 'orca' {
     /** Posted when the focused workspace changes: the console status line state there, so the
      *  panel's switch never shows the previous workspace's. */
     'rotator.consoleLine': ConsoleLineState
+    /** Posted when the plugin's settings change, also from Orca's Settings page. */
+    'rotator.settings': SettingValues
   }
 }
