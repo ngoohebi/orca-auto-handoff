@@ -210,9 +210,10 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <a class="brand" href="#top">
       <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="var(--accent)"/><path d="M9 19a7 7 0 1 1 14 0" stroke="var(--accent-fg)" stroke-width="3" fill="none" stroke-linecap="round"/><path d="M16 19l5-6" stroke="var(--accent-fg)" stroke-width="3" stroke-linecap="round"/></svg>
-      Auto Hand-off <small>Orca plugin</small>
+      OAH <small>CLI + Orca plugin</small>
     </a>
     <ul>
+      <li><a href="#cli">CLI &amp; Daemon</a></li>
       <li><a href="#how">How it works</a></li>
       <li><a href="#triggers">Triggers</a></li>
       <li><a href="#strategies">How it decides</a></li>
@@ -235,25 +236,26 @@ footer a{color:var(--fg-2)}
 <section class="hero">
   <div class="wrap">
     <div>
-      <div class="eyebrow">For Orca · Claude, Codex, Antigravity, OpenCode, Devin</div>
+      <div class="eyebrow">CLI-first Daemon + Thin Orca Plugin · Claude, Codex, Antigravity, OpenCode, Devin</div>
       <h1>Hit a rate limit? <span>Auto-switch to your next account.</span></h1>
-      <p class="lede">Automatic account switching for Orca. Claude to Claude, Codex to Codex: a session always keeps its provider. Auto Hand-off runs the accounts Orca manages as one pool per service. When a session hits a limit, the plugin cools that account down and hands the session off to the next account with room. A Claude session is resumed there as the same session, with its context and the first message already typed. Codex, Antigravity, OpenCode and Devin cannot resume a session on another account: they start a new session there from a summary of the old one.</p>
+      <p class="lede">OAH (Orca Auto Hand-off) is a standalone <code>oah</code> CLI and <code>oahd</code> daemon with a thin Orca sidebar panel. Claude stays Claude, Codex stays Codex: a session always keeps its provider. When an account hits a limit or runs low while you are away, <code>oahd</code> cools it down and hands the session off to the next healthy account — resuming Claude sessions in place with context and unsent text, or starting a summary hand-off for Codex, Antigravity, OpenCode and Devin.</p>
       <div class="badges">
-        <span class="badge">v<b>0.3.0</b></span>
+        <span class="badge">v<b>0.4.0</b></span>
+        <span class="badge">Node <b>≥ 22.18</b> · zero deps</span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
         <span class="badge"><b>MIT</b> license</span>
-        <span class="badge"><b>395</b> tests, real captured banners</span>
+        <span class="badge"><b>410</b> tests, real captured banners</span>
         <span class="badge">Never hands off <b>across services</b></span>
       </div>
       <div class="cta">
         <a class="btn primary" href="#install">Install</a>
-        <a class="btn" href="#how">See what it does</a>
+        <a class="btn" href="#cli">Explore oah CLI</a>
       </div>
-      <div class="cmd"><span class="dollar">$</span><span class="c">orca plugin install ngoohebi/orca-auto-handoff</span><button class="copy" data-copy="orca plugin install ngoohebi/orca-auto-handoff">Copy</button></div>
+      <div class="cmd"><span class="dollar">$</span><span class="c">oah status --json</span><button class="copy" data-copy="oah status --json">Copy</button></div>
     </div>
 
-    <div class="panel" aria-label="The Auto Hand-off panel">
-      <div class="ph">Auto Hand-off <span>◐ Auto · Early when away · waiting</span></div>
+    <div class="panel" aria-label="The OAH panel">
+      <div class="ph">OAH <span>◐ Auto · Early when away · waiting</span></div>
       <div class="row"><span>Automatic hand-off</span><span class="toggle"></span></div>
       <div class="tabs"><b>Accounts</b><span>History (13)</span><span>Settings</span></div>
       <div class="card">
@@ -292,6 +294,49 @@ footer a{color:var(--fg-2)}
   </div>
 </section>
 
+<section id="cli">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">CLI &amp; Daemon Architecture</div>
+      <h2>One CLI, one daemon, thin UI bridge</h2>
+      <p class="lede"><code>oahd</code> owns all state, settings, usage cache, burn-rate history and hand-off logic in <code>~/.orca/oah/</code> over a local Unix socket (<code>oahd.sock</code>). The <code>oah</code> CLI and the thin Orca plugin both talk to <code>oahd</code> — so local desktop, headless <code>orca serve</code> hosts, paired servers, scripts and agents all share one source of truth.</p>
+    </div>
+    <div class="grid g3">
+      <div class="tile default">
+        <h3><code>oah</code> CLI <span class="tag">bin/oah</span></h3>
+        <p>First-class command line with <code>--json</code> on every subcommand. Auto-starts <code>oahd</code> on demand; supports status, refresh, hand-off, account switching, pause/resume, skip, custom order, config, history, statusline and daemon control.</p>
+      </div>
+      <div class="tile">
+        <h3><code>oahd</code> Daemon <span class="tag">~/.orca/oah/</span></h3>
+        <p>Background Node.js daemon (zero npm dependencies). Persists <code>config.json</code>, <code>state.json</code>, <code>usage.json</code> and <code>samples.json</code> atomically with <code>0600</code> permissions, runs the periodic tick loop and watches live pane files.</p>
+      </div>
+      <div class="tile">
+        <h3>Thin Orca Plugin <span class="tag">src/plugin/worker.ts</span></h3>
+        <p>Zero business logic or local state. Connects to <code>oahd.sock</code>, forwards <code>agent.status.changed</code> and <code>workspace.changed</code> events, provides native <code>agent.resume</code> and desktop notifications, and renders the OAH sidebar panel.</p>
+      </div>
+    </div>
+    <div class="trace">
+      <div class="term">
+        <div class="t">oah CLI — daily controls</div>
+        <div><span class="dim">$</span> <span class="k">oah</span> <span class="dim"># accounts, usage, runway &amp; cooldowns</span></div>
+        <div><span class="dim">$</span> <span class="k">oah use</span> work@example.com</div>
+        <div><span class="dim">$</span> <span class="k">oah config set</span> timing at-limit</div>
+        <div><span class="dim">$</span> <span class="k">oah service</span> codex off</div>
+        <div><span class="dim">$</span> <span class="k">oah pause</span> <span class="dim">|</span> <span class="k">oah resume</span></div>
+        <div><span class="dim">$</span> <span class="k">oah history</span> --limit 10 --json</div>
+      </div>
+      <div class="term">
+        <div class="t">oahd daemon — lifecycle &amp; status</div>
+        <div><span class="dim">$</span> <span class="k">oah daemon status</span></div>
+        <div><span class="g">oahd 0.4.0 running</span> (pid 48210)</div>
+        <div>  <span class="dim">uptime:</span> 4h12m</div>
+        <div>  <span class="dim">socket:</span> ~/.orca/oah/oahd.sock</div>
+        <div>  <span class="dim">orca bridge:</span> <span class="g">connected</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
 <section id="how">
   <div class="wrap">
     <div class="sec-head">
@@ -316,7 +361,7 @@ footer a{color:var(--fg-2)}
         <div class="dim">❯</div>
       </div>
       <div class="term">
-        <div class="t">Auto Hand-off, moments later</div>
+        <div class="t">OAH (oahd), moments later</div>
         <div><span class="k">cooldown</span>  you@example.com <span class="dim">until 15:00</span></div>
         <div><span class="k">select  </span>  orca account select work@example.com</div>
         <div><span class="k">close   </span>  pane 3</div>
@@ -356,7 +401,7 @@ footer a{color:var(--fg-2)}
     <div class="grid g3" style="margin-top:28px">
       <div class="tile"><h3>Guards on hand-offs</h3><p>Plain text you typed and did not send goes with a Claude session and is put back unsent; if it cannot be put back, the notification quotes its first 300 characters and History keeps all of it to copy. Pasted images or blocks, text over 4,000 characters, text with escape sequences, queued messages, and unsent text in Codex, Antigravity, OpenCode or Devin keep the session where it is until you send or clear it. The session on screen is never handed off early. Early, idle and switch-back hand-offs also need at least 10 % more room on the target, and change a service's selection at most once per 5 minutes; hard limits ignore those two. Claude's grey prompt suggestion is reported like typed text, so it may come back as real text, never sent without Enter.</p></div>
       <div class="tile"><h3>Panes it did not start</h3><p>A restored pane has no recorded account. If it hits a limit while Orca shows plenty of room on the active account, the plugin cools nothing and simply resumes the session there.</p></div>
-      <div class="tile"><h3>Off switches</h3><p>Detection is heuristic. One switch pauses every service, each service has its own <em>Automatic hand-off</em> switch, and the <em>Skip</em> switch on an account card keeps that account out of automatic rotation. There is no manual or custom mode: these switches are it. While Orca cannot give the plugin your settings, or the upgrade from 0.2 is not finished, nothing is handed off automatically and the panel says so.</p></div>
+      <div class="tile"><h3>Off switches</h3><p>Detection is heuristic. Run <code>oah pause</code> (or flip the top switch) to pause every service, <code>oah service &lt;name&gt; off</code> for one service, or <code>oah skip &lt;account&gt;</code> to keep an account out of automatic rotation.</p></div>
     </div>
   </div>
 </section>
@@ -375,8 +420,7 @@ footer a{color:var(--fg-2)}
       <div class="tile"><h3>At limit</h3><p>A session hands off only when it hits a limit. Each account is used to the end.</p></div>
       <div class="tile"><h3>Session on screen</h3><p>Every pane of the tab Orca is showing. Never handed off early. At a limit, <em>Ask me first</em> (default) asks in the panel; unanswered, it waits while you are using Orca, then counts down. Or: <em>Wait, then count down</em>, <em>Wait for me</em>, <em>Move right away</em>.</p></div>
     </div>
-    <p class="lede" style="margin-top:24px">The badge next to the panel's title says what is happening now: <b style="color:var(--fg)">● Auto · Early when away · on</b> (green, you are away), <b style="color:var(--fg)">◐ … · waiting</b> (you are here), <b style="color:var(--fg)">○ Auto · At limit</b> (grey) or <b style="color:var(--fg)">■ Paused</b> (amber). <b style="color:var(--fg)">When everything is used up</b>, the session waits for the first account to reset and continues by itself, or, with <em>Stop</em>, stops and you are told. There is no manual or custom mode any more: pause, or turn off a service's <em>Automatic hand-off</em>.</p>
-    <p class="lede" style="margin-top:12px"><b style="color:var(--fg)">Coming from 0.2?</b> At the first start of 0.3.0 your old settings are read once and turned into the new ones: <em>my-order</em> or an account order becomes Custom order; <em>at-limit</em>, a running-sessions limit or "Switch at usage threshold" off becomes At limit; <em>earlier</em> becomes Early when away, 25 minutes before running out; "Wait for reset" off becomes Stop; "Retry on API errors" off becomes 0 retries; the idle time in seconds becomes minutes, rounded up. A setup that never handed off by itself gets automatic hand-off paused once, with a notification. Until that upgrade has finished, nothing is handed off automatically and the panel says "Auto Hand-off is finishing the upgrade".</p>
+    <p class="lede" style="margin-top:24px">The badge next to the panel's title says what is happening now: <b style="color:var(--fg)">● Auto · Early when away · on</b> (green, you are away), <b style="color:var(--fg)">◐ … · waiting</b> (you are here), <b style="color:var(--fg)">○ Auto · At limit</b> (grey) or <b style="color:var(--fg)">■ Paused</b> (amber). <b style="color:var(--fg)">When everything is used up</b>, the session waits for the first account to reset and continues by itself, or, with <em>Stop</em>, stops and you are told. Settings live in <code>~/.orca/oah/config.json</code> and stay in sync between <code>oah config</code> and the panel's Settings tab.</p>
   </div>
 </section>
 
@@ -431,7 +475,7 @@ footer a{color:var(--fg-2)}
     <div class="sec-head">
       <div class="eyebrow">Settings</div>
       <h2>Every knob, straight from the manifest</h2>
-      <p class="lede">The panel's Settings tab shows the four basic settings and, folded away, the <em>Advanced</em> ones; the same settings are in Settings → Plugins → Auto Hand-off. The first four rows are all most people need. A setting that does not apply right now is greyed out in the panel, with the reason. The texts below are the manifest's own.</p>
+      <p class="lede">The panel's Settings tab and <code>oah config set &lt;key&gt; &lt;value&gt;</code> both edit <code>~/.orca/oah/config.json</code>. The first four rows are all most people need; the rest are under <em>Advanced</em>.</p>
     </div>
     <div class="tscroll">
     <table class="tbl tbl-keys">
@@ -489,7 +533,7 @@ footer a{color:var(--fg-2)}
         <ul class="check">
           <li>Runs the <b>orca CLI</b>: <code>account select</code>, <code>account list</code>, <code>terminal close</code>, <code>terminal send</code>, <code>terminal read</code> (only to ask whether a pane holds unsent text; that text is put back after a hand-off, or shown when the panel asks before a hand-off by hand), <code>terminal list</code> (only to see which terminal tab is in front). Always an argument list, never a shell.</li>
           <li>For a project on a paired Orca server: loads Orca's own runtime client from the app bundle (<code>cli/runtime/client.js</code>, and before it the store helper <code>shared/remote-runtime/host-store/runtime-environment-store-execution.js</code>) to list and select that server's accounts, and to look up, read-only, which Orca a workspace runs on. The list call passes <code>refreshUsage: false, refreshStaleUsage: true</code>: no forced refresh, but that Orca may refresh readings it considers stale. These are Orca internals, not a published API</li>
-          <li>Writes its status file (readable by you only, mode 0600, since it names your accounts) and the status line script under <code>~/.orca/account-rotator/</code>, and, only when you install the console status line, that workspace's <code>.claude/settings.local.json</code></li>
+          <li>Stores daemon state, config, usage cache, socket (<code>oahd.sock</code>) and status files under <code>~/.orca/oah/</code> (folder mode <code>0700</code>, files mode <code>0600</code>), and, only when you install the console status line, that workspace's <code>.claude/settings.local.json</code></li>
           <li>Runs <b>git status</b> and <b>git diff --stat</b> for hand-off summaries</li>
           <li><b>Never</b> reads tokens, keychains or credential files</li>
           <li>A hand-off summary carries up to 40 lines of the previous agent's output, so treat it like any pasted terminal output</li>
@@ -535,35 +579,39 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <div class="sec-head">
       <div class="eyebrow">Install</div>
-      <h2>Two commands and an approval</h2>
+      <h2>Use the CLI right away, add the thin panel in Orca</h2>
     </div>
     <ol>
       <li>
         <div>
-          <p>Install from GitHub. Orca pins the newest version tag and prints what the plugin would be granted, along with a fingerprint.</p>
-          <pre><code>orca plugin install ngoohebi/orca-auto-handoff</code></pre>
+          <p>Run the <code>oah</code> CLI directly from a checkout (requires Node.js ≥ 22.18, zero npm dependencies). It auto-starts <code>oahd</code> on demand.</p>
+          <pre><code>git clone https://github.com/ngoohebi/orca-auto-handoff.git
+cd orca-auto-handoff
+./bin/oah status</code></pre>
         </div>
       </li>
       <li>
         <div>
-          <p>Approve with that fingerprint. The command is printed for you; it looks like this.</p>
-          <pre><code>orca plugin install ngoohebi/orca-auto-handoff --approve ap1-…</code></pre>
+          <p>Install the thin Orca plugin so <code>oahd</code> gets instant event push, native Claude <code>agent.resume</code>, desktop notifications and the OAH sidebar panel.</p>
+          <pre><code>orca plugin install ngoohebi/orca-auto-handoff
+# approve with the printed fingerprint:
+orca plugin install ngoohebi/orca-auto-handoff --approve ap1-…</code></pre>
         </div>
       </li>
       <li>
         <div>
-          <p>Add a second account for the service in Orca, if you have not already. Done: open the Auto Hand-off panel (gauge icon, right sidebar). Optionally choose <em>Custom order</em> in its Settings tab and arrange your accounts with the arrows.</p>
+          <p>Add a second account for the service in Orca, if you have not already. Open the <b>OAH</b> panel (gauge icon, right sidebar) or control everything from your terminal with <code>oah</code>.</p>
         </div>
       </li>
     </ol>
     <details>
-      <summary>Working on the plugin itself</summary>
-      <pre style="margin-top:12px"><code>orca plugin test . --json        # 395 tests: adapters, selector, usage, status line, worker end to end, panel
-orca plugin check . --json       # renders the panel with the real worker
-npx -p typescript tsc -p .       # type-check
-orca plugin validate . --json
-orca plugin dev load . --json    # needs --approve &lt;fingerprint&gt; the first time
-orca plugin dev request . rotator.debug</code></pre>
+      <summary>Developing OAH</summary>
+      <pre style="margin-top:12px"><code>npm run test:cli                 # standalone Node tests (oahd daemon, oah CLI, thin plugin bridge)
+npm run test:plugin              # 410 tests via orca plugin test
+npm run typecheck                # strict TypeScript check (zero npm dependencies)
+npm run validate                 # validates orca-plugin.json
+orca plugin dev load . --json    # load thin plugin locally
+./bin/oah debug --json           # daemon status, bridge state &amp; recent events</code></pre>
     </details>
   </div>
 </section>
@@ -572,7 +620,7 @@ orca plugin dev request . rotator.debug</code></pre>
 
 <footer>
   <div class="wrap">
-    <span>Auto Hand-off · MIT license · by <a href="https://github.com/ngoohebi">ngoohebi</a></span>
+    <span>OAH (Orca Auto Hand-off) · MIT license · by <a href="https://github.com/ngoohebi">ngoohebi</a></span>
     <a href="https://github.com/ngoohebi/orca-auto-handoff">Source on GitHub</a>
     <a href="https://github.com/ngoohebi/orca-auto-handoff/issues">Issues</a>
     <span>Ideas borrowed with thanks from cswap, tokenmaxx and the Orca community's rotation PRs.</span>

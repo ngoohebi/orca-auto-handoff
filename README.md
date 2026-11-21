@@ -119,7 +119,7 @@ next check.
 
 ## How it decides
 
-Out of the box Auto Hand-off picks the next account by itself (**Auto**) and hands off **Early
+Out of the box OAH picks the next account by itself (**Auto**) and hands off **Early
 when away**. While you are using Orca (and right after the plugin starts, since you are taken to
 be here) a session hands off only at a real limit, so it is seldom moved under you. Once you have
 been away for 10 minutes, Claude sessions hand off shortly before an account runs out, so work
@@ -467,14 +467,13 @@ once it resets. It is stored in the *Skipped accounts* setting (`exclude`): entr
 
 ## Settings
 
-All settings are in the panel's **Settings** tab: the four basic ones, then a collapsed
+All settings live in `~/.orca/oah/config.json` and can be changed from `oah config set <key> <value>` or the panel's **Settings** tab: the four basic ones, then a collapsed
 **Advanced** section ("Fine-tuning. The defaults suit most people."). Each dropdown lists the
 default choice first, marked "(Default)", for example "Auto (Default)", "Early when away
 (Default)", "Wait and resume (Default)" and "Ask me first (Default)". Under each setting one line
 says what the current value does; a setting that does not apply right now is greyed out and says
 why (for example "Only used when When to hand off is Early when away."). A number or text is saved
-when you press Enter. The same settings are on Orca's Settings page under Plugins → Auto Hand-off,
-where the advanced ones are titled "Advanced: …".
+when you press Enter.
 
 **Basic**
 
@@ -941,10 +940,11 @@ projects and hosts (`mobileRelay.projectSections`, `mobileRelay.hosts.list`,
 published API: an Orca update can break the server path, in which case the panel shows the error
 and this computer's accounts keep working.
 
-The worker writes `status.tsv` and the wrapper script under `~/.orca/account-rotator/` and reads
-the `live/` files the wrapper leaves there; the wrapper is the only writer of `live/`. `status.tsv`
-holds your account names (emails), so it and the `live/` files are written readable by you only
-(mode 0600, the folder 0700).
+The daemon stores its config (`config.json`), state (`state.json`), usage cache (`usage.json`),
+burn-rate samples (`samples.json`), Unix socket (`oahd.sock`), `status.tsv` and the status-line
+wrapper script under `~/.orca/oah/`, and reads the `live/` files the wrapper leaves there; the
+wrapper is the only writer of `live/`. Everything under `~/.orca/oah/` is written readable by you
+only (mode 0600, folder mode 0700).
 
 A hand-off summary (for services that cannot resume by session id) includes up to 40 lines of the
 previous agent's output, so treat it like any pasted terminal output.
