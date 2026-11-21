@@ -1,0 +1,23 @@
+{
+  "name": "orca-auto-handoff",
+  "version": "0.4.0",
+  "description": "OAH (Orca Auto Hand-off): CLI-first automatic account hand-off daemon and thin Orca panel plugin",
+  "type": "module",
+  "license": "MIT",
+  "repository": "https://github.com/ngoohebi/orca-auto-handoff",
+  "bin": {
+    "oah": "./bin/oah",
+    "oahd": "./bin/oahd"
+  },
+  "scripts": {
+    "oah": "node src/cli/main.ts",
+    "oahd": "node src/daemon/main.ts",
+    "test:cli": "node --test src/daemon/*.test.ts src/cli/*.test.ts src/plugin/*.test.ts",
+    "test:plugin": "orca plugin test . --json",
+    "typecheck": "npx -p typescript tsc -p .",
+    "validate": "orca plugin validate . --json"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

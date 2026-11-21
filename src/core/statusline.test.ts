@@ -15,11 +15,11 @@ import {
   needsUpgrade,
   renderStatusFile,
   uninstallFromSettings
-} from './statusline'
-import { ConsoleStatusLine, memoryFiles, nodeFiles } from './statusline-files'
-import type { Snapshot } from './types'
-import { likeOrca } from './fixtures'
-import { activateWith } from './worker'
+} from './statusline.ts'
+import { ConsoleStatusLine, memoryFiles, nodeFiles } from './statusline-files.ts'
+import type { Snapshot } from './types.ts'
+import { likeOrca } from '../fixtures'
+import { activateWith } from '../worker'
 
 const NOW = 1_800_000_000_000
 /** How long the limited account's cooldown lasts: 80 minutes and half a minute, so the wrapper

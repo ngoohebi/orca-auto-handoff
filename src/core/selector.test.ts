@@ -1,9 +1,9 @@
 import { assert, test } from 'orca/testing'
-import { parseAccounts } from './accounts'
-import { activeTerminalsIn, shownTerminalsIn } from './cli'
-import { accountList } from './fixtures'
-import { blindCooldownMs, buildChain, earliestReset, enoughGap, pickNext, preferredOver, strikesOf, tier } from './selector'
-import { DEFAULT_CONFIG, SMART_CONFIG, type Config, type Seat, type SeatHealth } from './types'
+import { parseAccounts } from './accounts.ts'
+import { activeTerminalsIn, shownTerminalsIn } from './cli.ts'
+import { accountList } from '../fixtures'
+import { blindCooldownMs, buildChain, earliestReset, enoughGap, pickNext, preferredOver, strikesOf, tier } from './selector.ts'
+import { DEFAULT_CONFIG, SMART_CONFIG, type Config, type Seat, type SeatHealth } from './types.ts'
 
 const NOW = 1_000_000
 const cfg = (over: Partial<Config> = {}): Config => ({ ...DEFAULT_CONFIG, ...over })

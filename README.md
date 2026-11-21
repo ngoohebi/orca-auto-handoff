@@ -1,14 +1,36 @@
-# Auto Hand-off (Orca plugin)
+# OAH — Orca Auto Hand-off (CLI + Thin Orca Plugin)
 
-**Hit a rate limit? Auto-switch to your next account.** Automatic account switching for Orca agents. When a Claude, Codex, Antigravity, OpenCode or Devin account hits a limit, Auto Hand-off hands the session off to your next account and keeps working. Claude stays Claude, Codex stays Codex: a session always keeps its provider.
+**Hit a rate limit? Auto-switch to your next account.** CLI-first automatic account hand-off daemon (`oah` / `oahd`) with a thin Orca sidebar panel and event bridge. When a Claude, Codex, Antigravity, OpenCode or Devin account hits a limit, OAH hands the session off to your next account and keeps working. Claude stays Claude, Codex stays Codex: a session always keeps its provider.
 
 Product page: <https://ngoohebi.github.io/orca-auto-handoff/>
+
+## Architecture
+
+OAH is **CLI- and daemon-centered**:
+
+- **`oahd` daemon** (`bin/oahd`): Owns all state, settings, usage cache, burn-rate history, and hand-off logic in `~/.orca/oah/` (`config.json`, `state.json`, `usage.json`, `samples.json`, `oahd.sock`, `0700`/`0600` permissions). Auto-starts on demand when `oah` or the Orca plugin connects.
+- **`oah` CLI** (`bin/oah`): First-class command line (`--json` or human-readable) for local desktop, headless `orca serve` hosts, paired servers, scripts, and agents.
+- **Thin Orca plugin** (`src/plugin/worker.ts` + `src/panel.tsx`): Zero business logic or local state — connects to `oahd.sock`, forwards `agent.status.changed` / `workspace.changed` / `agent.launch.before` events, exposes native `agent.resume` and desktop notifications to `oahd`, and renders the **OAH** panel directly from `oahd`'s live stream.
 
 ## Quick start
 
 1. Add at least two accounts of one service in Orca (Settings → Accounts), for example two Claude
    accounts.
-2. Install the plugin:
+2. Use the **`oah` CLI** directly (requires Node.js ≥ 22.18, zero npm dependencies):
+
+   ```sh
+   ./bin/oah                    # auto-starts oahd and shows accounts, usage & cooldowns
+   ./bin/oah refresh            # force Orca to refresh usage, then show status
+   ./bin/oah use work@example.com
+   ./bin/oah pause | ./bin/oah resume
+   ./bin/oah config set timing at-limit
+   ./bin/oah daemon status      # check oahd pid, uptime, socket & Orca bridge
+   ./bin/oah help
+   ```
+
+   Every command accepts `--json` for machine-readable output.
+
+3. (Recommended for desktop Orca) Load the thin **OAH** plugin so `oahd` gets instant event push, native Claude `agent.resume`, desktop notifications, and the sidebar panel:
 
    ```sh
    orca plugin install ngoohebi/orca-auto-handoff
@@ -17,12 +39,33 @@ Product page: <https://ngoohebi.github.io/orca-auto-handoff/>
    Orca lists the access it asks for and prints the same command with `--approve <fingerprint>`;
    run that to approve (see [Permissions](#permissions)). To try a local checkout instead, run
    `orca plugin dev load . --json` from its folder.
-3. Open the **Auto Hand-off** panel. It lists your accounts per service with their usage. That is
-   all: the defaults (*Auto*, *Early when away*) need no settings.
-4. Work as usual. While you are at Orca, a session hands off to your next account of the same
-   service when it hits a limit, and carries on. Once you have been away for 10 minutes, Claude
-   sessions hand off shortly before an account runs out, so work does not stop at a limit. The
-   panel's History says why, in one entry per hand-off.
+4. Open the **OAH** panel or run `oah`. The defaults (*Auto*, *Early when away*) need no settings.
+
+## The `oah` CLI
+
+```sh
+oah [status] [--json]               # Accounts, usage, runway, cooldowns, waiting sessions
+oah refresh [--json]                # Force Orca usage refresh, then status
+oah history [--limit 50] [--json]   # Recent hand-off history
+oah use <account> [--force]         # Select account + hand off on-screen session
+oah handoff                         # Hand off focused workspace session
+oah next [service]                  # Select next healthy account for new sessions
+oah pause | oah resume              # Global automatic hand-off off/on
+oah service <service> on|off        # Per-service automatic hand-off
+oah skip <account> [on|off]         # Exclude/include account from auto-pick
+oah clear <account>                 # Clear an account's cooldown
+oah order up|down <account>         # Reorder custom order
+oah config [get [key]]              # View settings (~/.orca/oah/config.json)
+oah config set <key> <value>        # Change a setting
+oah now | notnow | cancel <termId>  # Answer for a session waiting to hand off
+oah statusline [status|install|remove]
+oah daemon start|stop|restart|status|logs
+oah debug [--json]                  # Daemon health and recent events
+oah rpc <method> [jsonParams]       # Direct JSON-RPC passthrough to oahd
+oah version [--json]
+```
+
+Set `OAH_HOME=/path/to/dir` to isolate daemon state, config, and socket (useful for testing or multiple profiles).
 
 To stop it, use the *Automatic hand-off* switch at the top of the panel (pause), or the
 *Automatic hand-off* switch of one service, on its own line in that service's section. To hand
@@ -913,22 +956,20 @@ MIT; see [LICENSE](LICENSE).
 ## Develop
 
 ```sh
-orca plugin test . --json        # 405 tests: adapters (real captured banners), selector, usage cache, live usage, usage history, status line wrapper under sh, worker end to end, panel
-orca plugin check . --json       # renders the panel with the real worker (reads your real accounts)
-npx -p typescript tsc -p .       # type-check; src/node-shim.d.ts stands in for @types/node
-orca plugin validate . --json
+npm run test:cli                 # standalone Node tests for oahd daemon, oah CLI, and thin plugin bridge
+npm run test:plugin              # full suite (410 tests) via orca plugin test
+npm run typecheck                # strict TypeScript check (zero npm dependencies; src/node-shim.d.ts)
+npm run validate                 # validates orca-plugin.json
+orca plugin check . --json       # renders the panel with the real worker
 orca plugin dev load . --json    # needs --approve <fingerprint> the first time
-orca plugin dev request . rotator.debug   # last status events, agents.list, workspace ids
+./bin/oah debug --json           # daemon status, bridge state, and recent events
 ```
 
 Code layout:
 
-- `src/adapters.ts`: per-provider banner rules and reset-time parsing.
-- `src/accounts.ts`: parses `orca account list --json`.
-- `src/selector.ts`: the custom order, eligibility, tiers (known / presumed reset / unknown) and ranking.
-- `src/settings.ts`: every setting, and the upgrade from 0.2.
-- `src/labels.ts`: service names and the panel's words (History, held callouts, times).
-- `src/engine.ts`: the hand-off logic, with every side effect injected.
-- `src/cli.ts`: runs the `orca` CLI and `git`.
-- `src/worker.ts`: wiring.
-- `src/panel.tsx`: the panel.
+- `bin/oah`, `bin/oahd`: zero-dependency Node.js executables.
+- `src/core/`: pure domain logic (`engine.ts`, `adapters.ts`, `accounts.ts`, `smart.ts`, `selector.ts`, `usage-cache.ts`, `usage-history.ts`, `live-usage.ts`, `settings.ts`, `statusline.ts`, `statusline-files.ts`, `labels.ts`, `cli.ts`, `types.ts`, `version.ts`).
+- `src/daemon/`: standalone `oahd` daemon (`server.ts`, `store.ts`, `ipc.ts`, `orca-transport.ts`, `main.ts`).
+- `src/cli/`: `oah` CLI (`client.ts`, `commands.ts`, `format.ts`, `main.ts`).
+- `src/plugin/`: thin Orca plugin bridge (`worker.ts`, `worker.test.ts`).
+- `src/panel.tsx`, `src/protocol.ts`: Orca sidebar panel UI and panel IPC contract.

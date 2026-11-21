@@ -1,7 +1,7 @@
 // Turns `orca account list --json` (its `result`) into seats with usage. Orca already polls usage
 // for every managed account, so the plugin never touches tokens or keychains itself.
-import { liveKeyOfHome } from './live-usage'
-import type { Provider, Seat, SeatUsage, UsageWindow } from './types'
+import { liveKeyOfHome } from './live-usage.ts'
+import type { Provider, Seat, SeatUsage, UsageWindow } from './types.ts'
 
 type Json = Record<string, any>
 

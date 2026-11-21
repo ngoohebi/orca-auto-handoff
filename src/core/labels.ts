@@ -1,7 +1,7 @@
 // Account labels as the panel and the console status line show them: when every account of a
 // service shares one email domain the domain is dropped (`me`, `system (third)`); otherwise the
 // labels stay whole.
-import type { Held, Provider, Seat, Snapshot, SwapReason, SwapResult } from './types'
+import type { Held, Provider, Seat, Snapshot, SwapReason, SwapResult } from './types.ts'
 
 type SeatRow = Snapshot['seats'][number]
 

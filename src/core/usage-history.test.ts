@@ -1,11 +1,11 @@
 // The usage history: samples, the pace they give, the runway, and its bounds.
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
-import type { Cli, Rotator } from './engine'
-import { accountList, likeOrca } from './fixtures'
-import { clockWords, levelWords, runwayWords, whyMove } from './labels'
-import { memoryFiles } from './statusline-files'
-import type { RotatorState, Seat } from './types'
+import type { Cli, Rotator } from './engine.ts'
+import { accountList, likeOrca } from '../fixtures'
+import { clockWords, levelWords, runwayWords, whyMove } from './labels.ts'
+import { memoryFiles } from './statusline-files.ts'
+import type { RotatorState, Seat } from './types.ts'
 import {
   DAILY_CAP,
   RECENT_CAP,
@@ -18,8 +18,8 @@ import {
   sampleOf,
   type Sample,
   type UsageSamples
-} from './usage-history'
-import { activateWith } from './worker'
+} from './usage-history.ts'
+import { activateWith } from '../worker'
 
 const T0 = 1_800_000_000_000
 const MIN = 60_000

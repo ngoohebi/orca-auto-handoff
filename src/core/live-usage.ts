@@ -6,7 +6,7 @@
 //
 // One line, tab-separated: `1  written (epoch s)  5h used %  5h reset (epoch s)  7d used %  7d reset`,
 // `-` for a value the pane did not have. The file holds numbers only: no names, emails or tokens.
-import type { UsageWindow } from './types'
+import type { UsageWindow } from './types.ts'
 
 /** What a live key may look like; anything else never becomes a file name. */
 export const LIVE_KEY = /^(?!\.{1,2}$)[A-Za-z0-9._-]+$/

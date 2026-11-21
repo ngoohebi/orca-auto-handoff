@@ -3,8 +3,8 @@
 // Claude account with an expired token reports nothing until it runs again. So the plugin keeps
 // the last reading Orca gave for every account and shows it with its
 // age, treating windows whose reset time has passed as reset.
-import { LIVE_FRESH_MS, type LiveReading } from './live-usage'
-import type { Provider, Seat, SeatUsage, UsageWindow } from './types'
+import { LIVE_FRESH_MS, type LiveReading } from './live-usage.ts'
+import type { Provider, Seat, SeatUsage, UsageWindow } from './types.ts'
 
 export type CachedSeat = {
   session?: UsageWindow

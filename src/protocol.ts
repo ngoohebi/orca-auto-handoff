@@ -1,6 +1,6 @@
 // The panel <-> worker contract, declared once: src/panel.tsx and src/worker.ts both read it.
-import type { SettingValues } from './settings'
-import type { Provider, Snapshot } from './types'
+import type { SettingValues } from './core/settings.ts'
+import type { Provider, Snapshot } from './core/types.ts'
 
 /** What the panel's console status line switch shows: the focused workspace and whether the
  *  line is installed there (or why it cannot be). */
@@ -8,7 +8,7 @@ export type ConsoleLineState = { installed: boolean; workspace?: string; reason?
 
 export type { Snapshot }
 
-export type { SettingValues } from './settings'
+export type { SettingValues } from './core/settings.ts'
 
 /** Unsent text a pane shows in its input box (trimmed), and the pane. `queued`: it is Claude's
  *  hint for queued messages (sent, waiting in the session), not text the user typed. */

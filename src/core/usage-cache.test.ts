@@ -1,10 +1,10 @@
 import { assert, test } from 'orca/testing'
-import { parseAccounts } from './accounts'
-import { accountList, likeOrca } from './fixtures'
-import { buildChain, pickNext } from './selector'
-import { DEFAULT_CONFIG, type Seat } from './types'
-import { emptyUsageCache, isLive, loadedUsageCache, observe, resolve } from './usage-cache'
-import { tickMs } from './worker'
+import { parseAccounts } from './accounts.ts'
+import { accountList, likeOrca } from '../fixtures'
+import { buildChain, pickNext } from './selector.ts'
+import { DEFAULT_CONFIG, type Seat } from './types.ts'
+import { emptyUsageCache, isLive, loadedUsageCache, observe, resolve } from './usage-cache.ts'
+import { tickMs } from '../worker'
 
 const T0 = 1_000_000
 const HOUR = 3_600_000
@@ -126,8 +126,8 @@ test('the tick follows the read period, between 15 and 30 s', () => {
 // ---- through the worker ---------------------------------------------------------------------
 import { mockHost, mountWorker } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
-import type { Cli, Rotator } from './engine'
-import { activateWith } from './worker'
+import type { Cli, Rotator } from './engine.ts'
+import { activateWith } from '../worker'
 
 function cliFor(result: () => Record<string, any>, calls: string[], gate?: Promise<void>): Cli {
   return {

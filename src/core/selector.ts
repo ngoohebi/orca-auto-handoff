@@ -1,6 +1,6 @@
 // Which seat comes next: the chain, eligibility, Smart or the account order, switch-back, earliest reset.
-import { NO_CONTEXT, candidateOf, headroom, rank, type SmartContext, type Tier } from './smart'
-import { BLIND_COOLDOWN_CAP_MINUTES, STRIKE_TTL_MS, type Config, type Provider, type Seat, type SeatHealth } from './types'
+import { NO_CONTEXT, candidateOf, headroom, rank, type SmartContext, type Tier } from './smart.ts'
+import { BLIND_COOLDOWN_CAP_MINUTES, STRIKE_TTL_MS, type Config, type Provider, type Seat, type SeatHealth } from './types.ts'
 
 export type { Tier }
 

@@ -14,10 +14,10 @@ import {
   shouldLeave,
   type Candidate,
   type SmartContext
-} from './smart'
-import { pickNext } from './selector'
-import { SMART_CONFIG, type Config, type Seat, type SeatHealth } from './types'
-import type { DailySample, Sample } from './usage-history'
+} from './smart.ts'
+import { pickNext } from './selector.ts'
+import { SMART_CONFIG, type Config, type Seat, type SeatHealth } from './types.ts'
+import type { DailySample, Sample } from './usage-history.ts'
 
 const T0 = 1_800_000_000_000
 const MIN = 60_000

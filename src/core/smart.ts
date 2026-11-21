@@ -6,8 +6,8 @@
 // - `rank`: the order in which accounts are worth moving to.
 // - `shouldLeave`: is a session's account one to move away from at the next safe moment?
 // - `explain`: the reason for a move, for the history and the notification.
-import { RUNWAY_MAX_AGE_MS, rateOf, runwayOf, weeklyPace, type Sample, type SeatSamples, type WindowName } from './usage-history'
-import type { Config, Seat, SeatHealth, UsageWindow } from './types'
+import { RUNWAY_MAX_AGE_MS, rateOf, runwayOf, weeklyPace, type Sample, type SeatSamples, type WindowName } from './usage-history.ts'
+import type { Config, Seat, SeatHealth, UsageWindow } from './types.ts'
 
 const MIN = 60_000
 const HOUR = 60 * MIN

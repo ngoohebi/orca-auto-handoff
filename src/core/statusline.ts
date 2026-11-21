@@ -7,8 +7,8 @@
 //
 // The worker writes `~/.orca/account-rotator/status.tsv` whenever the snapshot changes; the script
 // reads it, so the line needs no CLI call and stays under Claude's status line budget.
-import { displayLabels, seatOrder } from './labels'
-import type { Snapshot } from './types'
+import { displayLabels, seatOrder } from './labels.ts'
+import type { Snapshot } from './types.ts'
 
 export { displayLabels }
 

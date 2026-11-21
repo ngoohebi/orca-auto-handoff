@@ -1,6 +1,6 @@
 import { assert, test } from 'orca/testing'
-import { classify, draftOf, hasDraft, isClaudeHint, parseModelFallback, parseReset } from './adapters'
-import * as fx from './fixtures'
+import { classify, draftOf, hasDraft, isClaudeHint, parseModelFallback, parseReset } from './adapters.ts'
+import * as fx from '../fixtures'
 
 const NOW = new Date(2026, 10, 18, 10, 0, 0).getTime()
 

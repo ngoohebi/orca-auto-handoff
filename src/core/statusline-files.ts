@@ -4,7 +4,7 @@
 import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
-import type { Deps } from './engine'
+import type { Deps } from './engine.ts'
 import {
   DATA_DIR,
   DEFAULT_BAR_WIDTH,
@@ -17,9 +17,9 @@ import {
   uninstallFromSettings,
   isInstalledIn,
   needsUpgrade
-} from './statusline'
-import type { ConsoleLineState } from './protocol'
-import type { Snapshot } from './types'
+} from './statusline.ts'
+import type { ConsoleLineState } from '../protocol'
+import type { Snapshot } from './types.ts'
 
 export type Files = {
   home: string
@@ -95,10 +95,13 @@ export class ConsoleStatusLine {
   private lastStatus = ''
   private scriptChecked = false
 
-  constructor(
-    private readonly files: Files,
-    private readonly ctx: Ctx
-  ) {}
+  private readonly files: Files
+  private readonly ctx: Ctx
+
+  constructor(files: Files, ctx: Ctx) {
+    this.files = files
+    this.ctx = ctx
+  }
 
   get scriptPath(): string {
     return `${this.files.home}/${DATA_DIR}/${SCRIPT_NAME}`

@@ -2,14 +2,14 @@
 // the worker (which account a file belongs to, and that reading it is passive).
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
-import { parseAccounts } from './accounts'
-import type { Cli, Rotator } from './engine'
-import { accountList, likeOrca } from './fixtures'
-import { LIVE_KEY, liveFileName, liveKeyOfHome, parseLive } from './live-usage'
-import { memoryFiles } from './statusline-files'
-import type { Seat } from './types'
-import { emptyUsageCache, observe, observeLive, resolve } from './usage-cache'
-import { activateWith } from './worker'
+import { parseAccounts } from './accounts.ts'
+import type { Cli, Rotator } from './engine.ts'
+import { accountList, likeOrca } from '../fixtures'
+import { LIVE_KEY, liveFileName, liveKeyOfHome, parseLive } from './live-usage.ts'
+import { memoryFiles } from './statusline-files.ts'
+import type { Seat } from './types.ts'
+import { emptyUsageCache, observe, observeLive, resolve } from './usage-cache.ts'
+import { activateWith } from '../worker'
 
 const T0 = 1_800_000_000_000
 const SEC = Math.floor(T0 / 1000)

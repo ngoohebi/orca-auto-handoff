@@ -1,11 +1,11 @@
 // The rotator: reacts to agent status, classifies the terminal tail, and swaps seats.
 // Every side effect goes through Deps so tests run it with a fake host, CLI and clock.
-import { ADAPTERS, CHROME, classify, countCopies, draftOf, isClaudeHint, parseModelFallback } from './adapters'
-import { parseAccounts, type AccountView } from './accounts'
-import { HELD_WORDS, PROVIDER_NAME, clockWords, displayLabels, whyMove } from './labels'
-import { parseLive } from './live-usage'
-import { emptyUsageCache, loadedUsageCache, observe, observeLive, resolve, type UsageCache } from './usage-cache'
-import { addSample, emptyUsageSamples, loadedUsageSamples, pruneSamples, runwayMs, type SeatSamples, type UsageSamples } from './usage-history'
+import { ADAPTERS, CHROME, classify, countCopies, draftOf, isClaudeHint, parseModelFallback } from './adapters.ts'
+import { parseAccounts, type AccountView } from './accounts.ts'
+import { HELD_WORDS, PROVIDER_NAME, clockWords, displayLabels, whyMove } from './labels.ts'
+import { parseLive } from './live-usage.ts'
+import { emptyUsageCache, loadedUsageCache, observe, observeLive, resolve, type UsageCache } from './usage-cache.ts'
+import { addSample, emptyUsageSamples, loadedUsageSamples, pruneSamples, runwayMs, type SeatSamples, type UsageSamples } from './usage-history.ts'
 import {
   assess,
   betterExpiring,
@@ -17,7 +17,7 @@ import {
   shouldLeave,
   type Assessment,
   type SmartContext
-} from './smart'
+} from './smart.ts'
 import {
   blindCooldownMs,
   buildChain,
@@ -31,7 +31,7 @@ import {
   preferredOver,
   strikesOf,
   tier
-} from './selector'
+} from './selector.ts'
 import {
   HISTORY_CAP,
   HISTORY_MAX_AGE_MS,
@@ -53,7 +53,7 @@ import {
   type Snapshot,
   type SwapReason,
   type WaitingEntry
-} from './types'
+} from './types.ts'
 
 export type HostLike = { call(method: string, params?: unknown): Promise<any> }
 
@@ -396,7 +396,9 @@ export class Rotator {
    *  pane takes its place. */
   private unplaced = new Map<string, StatusEvent>()
 
-  constructor(private deps: Deps) {
+  private deps: Deps
+
+  constructor(deps: Deps) {
     // Every account switch the plugin makes goes through here: note it, and read usage again
     // shortly after, because a switch is what makes Orca fetch its inactive accounts.
     const select = deps.cli.select.bind(deps.cli)

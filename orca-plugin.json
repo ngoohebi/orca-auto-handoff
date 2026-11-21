@@ -1,9 +1,9 @@
 {
   "manifestVersion": 2,
-  "id": "auto-handoff",
-  "name": "Auto Hand-off",
-  "version": "0.3.0",
-  "description": "Automatic account hand-off for Orca agents. Pools the accounts Orca manages per service (Claude, Codex, Antigravity, OpenCode, Devin). When a session hits a usage limit it is handed off to another account of the same service: a Claude session resumes as itself, and with Early when away it hands off shortly before an account runs out, once you have been away a while. Codex, Antigravity, OpenCode and Devin sessions hand off only at a limit and start a new session from a summary. To reach sessions outside the focused workspace it also runs the orca CLI (account select, terminal close/send).",
+  "id": "oah",
+  "name": "OAH",
+  "version": "0.4.0",
+  "description": "OAH (Orca Auto Hand-off): CLI-first automatic account hand-off daemon (`oah` / `oahd`) with a thin Orca panel and event bridge.",
   "author": {
     "name": "ngoohebi",
     "url": "https://github.com/ngoohebi"
@@ -15,12 +15,12 @@
   },
   "execution": "trusted-worker",
   "pluginApi": 1,
-  "main": "src/worker.ts",
+  "main": "src/plugin/worker.ts",
   "contributes": {
     "panels": [
       {
         "id": "seats",
-        "title": "Auto Hand-off",
+        "title": "OAH",
         "icon": "gauge",
         "entry": "src/panel.tsx",
         "ui": "components"

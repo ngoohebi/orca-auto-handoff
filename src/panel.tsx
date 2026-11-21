@@ -38,10 +38,10 @@ import {
   type PanelContext,
   type Tone
 } from 'orca'
-import { HELD_WORDS, minLeft, percentLeft, PROVIDER_NAME, REASON_WORDS, resultWords, runwayWords, seatOrder } from './labels'
+import { HELD_WORDS, minLeft, percentLeft, PROVIDER_NAME, REASON_WORDS, resultWords, runwayWords, seatOrder } from './core/labels.ts'
 import type { ConsoleLineState, SettingValues, Snapshot, UnsentDraft } from './protocol'
-import { ADVANCED_SETTINGS, applies, BASIC_SETTINGS, checked, STATUS_LINE_SETTINGS, type SettingSpec } from './settings'
-import { PROVIDERS, type Provider } from './types'
+import { ADVANCED_SETTINGS, applies, BASIC_SETTINGS, checked, STATUS_LINE_SETTINGS, type SettingSpec } from './core/settings.ts'
+import { PROVIDERS, type Provider } from './core/types.ts'
 
 /** "Pick the next account", as the panel names it. */
 const MODE_NAME = { smart: 'Auto', 'my-order': 'Custom order' } as const

@@ -2,7 +2,7 @@
 // "94 % used" says little, "94 % used and rising 1 point a minute" says about 6 minutes are left.
 // Observe only: nothing here decides a move. Kept under its own storage key (`usage-samples`),
 // apart from the rotator's state, and holds numbers and times only.
-import type { Seat, UsageWindow } from './types'
+import type { Seat, UsageWindow } from './types.ts'
 
 /** One reading of an account, as taken (not projected). `s`, `w`, `m`: percent used of the
  *  5-hour, weekly and model windows; `null` when the reading had none, or that window has been

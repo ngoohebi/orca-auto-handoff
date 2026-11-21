@@ -1,16 +1,16 @@
 // End-to-end through the real worker: Orca events in, host calls and CLI calls out.
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
-import { Rotator, restartNote, type Cli } from './engine'
-import { classify, draftOf } from './adapters'
+import { Rotator, restartNote, type Cli } from './core/engine.ts'
+import { classify, draftOf } from './core/adapters.ts'
 import * as fx from './fixtures'
 import { likeOrca, type SettingsFaults } from './fixtures'
 import { activateWith, configFrom, nextTickMs, ticker } from './worker'
-import { settingValues, upgradedValues } from './settings'
+import { settingValues, upgradedValues } from './core/settings.ts'
 
 /** What a setup reads as after the one-time 0.2 upgrade (worker.ts). */
 const up = (stored: Record<string, unknown>) => ({ ...settingValues(stored), ...upgradedValues(stored) })
-import { DEFAULT_CONFIG, type RotatorState } from './types'
+import { DEFAULT_CONFIG, type RotatorState } from './core/types.ts'
 
 type Pane = { terminalId: string; agent: string; state: 'working' | 'waiting' | 'done' | 'blocked'; sessionId?: string; title?: string; stateStartedAt?: number; unlisted?: boolean }
 
@@ -2258,7 +2258,7 @@ test('settings: every setting the panel shows is in orca-plugin.json, with the s
   const { readFileSync } = await import('node:fs')
   const manifest = JSON.parse(readFileSync(new URL('../orca-plugin.json', import.meta.url) as never, 'utf8'))
   const listed = new Map<string, any>(manifest.contributes.settings.map((x: any) => [x.key, x]))
-  const { ALL_SETTINGS } = await import('./settings')
+  const { ALL_SETTINGS } = await import('./core/settings.ts')
   for (const spec of ALL_SETTINGS) {
     const entry = listed.get(spec.key)
     assert.ok(entry, `${spec.key} is in the manifest`)
@@ -4818,7 +4818,7 @@ test('upgrade: an older "manual" setting pauses automatic hand-off once, and say
 })
 
 test('upgrade: which 0.2 settings count as "not by itself" (paused once), and which leftovers do not', async () => {
-  const { wasManual } = await import('./settings')
+  const { wasManual } = await import('./core/settings.ts')
   assert.equal(wasManual({}), false)
   assert.equal(wasManual({ mode: 'manual' }), true)
   assert.equal(wasManual({ strategy: 'manual' }), true)
@@ -5086,7 +5086,7 @@ test('notifications name the service and say times in local clock words', async 
   })
   const worker = await p.mount()
   await worker.emit('agent.status.changed', statusEvent('t1'))
-  const { clockWords } = await import('./labels')
+  const { clockWords } = await import('./core/labels.ts')
   const waited = stored(p).history.at(-1)
   assert.equal(waited?.result, 'waiting')
   assert.match(waited?.detail ?? '', /^until \d{1,2}:\d\d (am|pm)$|^until \w{3} \d{1,2}:\d\d (am|pm)$/)

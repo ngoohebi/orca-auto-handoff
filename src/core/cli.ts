@@ -5,8 +5,8 @@
 import { execFile } from 'node:child_process'
 import { existsSync, realpathSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import type { Cli } from './engine'
-import type { Provider } from './types'
+import type { Cli } from './engine.ts'
+import type { Provider } from './types.ts'
 
 const MAC_APP_CLI = '/Applications/Orca.app/Contents/Resources/bin/orca'
 const MAC_UNPACKED_OUT = '/Applications/Orca.app/Contents/Resources/app.asar.unpacked/out'
