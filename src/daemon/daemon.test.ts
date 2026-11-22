@@ -115,6 +115,8 @@ test('direct quota still updates a known profile while Orca account listing is u
   await rotator.accounts(true, true)
   assert.deepEqual(lastOrcaOptions, { refreshStaleUsage: true })
   assert.equal(forceProviderChecks, false)
+  // Direct checks run in the background: their answer arrives after the read.
+  await rotator.directChecksSettled()
   const snapshot = rotator.snapshot()
   assert.equal(snapshot.error, 'orca account list failed: offline')
   const direct = snapshot.seats.find((seat) => seat.key === 'codex:c1')!.usage
@@ -380,4 +382,88 @@ test('Live quota fills the gaps: an account Orca read recently is not asked dire
   now += 11 * 60_000
   await rotator.accounts(true)
   assert.deepEqual(asked.at(-1), ['codex:c1', 'codex:c2'])
+})
+
+test('Live quota checks run beside the account read: a slow provider never holds the read up, and its answer shows when it comes', async () => {
+  let now = 1_790_000_000_000
+  const cli = fakeCli({ codex: { activeAccountId: 'c1', accounts: [{ id: 'c1' }, { id: 'c2' }] }, rateLimits: {} })
+  let release!: () => void
+  const slow = new Promise<void>((resolve) => (release = resolve))
+  const published: unknown[] = []
+  const rotator = new Rotator({
+    cli,
+    host: fakeHost(),
+    now: () => now,
+    sleep: async () => {},
+    loadState: async () => null,
+    saveState: async () => {},
+    config: async () => ({ ...DEFAULT_CONFIG, quotaLinks: ['codex:c2'] }),
+    log: () => {},
+    notify: async () => {},
+    publish: (snap) => published.push(snap),
+    loadUsage: async () => null,
+    saveUsage: async () => {},
+    readLive: async () => null,
+    loadSamples: async () => null,
+    saveSamples: async () => {},
+    refreshProfileQuota: async (_profiles, seats) => {
+      await slow
+      const seat = seats.find((s) => s.key === 'codex:c2')!
+      seat.usage = { known: true, source: 'live', origin: 'codex-profile', updatedAt: now, session: { usedPercent: 30, resetsAt: null } }
+    }
+  })
+  await rotator.init()
+  // The read answers while the check still waits on the provider.
+  await rotator.accounts(true)
+  assert.equal(rotator.snapshot().seats.find((s) => s.key === 'codex:c2')?.usage.known, false)
+  const before = published.length
+  release()
+  await rotator.directChecksSettled()
+  const c2 = rotator.snapshot().seats.find((s) => s.key === 'codex:c2')!.usage
+  assert.deepEqual([c2.known, c2.source, c2.session?.usedPercent], [true, 'live', 30])
+  assert.ok(published.length > before, 'the answer is published')
+})
+
+test('an account read that fails is not taken for a fresh one: the next read asks Orca again', async () => {
+  let now = 1_790_000_000_000
+  let offline = false
+  let asked = 0
+  const cli = fakeCli({ codex: { activeAccountId: 'c1', accounts: [{ id: 'c1' }] }, rateLimits: {} })
+  const listAccounts = cli.listAccounts
+  cli.listAccounts = async (...args) => {
+    asked++
+    if (offline) throw new Error('offline')
+    return listAccounts(...args)
+  }
+  const rotator = new Rotator({
+    cli,
+    host: fakeHost(),
+    now: () => now,
+    sleep: async () => {},
+    loadState: async () => null,
+    saveState: async () => {},
+    config: async () => ({ ...DEFAULT_CONFIG, quotaLinks: ['codex:c1'] }),
+    log: () => {},
+    notify: async () => {},
+    publish: () => {},
+    loadUsage: async () => null,
+    saveUsage: async () => {},
+    readLive: async () => null,
+    loadSamples: async () => null,
+    saveSamples: async () => {},
+    refreshProfileQuota: async () => {}
+  })
+  await rotator.init()
+  await rotator.accounts(true)
+  offline = true
+  now += 1000
+  await rotator.accounts(true)
+  assert.equal(rotator.snapshot().error, 'orca account list failed: offline')
+  // A read within the poll interval, not forced: it asks Orca again rather than keep the failure.
+  offline = false
+  const before = asked
+  now += 1000
+  await rotator.accounts()
+  assert.equal(asked, before + 1)
+  assert.equal(rotator.snapshot().error, undefined)
 })

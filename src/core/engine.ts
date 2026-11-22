@@ -341,6 +341,10 @@ export function scopedKey(server: string | undefined, key: string): string {
 /** How old Orca's reading of an account may be before Live quota asks the provider itself: the
  *  same pace as the direct check (Claude's usage endpoint locks out for an hour when asked more
  *  often; the others are asked every 10 minutes). */
+/** How long a refresh by hand waits for Live quota's checks before answering with what it has
+ *  (the rest arrive in the background). */
+const DIRECT_WAIT_MS = 10_000
+
 export const DIRECT_GAP_MS: Record<Provider, number> = { claude: 15 * 60_000, codex: 10 * 60_000, antigravity: 10 * 60_000, opencode: 10 * 60_000, devin: 10 * 60_000 }
 
 /** Whether Orca's own reading of the account is recent enough that no direct check is needed. */
@@ -381,6 +385,11 @@ export class Rotator {
   /** One `orca account list` at a time per server: the timer, the panel and commands share the
    *  one in flight. */
   private listings = new Map<string, { promise: Promise<AccountView>; refreshUsage: boolean; directQuota: boolean; quotaLinks: string }>()
+  /** Live quota's checks, while one round runs: they run beside the account reads, never inside
+   *  them, so a slow provider (or Claude Code renewing a sign-in) never holds up a read. */
+  private directRun: Promise<void> | undefined
+  /** What the last direct check of each account found wrong, by seat key; applied on every read. */
+  private directIssues = new Map<string, NonNullable<Seat['directQuotaIssue']>>()
   private followUp = 0
   private disposed = false
   /** Moves (and anything else under a provider's lock) running or queued right now. */
@@ -879,7 +888,6 @@ export class Rotator {
     if (directQuota) {
       if (server || !this.deps.refreshProfileQuota) throw new Error('Direct quota checks are available for local profiles only.')
       if (!(await this.config()).directQuota) throw new Error('Live quota is off in Settings.')
-      if (!(await this.config()).quotaLinks.length) throw new Error('Link an Orca account before checking its connection.')
       force = refreshUsage = true
     }
     this.server = server
@@ -891,7 +899,8 @@ export class Rotator {
     const key = server ?? 'local'
     const quotaLinks = server ? '' : JSON.stringify(config.quotaLinks)
     const current = this.views.get(key)
-    const fresh = current && this.deps.now() - current.at < config.pollIntervalSeconds * 1000
+    // A view whose last read failed is never fresh: the next call asks Orca again.
+    const fresh = current && !current.error && this.deps.now() - current.at < config.pollIntervalSeconds * 1000
     if (current && fresh && !force) {
       if (server === this.server) {
         this.view = current.view
@@ -931,6 +940,9 @@ export class Rotator {
     const direct = !server && config.directQuota && !!this.deps.refreshProfileQuota
     const preferDirect = direct && config.quotaLinks.length > 0
     let quotaProfiles = preferDirect ? current?.quotaProfiles : undefined
+    // Orca could not be read and the last view stands in: not a fresh read, so the next one asks
+    // Orca again instead of waiting out the poll interval.
+    let fellBack = false
     try {
       let raw: Record<string, any>
       let parsed: AccountView
@@ -945,6 +957,7 @@ export class Rotator {
         }
       } catch (error) {
         if (!quotaProfiles || !current?.rawSeats) throw error
+        fellBack = true
         nextError = `orca account list failed: ${String((error as Error)?.message ?? error)}`
         this.deps.log(nextError)
         raw = quotaProfiles
@@ -979,11 +992,27 @@ export class Rotator {
       }
       if (direct && links.length) {
         // Only the gaps: an account whose reading from Orca is missing or older than its check
-        // interval. Orca reads only the account in use, and only while you use Orca.
+        // interval. Orca reads only the account in use, and only while you use Orca. They run in
+        // the background; a refresh by hand waits a little for them.
         const linked = new Set(links)
         const now = this.deps.now()
         const gaps = parsed.seats.filter((seat) => linked.has(seat.key) && !orcaReadingFresh(seat, now))
-        if (gaps.length) await this.deps.refreshProfileQuota!(raw, gaps, directQuota)
+        if (gaps.length) {
+          const run = this.runDirectChecks(raw, gaps, directQuota)
+          if (directQuota) {
+            let timer: ReturnType<typeof setTimeout> | undefined
+            await Promise.race([run, new Promise<void>((done) => {
+              timer = setTimeout(done, DIRECT_WAIT_MS)
+              ;(timer as unknown as { unref?: () => void }).unref?.()
+            })])
+            if (timer) clearTimeout(timer)
+          }
+        }
+        // What the checks found wrong so far, on each account (the panel says it there).
+        for (const seat of parsed.seats) {
+          const issue = linked.has(seat.key) ? this.directIssues.get(seat.key) : undefined
+          if (issue) seat.directQuotaIssue = issue
+        }
       }
       const now = this.deps.now()
       const rawSeats = parsed.seats.map((s) => ({ ...s, usage: { ...s.usage } }))
@@ -1019,7 +1048,7 @@ export class Rotator {
       }
       nextView = parsed
       nextRaw = rawSeats
-      nextAt = now
+      nextAt = fellBack ? (current?.at ?? 0) : now
     } catch (error) {
       nextError = `orca account list failed: ${String((error as Error)?.message ?? error)}`
       this.deps.log(nextError)
@@ -1035,6 +1064,55 @@ export class Rotator {
       this.viewError = nextError
     }
     return nextView
+  }
+
+  /** One round of Live quota checks for `gaps` (copies: the read that asked has moved on). The
+   *  readings go into the usage cache and the problems into `directIssues`, where every later read
+   *  finds them; when no read is under way the shown accounts are resolved again at once and
+   *  published. One round at a time: a round asked for while one runs is that round. */
+  private runDirectChecks(raw: Record<string, any>, gaps: readonly Seat[], force: boolean): Promise<void> {
+    if (this.directRun) return this.directRun
+    const seats = gaps.map((seat) => ({ ...seat, usage: { ...seat.usage } }))
+    const run = (async () => {
+      try {
+        await this.deps.refreshProfileQuota!(raw, seats, force)
+      } catch (error) {
+        this.deps.log(`direct quota: ${String((error as Error)?.message ?? error)}`)
+        return
+      }
+      const now = this.deps.now()
+      for (const seat of seats) {
+        if (seat.directQuotaIssue) this.directIssues.set(seat.key, seat.directQuotaIssue)
+        else this.directIssues.delete(seat.key)
+      }
+      const readings = seats.filter((seat) => seat.usage.known && seat.usage.origin && seat.usage.origin !== 'pane')
+      // Only these accounts' readings: the others' stay as the last account read left them.
+      if (readings.length && observe(this.usage, readings, now, this.activeSinceFor(undefined), undefined, false)) {
+        await this.deps.saveUsage(this.usage).catch(() => undefined)
+      }
+      // A read under way takes all this in itself; otherwise the shown accounts are updated now.
+      if (this.listings.get('local')) return
+      const current = this.views.get('local')
+      if (current?.rawSeats) {
+        for (const list of [current.rawSeats, current.view.seats]) {
+          for (const seat of list) {
+            const issue = this.directIssues.get(seat.key)
+            if (issue) seat.directQuotaIssue = issue
+            else if (seats.some((s) => s.key === seat.key)) delete seat.directQuotaIssue
+          }
+        }
+      }
+      if (!(await this.syncLivePanes(true)) && !this.server) this.publishNow()
+    })().finally(() => {
+      if (this.directRun === run) this.directRun = undefined
+    })
+    this.directRun = run
+    return run
+  }
+
+  /** Waits for the Live quota checks under way, if any (for tests and the daemon's shutdown). */
+  async directChecksSettled(): Promise<void> {
+    await this.directRun?.catch(() => undefined)
   }
 
   /** Re-reads local per-pane live files (`live/claude-*.tsv`) and re-projects cached/live reset

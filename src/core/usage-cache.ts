@@ -4,6 +4,9 @@
 // the last reading Orca gave for every account and shows it with its
 // age, treating windows whose reset time has passed as reset.
 import { LIVE_FRESH_MS, type LiveReading } from './live-usage.ts'
+
+/** How long a direct reading (Live quota) counts as current: Claude's check interval, the longest. */
+const DIRECT_FRESH_MS = 15 * 60_000
 import type { Provider, Seat, SeatUsage, UsageWindow } from './types.ts'
 
 export type CachedSeat = {
@@ -67,17 +70,20 @@ function inScope(scope: string | undefined, key: string): boolean {
   return scope ? key.startsWith(`${scope}|`) : !key.includes('|')
 }
 
-/** Records every live reading; prunes accounts Orca no longer lists. Returns whether it changed. */
+/** Records every live reading; prunes accounts Orca no longer lists (with `prune` off, `seats` is
+ *  only some of the accounts, such as Live quota's checks, and nothing else is touched). Returns
+ *  whether it changed. */
 export function observe(
   cache: UsageCache,
   seats: readonly Seat[],
   now: number,
   activeSince: Partial<Record<Provider, number>>,
-  scope?: string
+  scope?: string,
+  prune = true
 ): boolean {
   let changed = false
   const listed = new Set(seats.map((s) => cacheKey(scope, s.key)))
-  for (const key of Object.keys(cache.seats)) {
+  for (const key of prune ? Object.keys(cache.seats) : []) {
     if (inScope(scope, key) && !listed.has(key)) {
       delete cache.seats[key]
       changed = true
@@ -202,7 +208,10 @@ export function resolve(
   if (current.retryAt) keep.retryAt = current.retryAt
   const cached = cachedEntry
   const paneFresh = !!cachedPane && now - cachedPane.asOf <= LIVE_FRESH_MS
-  const upToDate = paneFresh || (orcaLive && !!cachedPane)
+  // A direct reading (Live quota) within its check interval is as current as numbers get: it is
+  // shown as live, not as an old reading.
+  const directFresh = !!cached?.origin && cached.origin !== 'pane' && now - cached.asOf <= DIRECT_FRESH_MS
+  const upToDate = paneFresh || (orcaLive && !!cachedPane) || directFresh
   if (!cached || (!upToDate && (maxAgeMs <= 0 || now - cached.asOf > maxAgeMs))) {
     return { ...keep, known: false, source: 'unknown' }
   }

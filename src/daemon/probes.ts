@@ -489,6 +489,71 @@ async function probeDevinProfile(file: string, now: () => number): Promise<SeatU
   }
 }
 
+/** Parses ChatGPT's `GET /backend-api/wham/usage` (what Codex itself shows) into a `SeatUsage`:
+ *  `rate_limit.primary_window` and `secondary_window`, each with `used_percent`, `reset_at`
+ *  (epoch seconds) or `reset_after_seconds`, and `limit_window_seconds`; a window of a week or
+ *  more is the weekly one, a shorter one the session. */
+export function parseCodexUsage(payload: Json, now: number): SeatUsage {
+  const usage: SeatUsage = { known: false, source: 'live', origin: 'codex-profile', updatedAt: now, asOf: now }
+  const rateLimit = payload?.rate_limit
+  for (const raw of [rateLimit?.primary_window, rateLimit?.secondary_window]) {
+    const used = raw?.used_percent
+    if (typeof used !== 'number' || !Number.isFinite(used)) continue
+    const resetsAt = typeof raw.reset_at === 'number' && raw.reset_at > 0
+      ? raw.reset_at * 1000
+      : typeof raw.reset_after_seconds === 'number' && raw.reset_after_seconds >= 0 ? now + raw.reset_after_seconds * 1000 : null
+    const window = { usedPercent: Math.min(100, Math.max(0, used)), resetsAt }
+    const weekly = typeof raw.limit_window_seconds === 'number' && raw.limit_window_seconds >= 6.5 * 86_400
+    if (weekly) usage.weekly = window
+    else usage.session = window
+  }
+  if (rateLimit?.allowed === false || rateLimit?.limit_reached === true) usage.ordinaryUsageAllowed = false
+  usage.known = !!(usage.session || usage.weekly) || usage.ordinaryUsageAllowed === false
+  if (!usage.known) usage.reason = 'not-reported'
+  return usage
+}
+
+/** When a JWT expires (its `exp`, in ms), when it says. */
+function jwtExpiry(token: string): number | undefined {
+  try {
+    const exp = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8'))?.exp
+    return typeof exp === 'number' && Number.isFinite(exp) ? exp * 1000 : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Asks ChatGPT for one saved Codex profile's usage with the sign-in saved in its home
+ *  (`auth.json`), and never renews it: an expired access token is said as such and left for
+ *  Codex to renew when it next runs, so this check can never race a running Codex session over
+ *  the same rotating refresh token. `accountId` is the account the sign-in belongs to. */
+async function probeCodexProfile(home: string, now: () => number): Promise<{ accountId?: string; usage: SeatUsage }> {
+  let token: string | undefined
+  let accountId: string | undefined
+  try {
+    const tokens = JSON.parse(readFileSync(join(home, 'auth.json'), 'utf8'))?.tokens
+    token = typeof tokens?.access_token === 'string' && tokens.access_token ? tokens.access_token : undefined
+    accountId = typeof tokens?.account_id === 'string' && tokens.account_id ? tokens.account_id : undefined
+  } catch {
+    // No saved sign-in to read.
+  }
+  if (!token) return { usage: { known: false, reason: 'sign-in' } }
+  const expiresAt = jwtExpiry(token)
+  if (expiresAt !== undefined && expiresAt <= now()) return { ...(accountId ? { accountId } : {}), usage: { known: false, reason: 'stale-token' } }
+  try {
+    const response = await fetch('https://chatgpt.com/backend-api/wham/usage', {
+      headers: { Authorization: `Bearer ${token}`, ...(accountId ? { 'ChatGPT-Account-Id': accountId } : {}), Accept: 'application/json', 'User-Agent': 'codex-cli' },
+      signal: AbortSignal.timeout(6000),
+      redirect: 'error'
+    })
+    if (response.status === 429) return { ...(accountId ? { accountId } : {}), usage: { known: false, reason: 'rate-limited', retryAt: retryAfter(response, now()) } }
+    if (!response.ok) return { ...(accountId ? { accountId } : {}), usage: { known: false, reason: response.status === 401 || response.status === 403 ? 'stale-token' : 'error' } }
+    return { ...(accountId ? { accountId } : {}), usage: parseCodexUsage(await response.json() as Json, now()) }
+  } catch {
+    return { ...(accountId ? { accountId } : {}), usage: { known: false, reason: 'error' } }
+  }
+}
+
 /** Services whose saved Orca profiles can be asked for usage with the profile's own sign-in. */
 const PROFILE_PROVIDERS = new Set<Seat['provider']>(['claude', 'codex', 'opencode', 'devin'])
 
@@ -597,8 +662,11 @@ export function managedProfileQuota(now: () => number, persisted: {
         (authenticatedAt !== null && authenticatedAt > prev.checkedAt) ||
         (force && attemptedAt - prev.checkedAt >= PROFILE_QUOTA_RETRY)
       )
+      // A manual refresh asks again at once, except Claude: its usage endpoint locks an account out
+      // for an hour when asked more often than every 15 minutes, so it keeps its pace.
+      const forced = force && !claude
       if (!force && recentDirect && !canRetrySignIn) continue
-      if (prev && attemptedAt < prev.retryAt && !canRetrySignIn) continue
+      if (prev && attemptedAt < prev.retryAt && !canRetrySignIn && !forced) continue
       pending.push(async () => {
         const result = claude
           ? { accountId: expectedId, usage: await probeClaudeProfile(home, profile.email, expectedId, now, renewClaude(home)) }
@@ -606,15 +674,18 @@ export function managedProfileQuota(now: () => number, persisted: {
             ? { accountId: expectedId, usage: await probeOpenCodeProfile(home, now) }
             : devin
               ? { accountId: expectedId, usage: await probeDevinProfile(home, now) }
-              : await probeCodexAppServer(home, { now })
-        const delay = claude || dataProfile || result.usage.reason === 'rate-limited' || result.usage.reason === 'sign-in'
+              : await probeCodexProfile(home, now)
+        // What went wrong, if anything, decided first: a sign-in for another account is a sign-in
+        // problem (it does not go away in a minute), whatever the numbers said.
+        const mismatch = result.accountId !== undefined && result.accountId !== expectedId
+        const reason = mismatch ? (result.usage.known ? 'sign-in' : (result.usage.reason ?? 'sign-in')) : result.usage.known ? undefined : (result.usage.reason ?? 'not-reported')
+        const delay = claude || dataProfile || reason === 'rate-limited' || reason === 'sign-in' || reason === 'stale-token'
           ? interval
           : PROFILE_QUOTA_RETRY
         const checkedAt = now()
         const retryAt = Math.max(checkedAt + delay, result.usage.retryAt ?? 0)
-        if (result.usage.reason === 'rate-limited') backoff.record(seat.key, retryAt)
-        if (result.accountId !== expectedId || !result.usage.known) {
-          const reason = result.usage.reason ?? (result.accountId !== expectedId ? 'sign-in' : 'not-reported')
+        if (reason === 'rate-limited') backoff.record(seat.key, retryAt)
+        if (reason) {
           const issue = { reason, retryAt }
           readings.set(key, { retryAt, checkedAt, usage, issue })
           seat.directQuotaIssue = issue

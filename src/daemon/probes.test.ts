@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { DatabaseSync } from 'node:sqlite'
 import type { Seat } from '../core/types.ts'
-import { directQuotaUnavailable, managedProfileQuota, probeClaudeUsage, parseAntigravityQuota, parseClaudeOAuthQuota, parseClaudeUsageJson, parseCodexRateLimits, parseDevinQuota, parseOpenCodeUsage } from './probes.ts'
+import { directQuotaUnavailable, managedProfileQuota, parseCodexUsage, probeClaudeUsage, parseAntigravityQuota, parseClaudeOAuthQuota, parseClaudeUsageJson, parseCodexRateLimits, parseDevinQuota, parseOpenCodeUsage } from './probes.ts'
 
 test('linked OpenCode Go and Devin checks use the credentials of their own saved profiles', async () => {
   const root = mkdtempSync(join(tmpdir(), 'oah-data-profile-quota-'))
@@ -256,5 +256,73 @@ test("probeClaudeUsage for one account: runs Claude Code's /usage with that acco
     if (oldToken === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN
     else process.env.CLAUDE_CODE_OAUTH_TOKEN = oldToken
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('parseCodexUsage: the session and weekly windows by their length, resets from reset_at or reset_after_seconds, and a reached limit', () => {
+  const now = 1_790_000_000_000
+  const usage = parseCodexUsage({
+    plan_type: 'plus',
+    rate_limit: {
+      allowed: true,
+      primary_window: { used_percent: 12.5, limit_window_seconds: 18_000, reset_at: 1_790_003_600 },
+      secondary_window: { used_percent: 40, limit_window_seconds: 604_800, reset_after_seconds: 86_400 }
+    }
+  }, now)
+  assert.deepEqual([usage.known, usage.origin, usage.session, usage.weekly], [true, 'codex-profile', { usedPercent: 12.5, resetsAt: 1_790_003_600_000 }, { usedPercent: 40, resetsAt: now + 86_400_000 }])
+  assert.equal(parseCodexUsage({ rate_limit: { allowed: false, primary_window: { used_percent: 100, limit_window_seconds: 18_000 } } }, now).ordinaryUsageAllowed, false)
+  assert.deepEqual([parseCodexUsage({}, now).known, parseCodexUsage({}, now).reason], [false, 'not-reported'])
+})
+
+test('Codex direct check: reads the saved sign-in and never renews it; an expired token asks nothing, another account backs off for the full interval, a refresh by hand asks again', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'oah-codex-direct-'))
+  const originalFetch = globalThis.fetch
+  try {
+    const home = join(root, 'home')
+    mkdirSync(home, { recursive: true })
+    let now = 1_790_000_000_000
+    const jwt = (exp: number) => `x.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.y`
+    const auth = (exp: number, accountId: string) => writeFileSync(join(home, 'auth.json'), JSON.stringify({ tokens: { access_token: jwt(exp), account_id: accountId, refresh_token: 'never-used' } }))
+    const requests: Record<string, string>[] = []
+    globalThis.fetch = async (url, init) => {
+      assert.equal(url, 'https://chatgpt.com/backend-api/wham/usage')
+      requests.push(Object.fromEntries(new Headers(init?.headers).entries()))
+      return Response.json({ rate_limit: { primary_window: { used_percent: 20, limit_window_seconds: 18_000, reset_after_seconds: 3600 } } })
+    }
+    const accounts = { codex: { accounts: [{ id: 'c1', managedHomeRuntime: 'host', workspaceAccountId: 'acct-1', home }] } }
+    const seat = (): Seat => ({ key: 'codex:c1', provider: 'codex', accountId: 'c1', label: 'C1', active: false, usage: { known: false } })
+    const check = managedProfileQuota(() => now)
+    // Expired: nothing is asked, and nothing renews it.
+    auth(now / 1000 - 60, 'acct-1')
+    let s = seat()
+    await check(accounts, [s], false)
+    assert.equal(requests.length, 0)
+    assert.equal(s.directQuotaIssue?.reason, 'stale-token')
+    // Valid, for this account: asked with the saved token and account.
+    auth(now / 1000 + 3600, 'acct-1')
+    now += 11 * 60_000
+    s = seat()
+    await check(accounts, [s], false)
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0]!['chatgpt-account-id'], 'acct-1')
+    assert.deepEqual([s.usage.known, s.usage.session?.usedPercent], [true, 20])
+    // A refresh by hand two minutes later asks again (not Claude's 15-minute pace).
+    now += 2 * 60_000
+    s = seat()
+    await check(accounts, [s], true)
+    assert.equal(requests.length, 2)
+    // Signed in as another account: a sign-in problem, tried again only after the full interval.
+    auth(now / 1000 + 3600, 'someone-else')
+    now += 11 * 60_000
+    s = seat()
+    await check(accounts, [s], false)
+    assert.equal(s.directQuotaIssue?.reason, 'sign-in')
+    const asked = requests.length
+    now += 60_000
+    await check(accounts, [seat()], false)
+    assert.equal(requests.length, asked, 'not asked again a minute later')
+  } finally {
+    globalThis.fetch = originalFetch
+    rmSync(root, { recursive: true, force: true })
   }
 })

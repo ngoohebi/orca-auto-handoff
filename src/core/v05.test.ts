@@ -28,7 +28,8 @@ test('a newer direct Codex block survives a stale Orca reading until its reporte
   const stale: Seat = { ...saved, usage: { known: true, weekly: { usedPercent: 0, resetsAt: reset } } }
   observe(cache, [stale], now + 1000, {})
   const before = resolve(stale, cache, now + 1000, WEEK, {})
-  assert.equal(before.source, 'cached')
+  // A direct reading a second old is current: shown as live, not as an old reading.
+  assert.equal(before.source, 'live')
   assert.equal(before.ordinaryUsageAllowed, false)
   assert.equal(exhausted({ ...stale, usage: before }, now + 1000), true)
   const after = resolve(stale, cache, reset + 1000, WEEK, {})

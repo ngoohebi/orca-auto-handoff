@@ -258,7 +258,6 @@ export type Config = {
   /** Move a session that has been idle this long off an over-threshold seat, or back to the
    *  preferred seat. 0 = off. */
   autoSwapIdleAfterSeconds: number
-  /** Comma-separated seats never switched *to* automatically (same tokens as `chain`). */
   autoMessage: string
   waitForReset: boolean
   retryOnApiError: boolean
