@@ -584,7 +584,8 @@ export function managedProfileQuota(now: () => number, persisted: {
       const directAt = usage?.updatedAt ?? 0
       const interval = claude ? CLAUDE_QUOTA_INTERVAL : PROFILE_QUOTA_MAX_AGE
       const recentDirect = !!usage && attemptedAt - directAt < interval
-      if (usage && recentDirect) seat.usage = usage
+      // An earlier direct reading stands in only when Orca has nothing newer.
+      if (usage && recentDirect && (!seat.usage.known || (usage.updatedAt ?? 0) >= (seat.usage.updatedAt ?? 0))) seat.usage = usage
       const blockedUntil = backoff.get(seat.key)
       if (blockedUntil > attemptedAt) {
         seat.directQuotaIssue = { reason: 'rate-limited', retryAt: blockedUntil }

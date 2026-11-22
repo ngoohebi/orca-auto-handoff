@@ -107,12 +107,13 @@ test('direct quota still updates a known profile while Orca account listing is u
   })
   await rotator.init()
   await rotator.accounts(true, true, true)
-  assert.deepEqual(lastOrcaOptions, { refreshStaleUsage: false })
+  // Orca first, stale only, within its throttles: never a forced refresh.
+  assert.deepEqual(lastOrcaOptions, { refreshStaleUsage: true })
   assert.equal(forceProviderChecks, true)
   offline = true
   now += 60_000
   await rotator.accounts(true, true)
-  assert.deepEqual(lastOrcaOptions, { refreshUsage: true })
+  assert.deepEqual(lastOrcaOptions, { refreshStaleUsage: true })
   assert.equal(forceProviderChecks, false)
   const snapshot = rotator.snapshot()
   assert.equal(snapshot.error, 'orca account list failed: offline')
@@ -304,4 +305,79 @@ test('accounts a direct check can serve are turned on automatically and checked 
   assert.equal(snap.seats.find((s) => s.key === 'codex:c2')?.quotaUnavailable, 'no saved sign-in on this computer')
   assert.equal(snap.seats.find((s) => s.key === 'codex:c3')?.quotaOff, true)
   assert.equal(snap.seats.find((s) => s.key === 'codex:c1')?.quotaOff, undefined)
+})
+
+test('with Live quota off no direct check is made and nothing is turned on; Check now says why', async () => {
+  const cli = fakeCli({
+    codex: { activeAccountId: 'c1', accounts: [{ id: 'c1' }] },
+    rateLimits: { claude: { status: 'ok', session: { usedPercent: 50, resetsAt: null } } }
+  })
+  const calls: string[] = []
+  const rotator = new Rotator({
+    cli,
+    host: fakeHost(),
+    now: () => 1_790_000_000_000,
+    sleep: async () => {},
+    loadState: async () => null,
+    saveState: async () => {},
+    config: async () => ({ ...DEFAULT_CONFIG, quotaLinks: ['codex:c1'], directQuota: false }),
+    log: () => {},
+    notify: async () => {},
+    publish: () => {},
+    loadUsage: async () => null,
+    saveUsage: async () => {},
+    readLive: async () => null,
+    loadSamples: async () => null,
+    saveSamples: async () => {},
+    quotaStatus: () => {
+      calls.push('status')
+      return { added: [], off: [], unavailable: {} }
+    },
+    refreshProfileQuota: async () => {
+      calls.push('check')
+    }
+  })
+  await rotator.init()
+  await rotator.accounts(true, true)
+  assert.deepEqual(calls, [])
+  assert.equal(rotator.snapshot().seats.find((s) => s.key === 'codex:c1')?.quotaLinked, undefined)
+  const refused = await rotator.accounts(true, true, true).then(() => '', (error: Error) => error.message)
+  assert.match(refused, /Live quota is off in Settings/)
+})
+
+test('Live quota fills the gaps: an account Orca read recently is not asked directly; one Orca has no recent reading of is', async () => {
+  let now = 1_790_000_000_000
+  const cli = fakeCli({
+    codex: { activeAccountId: 'c1', accounts: [{ id: 'c1' }, { id: 'c2' }] },
+    rateLimits: { codex: { status: 'ok', updatedAt: now - 60_000, session: { usedPercent: 10, resetsAt: null } } }
+  })
+  const asked: string[][] = []
+  const rotator = new Rotator({
+    cli,
+    host: fakeHost(),
+    now: () => now,
+    sleep: async () => {},
+    loadState: async () => null,
+    saveState: async () => {},
+    config: async () => ({ ...DEFAULT_CONFIG, quotaLinks: ['codex:c1', 'codex:c2'] }),
+    log: () => {},
+    notify: async () => {},
+    publish: () => {},
+    loadUsage: async () => null,
+    saveUsage: async () => {},
+    readLive: async () => null,
+    loadSamples: async () => null,
+    saveSamples: async () => {},
+    refreshProfileQuota: async (_profiles, seats) => {
+      asked.push(seats.map((s) => s.key))
+    }
+  })
+  await rotator.init()
+  await rotator.accounts(true)
+  // c1 is in use and Orca read it a minute ago; c2 is not in use and Orca has nothing for it.
+  assert.deepEqual(asked.at(-1), ['codex:c2'])
+  // Eleven minutes on, Orca's reading of c1 is older than the check interval: both are gaps.
+  now += 11 * 60_000
+  await rotator.accounts(true)
+  assert.deepEqual(asked.at(-1), ['codex:c1', 'codex:c2'])
 })

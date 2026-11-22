@@ -58,7 +58,7 @@ function setupDaemon() {
   return { dir, daemon, client, selected }
 }
 
-test('oah CLI: help, version, status, --json, pause/resume, service, skip, config', async () => {
+test('oah CLI: help, version, status, --json, pause/resume, service, config', async () => {
   const { dir, daemon, client } = setupDaemon()
   try {
     await daemon.start()
@@ -89,9 +89,9 @@ test('oah CLI: help, version, status, --json, pause/resume, service, skip, confi
     assert.equal(svc.code, 0)
     assert.equal(JSON.parse(svc.stdout).services.claude, false)
 
+    // Skip is gone: an unknown command.
     const skip = await runCli(['skip', 'personal', '--json'], client, { autoStart: false })
-    assert.equal(skip.code, 0)
-    assert.equal(JSON.parse(skip.stdout).excluded, true)
+    assert.ok(skip.code !== 0)
 
     const set = await runCli(['config', 'set', 'timing', 'at-limit', '--json'], client, { autoStart: false })
     assert.equal(set.code, 0)

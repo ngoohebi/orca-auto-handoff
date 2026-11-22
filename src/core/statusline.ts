@@ -28,6 +28,21 @@ export const DEFAULT_FORMAT = ''
 export const REFRESH_SECONDS = 10
 /** The `statusLine` value the plugin installs. */
 export const WRAPPER_SETTING = { type: 'command', command: STATUSLINE_COMMAND, padding: 0, refreshInterval: REFRESH_SECONDS }
+
+/** One shell word that is `text` exactly. */
+const shellWord = (text: string) => `'${text.split("'").join("'\\''")}'`
+
+/** The earlier status line's command, when it was a command. */
+function commandOf(value: unknown): string | undefined {
+  const command = value && typeof value === 'object' ? (value as SettingsJson).command : undefined
+  return typeof command === 'string' && command.trim() ? command : undefined
+}
+
+/** The wrapper, running `previous` (the workspace's earlier status line) first, above its rows. */
+export function wrapperSetting(previous?: unknown) {
+  const command = commandOf(previous)
+  return { ...WRAPPER_SETTING, command: command ? `${STATUSLINE_COMMAND} ${shellWord(command)}` : STATUSLINE_COMMAND }
+}
 /** Key under which an earlier `statusLine` is kept so uninstall can put it back. */
 const PREVIOUS_KEY = 'accountRotatorPreviousStatusLine'
 
@@ -42,7 +57,7 @@ export const DEFAULT_BAR_WIDTH = 8
 /** The tab-separated file the script reads. One `seat` row per account, every provider, in the
  *  order the panel lists them (`seatOrder`), so the line and the panel agree. */
 
-export function renderStatusFile(snapshot: Snapshot, format: string, now: number, barWidth = DEFAULT_BAR_WIDTH): string {
+export function renderStatusFile(snapshot: Snapshot, format: string, now: number, barWidth = DEFAULT_BAR_WIDTH, dirs: [string, string][] = []): string {
   const width = Number.isInteger(barWidth) && barWidth >= 1 && barWidth <= 99 ? barWidth : DEFAULT_BAR_WIDTH
   const lines = [
     '# Auto Hand-off (Orca plugin) — read by claude-statusline.sh; rewritten on every change',
@@ -72,6 +87,8 @@ export function renderStatusFile(snapshot: Snapshot, format: string, now: number
       )
     }
   }
+  // Claude config folders that are not an Orca profile, and the account each one signs in as.
+  for (const [path, id] of dirs) lines.push(['dir', clean(path), clean(id)].join('\t'))
   return lines.join('\n') + '\n'
 }
 
@@ -102,22 +119,27 @@ export function isInstalledIn(text: string | null): boolean {
   }
 }
 
-/** `.claude/settings.local.json` with the wrapper as `statusLine`; an earlier value is kept aside. */
+/** `.claude/settings.local.json` with the wrapper as `statusLine`. An earlier status line keeps
+ *  running, above the wrapper's rows, and is kept aside so uninstall puts it back. */
 export function installIntoSettings(text: string | null): { text: string; replaced: boolean } {
   const settings = parseSettings(text)
   const previous = settings.statusLine
   const replaced = previous !== undefined && !isOurs(previous)
   if (replaced) settings[PREVIOUS_KEY] = previous
-  settings.statusLine = WRAPPER_SETTING
+  settings.statusLine = wrapperSetting(settings[PREVIOUS_KEY])
   return { text: JSON.stringify(settings, null, 2) + '\n', replaced }
 }
 
-/** Whether an installed wrapper setting is older than `WRAPPER_SETTING`: it has no refresh
- *  interval. One that has (whatever else the user changed in it since) is left as it is. */
+/** Whether an installed wrapper setting is older than this version's: it has no refresh interval,
+ *  or does not run the workspace's earlier status line kept aside. Otherwise (whatever else the
+ *  user changed in it since) it is left as it is. */
 export function needsUpgrade(text: string | null): boolean {
   try {
-    const current = parseSettings(text).statusLine
-    return isOurs(current) && (current as SettingsJson).refreshInterval === undefined
+    const settings = parseSettings(text)
+    const current = settings.statusLine
+    if (!isOurs(current)) return false
+    if ((current as SettingsJson).refreshInterval === undefined) return true
+    return (current as SettingsJson).command !== wrapperSetting(settings[PREVIOUS_KEY]).command
   } catch {
     return false
   }
@@ -201,6 +223,20 @@ if [ -x "$orca_hook" ]; then
   printf '%s' "$payload" | /bin/sh "$orca_hook" >/dev/null 2>&1 &
 fi
 
+# The status line that was set before ours keeps running, and prints above our rows: the
+# workspace's own (the plugin passes its command as $1 when it installs the wrapper), else the
+# user's, in the settings.json of the config dir this pane runs on (the workspace's wrapper hides
+# it from Claude). Orca's hook (fed above, prints nothing) and this wrapper are never run here.
+prev=@{1:-}
+if [ -z "$prev" ] && command -v jq >/dev/null 2>&1; then
+  user_settings="@{CLAUDE_CONFIG_DIR:-@{HOME:-}/.claude}"
+  user_settings="@{user_settings%/}/settings.json"
+  [ -r "$user_settings" ] && prev=$(jq -r '.statusLine.command // empty' "$user_settings" 2>/dev/null)
+fi
+case "$prev" in *agent-hooks/claude-statusline*|*"/${DATA_DIR}/${SCRIPT_NAME}"*) prev= ;; esac
+prev_out=
+[ -n "$prev" ] && prev_out=$(printf '%s' "$payload" | /bin/sh -c "$prev" 2>/dev/null)
+
 tab=$(printf '\t')
 model=- ctx=- five=- seven=- reset=- wreset=-
 if command -v jq >/dev/null 2>&1; then
@@ -255,16 +291,36 @@ now=$(date +%s 2>/dev/null || printf '%s' 0)
 # Leave this pane's own numbers for the plugin: Orca polls only the selected account, so this is
 # how an account that runs in a pane but is not selected stays known. One line, per account:
 #   1 <tab> written (epoch s) <tab> 5h used % <tab> 5h reset (epoch s) <tab> 7d used % <tab> 7d reset
-# The account is the profile in CLAUDE_CONFIG_DIR, or "system" for Claude's own login; any other
-# config dir is not an account Orca manages and writes nothing. Background jobs do not write.
+# The account is the one this pane runs on (below). Background jobs do not write.
 # Nothing here may fail the line: it runs in a subshell with errors dropped.
-live_key=
+#
+# Which account this pane runs on: Orca sets CLAUDE_CONFIG_DIR to the profile's home, and an empty
+# one or ~/.claude is Claude's own login ("system"). Any other config dir (a launcher such as
+# ClaudeBar sets its own) is looked up in the status file's "dir" rows, which the plugin fills by
+# matching that folder's sign-in to an Orca account. Until it has, the folder is noted for it in
+# live/dirs/ (its path only, once) and no account is marked.
+me=
 case "@{CLAUDE_CONFIG_DIR:-}" in
-  ''|"@{HOME:-}/.claude"|"@{HOME:-}/.claude/") live_key=system ;;
-  */claude-profiles/*/*)
-    live_key=@{CLAUDE_CONFIG_DIR##*/claude-profiles/}; live_key=@{live_key%%/*}
-    case "$live_key" in ''|.|..|*[!A-Za-z0-9._-]*) live_key= ;; esac ;;
+  ''|"@{HOME:-}/.claude"|"@{HOME:-}/.claude/") me=system ;;
+  */claude-profiles/*/*) me=@{CLAUDE_CONFIG_DIR##*/claude-profiles/}; me=@{me%%/*} ;;
+  *)
+    if [ -r "$status" ]; then
+      while IFS="$tab" read -r kind path id rest; do
+        if [ "$kind" = dir ] && [ "$path" = "$CLAUDE_CONFIG_DIR" ]; then me=$id; break; fi
+      done <"$status"
+    fi
+    if [ -z "$me" ] && [ -n "@{HOME:-}" ]; then
+      (
+        key=$(printf '%s' "$CLAUDE_CONFIG_DIR" | cksum | cut -d' ' -f1)
+        seen="$dir/${LIVE_DIR}/dirs"
+        [ -n "$key" ] && [ ! -e "$seen/$key" ] || exit 0
+        umask 077
+        mkdir -p "$seen" && printf '%s\n' "$CLAUDE_CONFIG_DIR" >"$seen/$key"
+      ) 2>/dev/null || :
+    fi ;;
 esac
+case "$me" in ''|.|..|*[!A-Za-z0-9._-]*) me= ;; esac
+live_key=$me
 # A plain number, or "-".
 num_of() { case "$1" in ''|.|*[!0-9.]*|*.*.*) printf '%s' '-' ;; *) printf '%s' "$1" ;; esac; }
 if [ -n "$live_key" ] && [ -n "@{HOME:-}" ] && [ -z "@{CLAUDE_JOB_DIR:-}" ] && [ "$now" -gt 0 ] 2>/dev/null; then
@@ -339,22 +395,19 @@ label() {
   if [ "@{#1}" -gt "$labelmax" ]; then printf '%.14s…' "$1"; else printf '%-*s' "$labelw" "$1"; fi
 }
 
-# Which account this pane runs on: Orca sets CLAUDE_CONFIG_DIR to the profile's home.
-me=system
-case "@{CLAUDE_CONFIG_DIR:-}" in
-  */claude-profiles/*) me=@{CLAUDE_CONFIG_DIR##*/claude-profiles/}; me=@{me%%/*} ;;
-esac
-
 format='${DEFAULT_FORMAT}'
 paused=0
 best=?
 namew=5
+# The model-window column only when some account has one; otherwise it would be "n/a" on every row.
+hasmodel=
 rows=
 if [ -r "$status" ]; then
   # Column widths: the widest account name (20..40) and the widest model-window name (fable,
   # opus, ...), so every row lines up.
   while IFS="$tab" read -r kind provider id short active s w cool m mname; do
     [ "$kind" = seat ] && [ "$provider" = claude ] || continue
+    { [ "$mname" != - ] || [ "$m" != - ]; } && hasmodel=1
     [ "$mname" != - ] && [ "@{#mname}" -gt "$namew" ] && namew=@{#mname}
     [ "@{#short}" -gt "$labelw" ] && labelw=@{#short}
   done <"$status"
@@ -391,7 +444,9 @@ if [ -r "$status" ]; then
     [ -n "$cool_text" ] && cool_text="  @{alert}⏸$cool_text@{off}"
     col=$mname
     [ "$col" = - ] && col=model
-    row="$mark $name  5h $(bar "$s")  7d $(bar "$w")  $(printf '%-*s' "$namew" "$col") $(bar "$m")$cool_text"
+    modelcol=
+    [ -n "$hasmodel" ] && modelcol="  $(printf '%-*s' "$namew" "$col") $(bar "$m")"
+    row="$mark $name  5h $(bar "$s")  7d $(bar "$w")$modelcol$cool_text"
     rows="@{rows:+$rows
 }$row"
   done <"$status"
@@ -399,7 +454,7 @@ fi
 case "$best" in -|'') best=? ;; esac
 if [ -z "$rows" ]; then
   labelw=12
-  rows="▶ $(label 'this session')  5h $(bar "$five")  7d $(bar "$seven")  model $(bar -)"
+  rows="▶ $(label 'this session')  5h $(bar "$five")  7d $(bar "$seven")"
   [ -r "$status" ] || rows="$rows  @{dim}no Auto Hand-off status yet@{off}"
 fi
 
@@ -423,7 +478,9 @@ subst '{reset}' "@{reset_text:-now}"
 subst '{best}' "$best"
 [ -r "$status" ] || line="$line │ no Auto Hand-off status yet"
 [ "$paused" = 1 ] && line="$line │ @{alert}⏸ automatic hand-off paused@{off}"
-# The header is optional (the format setting); by default only the account rows print.
+# The earlier status line first, then ours below it. The header is optional (the format
+# setting); by default only the account rows print.
+[ -n "$prev_out" ] && printf '%s\n' "$prev_out"
 [ -n "$format" ] && printf '%s\n' "$line"
 printf '%s\n' "$rows"
 exit 0

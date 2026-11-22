@@ -147,3 +147,8 @@ declare const Buffer: {
   from(data: string, encoding?: 'utf8' | 'base64' | 'base64url'): { toString(encoding?: 'utf8' | 'base64' | 'base64url'): string; length: number }
 }
 declare function require(id: string): any
+
+declare module 'node:module' {
+  /** A CommonJS `require` for an ES module, resolving from `path` (usually `import.meta.url`). */
+  export function createRequire(path: string): (id: string) => any
+}

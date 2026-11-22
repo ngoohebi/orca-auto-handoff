@@ -5,6 +5,10 @@
 import { execFile } from 'node:child_process'
 import { existsSync, realpathSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { createRequire } from 'node:module'
+// Orca's runtime client is CommonJS; this module is an ES module, which has no `require` of its own.
+// (Without it every runtime call below fell back to starting the `orca` CLI.)
+const require = createRequire(import.meta.url)
 import type { Cli } from './engine.ts'
 import type { Provider } from './types.ts'
 
@@ -55,6 +59,28 @@ function openRuntimeClient(cliPath: string, server: string | null, timeoutMs = 3
   }
   const { RuntimeClient } = require(join(outDir, 'cli', 'runtime', 'client.js'))
   return new RuntimeClient(undefined, timeoutMs, null, server)
+}
+
+/** One runtime client for this computer's Orca, kept for the terminal list: asked over Orca's
+ *  local socket it answers in a millisecond or two, where starting `orca terminal list` costs
+ *  about 0.1 s of CPU each time, and the panel asks which tab is in front every second. */
+let localTerminalClient: any
+
+/** `orca terminal list --include-visual-layouts`, as data. This computer's Orca is asked over the
+ *  kept runtime client; if that fails (or for a paired server) the CLI is started as before. */
+async function terminalList(cli: string, server?: string): Promise<any> {
+  if (!server) {
+    try {
+      localTerminalClient ??= openRuntimeClient(cli, null, 5_000)
+      const response = await localTerminalClient.call('terminal.list', { includeVisualLayouts: true })
+      if (response && response.ok === false) throw new Error(response.error?.message ?? 'terminal.list failed')
+      return response?.result ?? response
+    } catch {
+      // The next read opens a new client; this one goes through the CLI.
+      localTerminalClient = undefined
+    }
+  }
+  return orcaJson(cli, ['terminal', 'list', '--include-visual-layouts', ...envArgs(server)])
 }
 
 async function callListAccounts(client: any, refreshUsage: boolean, refreshStaleUsage = true): Promise<Record<string, any>> {
@@ -243,12 +269,10 @@ export function nodeCli(getPath: () => Promise<string>): Cli {
       return run('git', ['-C', cwd, ...args], undefined, 10_000)
     },
     async activeTerminals(server?: string) {
-      const result = await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'list', '--include-visual-layouts', ...envArgs(server)])
-      return shownTerminalsIn(result)
+      return shownTerminalsIn(await terminalList(resolveOrcaCli(await getPath()), server))
     },
     async visibleTerminals(server?: string) {
-      const result = await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'list', '--include-visual-layouts', ...envArgs(server)])
-      return shownTerminalsIn(result, true)
+      return shownTerminalsIn(await terminalList(resolveOrcaCli(await getPath()), server), true)
     },
     async draft(terminalId: string, server?: string) {
       const result = await orcaJson(resolveOrcaCli(await getPath()), ['terminal', 'read', '--terminal', terminalId, '--limit', '1', ...envArgs(server)])

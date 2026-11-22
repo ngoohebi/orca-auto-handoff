@@ -41,11 +41,6 @@ export function buildChain(seats: readonly Seat[], provider: Provider, config: C
   return ordered.filter((s) => s.provider === provider)
 }
 
-/** Listed in `exclude`: never switched *to* automatically (a manual pick still works). */
-export function isExcluded(seat: Seat, config: Config): boolean {
-  return tokens(config.exclude).some((t) => matches(seat, t))
-}
-
 function full(window: { usedPercent: number; resetsAt: number | null } | undefined, now: number) {
   if (!window) return false
   if (window.resetsAt !== null && window.resetsAt <= now) return false // already reset
@@ -173,7 +168,7 @@ export function pickNext(
   const smart = config.strategy === 'smart' ? (options.smart ?? NO_CONTEXT) : null
   const candidates = new Map<Seat, ReturnType<typeof candidateOf>>()
   for (const s of chain) {
-    if (s.key === currentKey || isExcluded(s, config)) continue
+    if (s.key === currentKey) continue
     if (options.only && !options.only.has(s.key)) continue
     if (mode === 'advisory' && options.avoid?.has(s.key)) continue
     const t = tier(s, health[s.key], now)
@@ -247,7 +242,7 @@ export function preferredOver(
   const at = chain.findIndex((s) => s.key === currentKey)
   if (at <= 0) return null
   for (const s of chain.slice(0, at)) {
-    if (isExcluded(s, config) || avoid?.has(s.key)) continue
+    if (avoid?.has(s.key)) continue
     const t = tier(s, health[s.key], now)
     if (t === 'A' || t === 'B+') return s
     if (t === 'B' && scope === 'launch' && strikesOf(health[s.key], now) === 0) return s

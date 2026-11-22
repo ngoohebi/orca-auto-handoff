@@ -161,9 +161,6 @@ test('switch back: the first healthy seat ahead in the chain, for the account or
   assert.equal(preferredOver(chain, 'claude:c3', ahead, cfg(), NOW), null)
   assert.equal(preferredOver(chain, 'claude:c3', {}, cfg({ switchBack: false }), NOW), null)
   assert.equal(preferredOver(chain, 'claude:c3', {}, cfg({ strategy: 'smart' }), NOW), null)
-  // Excluded seats are never a target, for switch-back or rotation.
-  assert.equal(preferredOver(chain, 'claude:c3', {}, cfg({ exclude: 'one@example.test' }), NOW)?.key, 'claude:c2')
-  assert.equal(pickNext(chain, 'claude:c3', {}, cfg({ exclude: 'claude:c1, two@example.test' }), NOW), null)
 })
 
 test('headroom gap: a threshold move needs a clearly better seat; exhausted seats may always leave', () => {
@@ -399,14 +396,3 @@ test('the account order is unchanged by Auto: its context and its settings mean 
   assert.equal(preferredOver(back, 'claude:q', {}, cfg(), NOW, 'pane', new Set(['claude:p'])), null)
 })
 
-test('exclude: an account by its label, or by service and label (claude:work@example.com)', async () => {
-  const { isExcluded, namesAny } = await import('./selector')
-  const seat = { key: 'claude:a1', provider: 'claude', accountId: 'a1', label: 'work@example.com', active: false, usage: { known: false } } as const
-  const cfg = (exclude: string) => ({ ...DEFAULT_CONFIG, exclude })
-  assert.equal(isExcluded(seat as never, cfg('work@example.com')), true)
-  assert.equal(isExcluded(seat as never, cfg('claude:work@example.com')), true)
-  assert.equal(isExcluded(seat as never, cfg('codex:work@example.com')), false)
-  assert.equal(isExcluded(seat as never, cfg('claude:a1')), true)
-  assert.equal(namesAny([seat as never], ' Claude:Work@Example.com '), true)
-  assert.equal(namesAny([seat as never], 'claude:other'), false)
-})

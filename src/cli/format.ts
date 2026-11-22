@@ -45,9 +45,8 @@ export function formatStatus(snap: Snapshot, version: string, now = Date.now()):
         : 'no usage yet'
       const state = cooling ? `limited ${span(s.cooldownUntil! - now)}` : s.active ? 'active' : 'ready'
       const circuit = s.circuit && s.circuit !== 'closed' ? `  [${s.circuit.replace('_', '-')}]` : ''
-      const skip = s.excluded ? '  [skipped]' : ''
       const runway = s.runwayMs !== undefined ? `  ~${span(s.runwayMs)} left` : ''
-      out.push(`  ${s.active ? '●' : '○'} ${s.label}  ${state}  ${usage}${runway}${circuit}${skip}`)
+      out.push(`  ${s.active ? '●' : '○'} ${s.label}  ${state}  ${usage}${runway}${circuit}`)
     }
   }
 
@@ -129,7 +128,6 @@ export const HELP_TEXT = [
   '  oah next [service]                  Select the next healthy account for new sessions',
   '  oah pause | resume                  Turn automatic hand-off off or on globally',
   '  oah service <service> on|off        Turn automatic hand-off on or off for one service',
-  '  oah skip <account> [on|off]         Skip an account during automatic hand-off',
   '  oah clear <account>                 Clear an account cooldown / reset circuit breaker',
   '  oah order up|down <account>         Move an account in the custom order',
   '  oah pin <id> <account>              Pin a workspace or terminal to one account',

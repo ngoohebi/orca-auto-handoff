@@ -123,7 +123,8 @@ test('settings.local.json: install keeps an earlier statusLine aside, uninstall 
   assert.equal(merged.replaced, true)
   const m = JSON.parse(merged.text)
   assert.deepEqual(m.permissions, { allow: ['Bash(ls)'] })
-  assert.equal(m.statusLine.command, STATUSLINE_COMMAND)
+  // The earlier status line keeps running, above ours: the wrapper is given its command.
+  assert.equal(m.statusLine.command, `${STATUSLINE_COMMAND} 'my-line'`)
   assert.deepEqual(m.accountRotatorPreviousStatusLine, { type: 'command', command: 'my-line' })
   // Installing twice does not move our own line into the backup.
   assert.equal(installIntoSettings(merged.text).replaced, false)
@@ -254,7 +255,7 @@ test('wrapper script: a header and one gauge row per account of the service, thi
     rmSync(join(fx.home, '.orca/account-rotator/status.tsv'))
     const bare = await sh(script, PAYLOAD, env)
     assert.deepEqual(plain(bare.stdout).split('\n'), [
-      `▶ ${pad('this session', 12)}  5h █░░░░░░░  14%  7d ██████░░  80%  model ········  n/a  no Auto Hand-off status yet`,
+      `▶ ${pad('this session', 12)}  5h █░░░░░░░  14%  7d ██████░░  80%  no Auto Hand-off status yet`,
       ''
     ])
 
@@ -343,7 +344,9 @@ test('wrapper script: no live file for an unknown config dir, a background job, 
       const run = await sh(script, payload, { ...base, ...env })
       assert.equal(run.code, 0, run.stderr)
       assert.ok(plain(run.stdout).startsWith('▶ this session'), `${why}: the line still prints`)
-      assert.equal(existsSync(live), false, why)
+      // No numbers file for any account (a folder that is no Orca profile is only noted in dirs/).
+      const { readdirSync } = await fs()
+      assert.deepEqual(existsSync(live) ? readdirSync(live).filter((n: string) => n !== 'dirs') : [], [], why)
     }
     await quiet(PAYLOAD, { CLAUDE_CONFIG_DIR: '/somewhere/else/.claude' }, 'a config dir that is no Orca profile')
     await quiet(PAYLOAD, { CLAUDE_CONFIG_DIR: `${fx.home}/claude-profiles/bad id!/home` }, 'a profile id with other characters')
@@ -510,7 +513,7 @@ test('wrapper script: a live dir that cannot be written still prints the line an
     assert.equal(run.code, 0, run.stderr)
     assert.equal(run.stderr, '')
     assert.deepEqual(plain(run.stdout).split('\n'), [
-      `▶ ${pad('this session', 12)}  5h █░░░░░░░  14%  7d ██████░░  80%  model ········  n/a  no Auto Hand-off status yet`,
+      `▶ ${pad('this session', 12)}  5h █░░░░░░░  14%  7d ██████░░  80%  no Auto Hand-off status yet`,
       ''
     ])
     assert.equal(readFileSync(join(fx.home, '.orca/account-rotator/live'), 'utf8'), 'in the way\n')
@@ -877,4 +880,135 @@ test('wrapper script: quotes, backslashes, $( ), backticks, % and escape sequenc
   } finally {
     rmSync(base, { recursive: true, force: true })
   }
+})
+
+test('global status line: on puts the wrapper in every workspace on this computer, off takes it out of all of them and puts an earlier one back', async () => {
+  const files = memoryFiles('/home/u')
+  const results: Record<string, unknown> = {
+    'workspace.list': {
+      workspaces: [
+        { id: 'w1', name: 'app', path: '/repo/app', hostId: 'local' },
+        { id: 'w2', name: 'web', path: '/repo/web', projectId: 'p1' },
+        { id: 'w3', name: 'remote', path: '/srv/remote', hostId: 'ssh:box' },
+        { id: 'w4', name: 'paired', path: '/srv/paired', projectId: 'p2' }
+      ]
+    },
+    'project.list': { projects: [{ id: 'p1', hostId: 'local' }, { id: 'p2', hostId: 'server:studio' }] },
+    'workspace.readContext': { workspaceId: 'w5' }
+  }
+  const host = { call: async (method: string) => results[method] } as never
+  const line = new ConsoleStatusLine(files, { host, settings: async () => ({}), log: () => undefined, now: () => NOW })
+  // web had a status line of its own.
+  files.write('/repo/web/.claude/settings.local.json', JSON.stringify({ statusLine: { type: 'command', command: 'mine.sh' } }))
+  assert.match(await line.installEverywhere(), /on in 2 workspaces/)
+  for (const path of ['/repo/app', '/repo/web']) {
+    assert.match(files.read(`${path}/.claude/settings.local.json`) ?? '', /claude-statusline\.sh/)
+  }
+  // Workspaces on another machine are left alone.
+  assert.equal(files.read('/srv/remote/.claude/settings.local.json'), null)
+  assert.equal(files.read('/srv/paired/.claude/settings.local.json'), null)
+  // Again: nothing to do.
+  assert.equal(await line.installEverywhere(), 'Claude status line is on in every workspace.')
+  // A workspace opened since gets it when focused.
+  ;(results['workspace.list'] as { workspaces: unknown[] }).workspaces.push({ id: 'w5', name: 'new', path: '/repo/new', hostId: 'local' })
+  await line.ensureFocused()
+  assert.match(files.read('/repo/new/.claude/settings.local.json') ?? '', /claude-statusline\.sh/)
+  // Off: out of all of them; web gets its own back, the others lose the file the wrapper made.
+  assert.match(await line.uninstallEverywhere(), /removed from 3 workspaces/)
+  assert.equal(files.read('/repo/app/.claude/settings.local.json'), null)
+  assert.equal(JSON.parse(files.read('/repo/web/.claude/settings.local.json') ?? '{}').statusLine.command, 'mine.sh')
+  assert.equal(await line.uninstallEverywhere(), 'Claude status line is off.')
+})
+
+test('wrapper script: a status line set before ours keeps printing, above our rows; Orca\'s hook and our own are never run as one', async () => {
+  const fx = fakeHome()
+  try {
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    writeFileSync(join(fx.home, '.orca/account-rotator/status.tsv'), 'format\t\nwidth\t8\npaused\t0\nseat\tclaude\taaa\tme\t1\t12\t40\t0\t-\t-\n')
+    const cfg = join(fx.home, 'launcher-config')
+    mkdirSync(cfg, { recursive: true })
+    const base = { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CONFIG_DIR: cfg }
+    const lines = async (args: string[] = []) => {
+      const run = await new Promise<{ stdout: string; code: number }>((resolve) => {
+        const child = execFile('/bin/sh', [script, ...args], { env: base, timeout: 5000 }, (error, stdout) =>
+          resolve({ stdout, code: error ? 1 : 0 })
+        ) as { stdin: { end(text: string): void } }
+        child.stdin.end(PAYLOAD)
+      })
+      assert.equal(run.code, 0)
+      return plain(run.stdout).trimEnd().split('\n')
+    }
+    // Nothing set before: our rows only.
+    assert.equal((await lines()).length, 1)
+    // The workspace's own status line, given as $1 when the wrapper was installed: first.
+    assert.deepEqual((await lines(["printf 'mine: %s' \"$(cat | wc -c | tr -d ' ')\""])).slice(0, 1)[0]!.startsWith('mine: '), true)
+    // Else the user's, in the settings.json of the config dir the pane runs on (with jq).
+    const hasJq = await new Promise<boolean>((resolve) => execFile('/bin/sh', ['-c', 'command -v jq'], { env: base }, (error) => resolve(!error)))
+    writeFileSync(join(cfg, 'settings.json'), JSON.stringify({ statusLine: { type: 'command', command: 'echo USER-LINE' } }))
+    const user = await lines()
+    if (hasJq) assert.deepEqual([user[0], user.length], ['USER-LINE', 2])
+    // Orca's hook, or our own wrapper, as the user's status line: not run again.
+    writeFileSync(join(cfg, 'settings.json'), JSON.stringify({ statusLine: { type: 'command', command: '/bin/sh "$HOME/.orca/agent-hooks/claude-statusline.sh"' } }))
+    assert.equal((await lines()).length, 1)
+    writeFileSync(join(cfg, 'settings.json'), JSON.stringify({ statusLine: { type: 'command', command: STATUSLINE_COMMAND } }))
+    assert.equal((await lines()).length, 1)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('wrapper script: a config dir that is no Orca profile is noted once; once the plugin maps it to an account, that account is marked and gets the numbers', async () => {
+  const fx = fakeHome()
+  try {
+    const { existsSync, readdirSync, readFileSync } = await fs()
+    const script = join(fx.home, '.orca/account-rotator/claude-statusline.sh')
+    const statusFile = join(fx.home, '.orca/account-rotator/status.tsv')
+    const rows = 'format\t\nwidth\t8\npaused\t0\nseat\tclaude\taaa\tme\t1\t12\t40\t0\t-\t-\nseat\tclaude\tbbb\tother\t0\t60\t90\t0\t-\t-\n'
+    writeFileSync(statusFile, rows)
+    const cfg = join(fx.home, 'launcher-config')
+    const env = { HOME: fx.home, PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CONFIG_DIR: cfg }
+    const seen = join(fx.home, '.orca/account-rotator/live/dirs')
+    const first = await sh(script, PAYLOAD, env)
+    assert.ok(!plain(first.stdout).includes('▶'))
+    assert.deepEqual(readdirSync(seen).map((n: string) => readFileSync(join(seen, n), 'utf8')), [`${cfg}\n`])
+    assert.equal(existsSync(join(fx.home, '.orca/account-rotator/live/claude-bbb.tsv')), false)
+    writeFileSync(statusFile, `${rows}dir\t${cfg}\tbbb\n`)
+    const mapped = plain((await sh(script, PAYLOAD, env)).stdout).split('\n')
+    assert.ok(mapped.find((l) => l.startsWith('▶ other')))
+    assert.ok(mapped.find((l) => l.startsWith('· me')))
+    assert.equal(existsSync(join(fx.home, '.orca/account-rotator/live/claude-bbb.tsv')), true)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('settings.local.json: the wrapper runs an earlier status line given as one shell word, and one installed before this version is upgraded to', () => {
+  const theirs = JSON.stringify({ statusLine: { type: 'command', command: "echo 'it''s' \"$X\"" } })
+  const m = JSON.parse(installIntoSettings(theirs).text)
+  assert.equal(m.statusLine.command, `${STATUSLINE_COMMAND} 'echo '\\''it'\\'''\\''s'\\'' "$X"'`)
+  // An older install kept the earlier line aside but did not run it: upgraded.
+  const older = JSON.stringify({ statusLine: { type: 'command', command: STATUSLINE_COMMAND, refreshInterval: 10 }, accountRotatorPreviousStatusLine: { type: 'command', command: 'my-line' } })
+  assert.equal(needsUpgrade(older), true)
+  const upgraded = installIntoSettings(older)
+  assert.equal(JSON.parse(upgraded.text).statusLine.command, `${STATUSLINE_COMMAND} 'my-line'`)
+  assert.equal(needsUpgrade(upgraded.text), false)
+})
+
+test('status file: a launcher\'s config dir is matched to the Orca account with the same sign-in', async () => {
+  const files = memoryFiles('/home/u')
+  const root = '/home/u/orca-data'
+  const signIn = (email: string, org: string) => JSON.stringify({ oauthAccount: { emailAddress: email, organizationUuid: org } })
+  const a = '8e3da481-7456-4be3-a50b-b094ee3e60b3'
+  const b = '6c76c78a-c6ee-4454-8eb4-bdebb31c6198'
+  files.write(`${root}/claude-profiles/${a}/home/.claude.json`, signIn('One@Example.test', 'org1'))
+  files.write(`${root}/claude-profiles/${b}/home/.claude.json`, signIn('two@example.test', 'org2'))
+  files.write('/cfg/launcher/.claude.json', signIn('one@example.test', 'org1'))
+  files.write('/cfg/stranger/.claude.json', signIn('three@example.test', 'org3'))
+  files.write('/home/u/.orca/account-rotator/live/dirs/111', '/cfg/launcher\n')
+  files.write('/home/u/.orca/account-rotator/live/dirs/222', '/cfg/stranger\n')
+  const line = new ConsoleStatusLine(files, { host: { call: async () => null } as never, settings: async () => ({}), log: () => undefined, now: () => NOW, orcaUserData: root })
+  const seat = (id: string) => ({ key: `claude:${id}`, provider: 'claude' as const, accountId: id, label: id, active: false, usage: { known: false } })
+  await line.writeStatus({ paused: false, updatedAt: NOW, seats: [seat(a), seat(b)], waiting: [], history: [], services: {} } as never)
+  const status = files.read('/home/u/.orca/account-rotator/status.tsv') ?? ''
+  assert.deepEqual(status.split('\n').filter((l) => l.startsWith('dir\t')), [`dir\t/cfg/launcher\t${a}`])
 })

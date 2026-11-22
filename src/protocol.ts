@@ -46,8 +46,6 @@ declare module 'orca' {
      *  comes back as `draft` again. */
     'rotator.switchTo': { input: { seatKey: string; acceptDraft?: boolean; draft?: UnsentDraft }; output: { message: string; draft?: UnsentDraft } }
     'rotator.cancelWaiting': { input: { terminalId: string }; output: { ok: true } }
-    /** An account card's "Skip" switch: the account is never chosen automatically. */
-    'rotator.setExcluded': { input: { seatKey: string; excluded: boolean }; output: { ok: true } }
     /** *Not now* to "Ask me first": the session on screen waits for another tab, with no countdown. */
     'rotator.declineHandoff': { input: { terminalId: string }; output: { ok: true } }
     /** *Hand off now* for a waiting session (the one on screen, held for the user). `message`

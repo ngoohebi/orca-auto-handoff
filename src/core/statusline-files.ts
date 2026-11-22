@@ -1,13 +1,14 @@
 // The console status line's side effects: the script and status file under `~/.orca/account-
 // rotator/`, and the focused workspace's `.claude/settings.local.json`. `Files` is injected so the
 // worker tests run against memory; `nodeFiles` is what Orca runs.
-import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 import type { Deps } from './engine.ts'
 import {
   DATA_DIR,
   DEFAULT_BAR_WIDTH,
+  LIVE_DIR,
   DEFAULT_FORMAT,
   SCRIPT,
   SCRIPT_NAME,
@@ -29,6 +30,8 @@ export type Files = {
    *  set also when the folder was already there. */
   write(path: string, text: string, mode?: number, dirMode?: number): void
   remove(path: string): void
+  /** The names of the files in a folder; none when it does not exist. */
+  list?(dir: string): string[]
 }
 
 export function nodeFiles(): Files {
@@ -57,6 +60,13 @@ export function nodeFiles(): Files {
       } catch (error) {
         if ((error as { code?: string }).code !== 'ENOENT') throw error
       }
+    },
+    list(dir) {
+      try {
+        return readdirSync(dir)
+      } catch {
+        return []
+      }
     }
   }
 }
@@ -75,7 +85,8 @@ export function memoryFiles(home = '/home/test'): Files & { files: Map<string, s
       if (mode !== undefined) modes.set(path, mode)
       if (dirMode !== undefined) modes.set(dirname(path), dirMode)
     },
-    remove: (path) => void files.delete(path)
+    remove: (path) => void files.delete(path),
+    list: (dir) => [...files.keys()].filter((p) => dirname(p) === dir).map((p) => p.slice(dir.length + 1))
   }
 }
 
@@ -84,6 +95,18 @@ type Ctx = {
   settings(): Promise<Record<string, unknown>>
   log(message: string): void
   now(): number
+  /** Orca's data folder, where its Claude profiles live (`claude-profiles/<id>/home`). */
+  orcaUserData?: string
+}
+
+/** How often the Claude config folders noted by the wrapper are matched to accounts again. */
+const DIRS_EVERY_MS = 5 * 60_000
+
+/** Orca's data folder: ORCA_USER_DATA, else its macOS default. */
+export function defaultOrcaUserData(home: string): string | undefined {
+  const configured = process.env.ORCA_USER_DATA
+  if (configured && configured.startsWith('/')) return configured
+  return process.platform === 'darwin' ? `${home}/Library/Application Support/Orca` : undefined
 }
 
 /** The status file names the accounts (emails), and so do the live files beside it: the folder
@@ -134,11 +157,57 @@ export class ConsoleStatusLine {
     return { format: format || DEFAULT_FORMAT, barWidth }
   }
 
+  private dirs: [string, string][] = []
+  private dirsAt = 0
+  private dirsSeen = ''
+
+  /** The Claude sign-in a config folder holds: its account email and organization. */
+  private signInOf(configDir: string): string | undefined {
+    try {
+      const account = JSON.parse(this.files.read(`${configDir.replace(/\/+$/, '')}/.claude.json`) ?? 'null')?.oauthAccount
+      const email = typeof account?.emailAddress === 'string' ? account.emailAddress.toLowerCase() : ''
+      return email ? `${email}\t${typeof account.organizationUuid === 'string' ? account.organizationUuid : ''}` : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Claude config folders that are not an Orca profile (a launcher such as ClaudeBar sets its
+   *  own), matched to the Orca account whose profile holds the same sign-in, for the wrapper's
+   *  `dir` rows: it then marks that account and keeps its numbers. The wrapper notes each folder
+   *  it meets in live/dirs/; they are matched again every few minutes, or when one is new. */
+  private configDirs(snapshot: Snapshot): [string, string][] {
+    const seenDir = `${this.files.home}/${DATA_DIR}/${LIVE_DIR}/dirs`
+    const names = (this.files.list?.(seenDir) ?? []).filter((n) => /^[0-9]+$/.test(n)).sort()
+    const seen = names.join(',')
+    if (seen === this.dirsSeen && this.ctx.now() - this.dirsAt < DIRS_EVERY_MS) return this.dirs
+    this.dirsSeen = seen
+    this.dirsAt = this.ctx.now()
+    const root = this.ctx.orcaUserData ?? defaultOrcaUserData(this.files.home)
+    if (!names.length || !root) return (this.dirs = [])
+    const ids = [...new Set(snapshot.seats.filter((s) => s.provider === 'claude' && /^[0-9a-f-]{36}$/i.test(s.accountId)).map((s) => s.accountId))]
+    const byAccount = new Map<string, string[]>()
+    for (const id of ids) {
+      const sign = this.signInOf(`${root}/claude-profiles/${id}/home`)
+      if (sign) byAccount.set(sign, [...(byAccount.get(sign) ?? []), id])
+    }
+    const dirs: [string, string][] = []
+    for (const name of names) {
+      const path = (this.files.read(`${seenDir}/${name}`) ?? '').split('\n')[0]!.trim()
+      if (!path.startsWith('/') || /[\t\r]/.test(path)) continue
+      const sign = this.signInOf(path)
+      const match = sign ? byAccount.get(sign) : undefined
+      // Two Orca profiles of the same account: either is right, so the first.
+      if (match?.length) dirs.push([path, match[0]!])
+    }
+    return (this.dirs = dirs)
+  }
+
   /** Called on every publish; writes only when the rendered file differs. */
   async writeStatus(snapshot: Snapshot): Promise<void> {
     try {
       const { format, barWidth } = await this.format()
-      const text = renderStatusFile(snapshot, format, this.ctx.now(), barWidth)
+      const text = renderStatusFile(snapshot, format, this.ctx.now(), barWidth, this.configDirs(snapshot))
       if (text === this.lastStatus) return
       this.lastStatus = text
       this.ensureScript()
@@ -148,21 +217,96 @@ export class ConsoleStatusLine {
     }
   }
 
+  /** One workspace's Claude settings file, or why it has none here. A workspace on an SSH target
+   *  or a paired Orca server has its path on that machine: the same path here is another folder,
+   *  or none. The row names its host, or else its project does. */
+  private settingsFileOf(
+    ws: { path?: string; name: string; hostId?: unknown; projectId?: string } | undefined,
+    projects: { id: string; hostId?: unknown }[] | undefined
+  ): { file: string; name: string } | string {
+    if (!ws?.path) return 'The focused workspace has no local path'
+    let hostId: unknown = ws.hostId
+    if ((typeof hostId !== 'string' || !hostId) && ws.projectId) hostId = projects?.find((p) => p.id === ws.projectId)?.hostId
+    if (typeof hostId === 'string' && hostId && hostId !== 'local') return 'The focused workspace is not on this computer'
+    return { file: `${ws.path}/.claude/settings.local.json`, name: ws.name }
+  }
+
+  private async projects(): Promise<{ id: string; hostId?: unknown }[] | undefined> {
+    const listed = await this.ctx.host.call('project.list').catch(() => null)
+    return Array.isArray(listed?.projects) ? listed.projects : undefined
+  }
+
   private async focusedSettingsFile(): Promise<{ file: string; name: string } | string> {
     const context = await this.ctx.host.call('workspace.readContext')
     if (!context?.workspaceId) return 'No focused workspace'
     const { workspaces } = await this.ctx.host.call('workspace.list')
     const ws = workspaces.find((w: { id: string }) => w.id === context.workspaceId)
     if (!ws?.path) return 'The focused workspace has no local path'
-    // A workspace on an SSH target or a paired Orca server has its path on that machine: the same
-    // path here is another folder, or none. The row names its host, or else its project does.
-    let hostId: unknown = ws.hostId
-    if ((typeof hostId !== 'string' || !hostId) && ws.projectId) {
-      const listed = await this.ctx.host.call('project.list').catch(() => null)
-      hostId = Array.isArray(listed?.projects) ? listed.projects.find((p: { id: string }) => p.id === ws.projectId)?.hostId : undefined
+    return this.settingsFileOf(ws, ws.hostId || !ws.projectId ? undefined : await this.projects())
+  }
+
+  /** Every workspace on this computer, as its Claude settings file. */
+  private async localSettingsFiles(): Promise<{ file: string; name: string }[]> {
+    const { workspaces } = await this.ctx.host.call('workspace.list')
+    const projects = await this.projects()
+    const files: { file: string; name: string }[] = []
+    for (const ws of Array.isArray(workspaces) ? workspaces : []) {
+      const target = this.settingsFileOf(ws, projects)
+      if (typeof target !== 'string' && !files.some((f) => f.file === target.file)) files.push(target)
     }
-    if (typeof hostId === 'string' && hostId && hostId !== 'local') return 'The focused workspace is not on this computer'
-    return { file: `${ws.path}/.claude/settings.local.json`, name: ws.name }
+    return files
+  }
+
+  /** The `console_statusline` setting turned on: the wrapper in every workspace on this computer. */
+  async installEverywhere(): Promise<string> {
+    this.scriptChecked = false
+    this.ensureScript()
+    if (!this.scriptChecked) return `Could not write ${this.scriptPath}; see the plugin log`
+    let done = 0
+    for (const target of await this.localSettingsFiles()) {
+      try {
+        const text = this.files.read(target.file)
+        if (text !== null && isInstalledIn(text) && !needsUpgrade(text)) continue
+        this.files.write(target.file, installIntoSettings(text).text)
+        done++
+      } catch (error) {
+        this.ctx.log(`console status line: ${target.file}: ${String((error as Error)?.message ?? error)}`)
+      }
+    }
+    return done
+      ? `Claude status line on in ${done} workspace${done === 1 ? '' : 's'}; a previous status line is kept and put back when it is turned off. Claude sessions pick it up at their next status refresh or start.`
+      : 'Claude status line is on in every workspace.'
+  }
+
+  /** The `console_statusline` setting turned off: the wrapper out of every workspace on this
+   *  computer, with any earlier status line put back. */
+  async uninstallEverywhere(): Promise<string> {
+    let done = 0
+    for (const target of await this.localSettingsFiles()) {
+      try {
+        const existing = this.files.read(target.file)
+        if (existing === null) continue
+        const result = uninstallFromSettings(existing)
+        if (!result.changed) continue
+        if (result.text === null) this.files.remove(target.file)
+        else this.files.write(target.file, result.text)
+        done++
+      } catch (error) {
+        this.ctx.log(`console status line: ${target.file}: ${String((error as Error)?.message ?? error)}`)
+      }
+    }
+    return done ? `Claude status line removed from ${done} workspace${done === 1 ? '' : 's'}.` : 'Claude status line is off.'
+  }
+
+  /** While the setting is on: the wrapper in the focused workspace too, for one opened since. */
+  async ensureFocused(): Promise<void> {
+    const target = await this.focusedSettingsFile()
+    if (typeof target === 'string') return
+    const text = this.files.read(target.file)
+    if (text !== null && isInstalledIn(text) && !needsUpgrade(text)) return
+    this.ensureScript()
+    if (!this.scriptChecked) return
+    this.files.write(target.file, installIntoSettings(text).text)
   }
 
   /** Whether the focused workspace has the wrapper as its Claude `statusLine`. */

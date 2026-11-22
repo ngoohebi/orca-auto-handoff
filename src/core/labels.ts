@@ -20,11 +20,11 @@ export const PROVIDER_NAME: Record<Provider, string> = {
 export const HELD_WORDS: Record<Held, { title: string; body: string }> = {
   settings: {
     title: "Auto Hand-off is waiting for Orca's settings",
-    body: 'Orca could not be asked for your settings yet, so nothing is handed off or resumed automatically. It tries again by itself. Hand off to this account still works.'
+    body: 'Orca could not be asked for your settings yet, so nothing is handed off or resumed automatically. It tries again by itself. Early hand off still works.'
   },
   upgrade: {
     title: 'Auto Hand-off is finishing the upgrade',
-    body: 'Your settings from the earlier version are not carried over yet, so nothing is handed off or resumed automatically. It tries again by itself. Hand off to this account still works.'
+    body: 'Your settings from the earlier version are not carried over yet, so nothing is handed off or resumed automatically. It tries again by itself. Early hand off still works.'
   }
 }
 

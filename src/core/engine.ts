@@ -26,7 +26,6 @@ import {
   enoughGap,
   exhausted,
   isEligible,
-  isExcluded,
   namesAny,
   pickNext,
   preferredOver,
@@ -337,6 +336,17 @@ function shortQuote(text: string): string {
  *  `<server>|<key>` on a paired server, whose accounts are other accounts under the same keys. */
 export function scopedKey(server: string | undefined, key: string): string {
   return server ? `${server}|${key}` : key
+}
+
+/** How old Orca's reading of an account may be before Live quota asks the provider itself: the
+ *  same pace as the direct check (Claude's usage endpoint locks out for an hour when asked more
+ *  often; the others are asked every 10 minutes). */
+export const DIRECT_GAP_MS: Record<Provider, number> = { claude: 15 * 60_000, codex: 10 * 60_000, antigravity: 10 * 60_000, opencode: 10 * 60_000, devin: 10 * 60_000 }
+
+/** Whether Orca's own reading of the account is recent enough that no direct check is needed. */
+export function orcaReadingFresh(seat: Seat, now: number): boolean {
+  const u = seat.usage
+  return u.known && u.source === 'live' && !u.origin && typeof u.updatedAt === 'number' && now - u.updatedAt < (DIRECT_GAP_MS[seat.provider] ?? 10 * 60_000)
 }
 
 export class Rotator {
@@ -868,6 +878,7 @@ export class Rotator {
     const server = await this.currentServer()
     if (directQuota) {
       if (server || !this.deps.refreshProfileQuota) throw new Error('Direct quota checks are available for local profiles only.')
+      if (!(await this.config()).directQuota) throw new Error('Live quota is off in Settings.')
       if (!(await this.config()).quotaLinks.length) throw new Error('Link an Orca account before checking its connection.')
       force = refreshUsage = true
     }
@@ -916,19 +927,18 @@ export class Rotator {
     let nextRaw = current?.rawSeats
     let nextAt = current?.at ?? 0
     let nextError: string | undefined
-    const preferDirect = !server && config.quotaLinks.length > 0 && !!this.deps.refreshProfileQuota
+    // Live quota (the `direct_quota` setting): off, usage comes from Orca only.
+    const direct = !server && config.directQuota && !!this.deps.refreshProfileQuota
+    const preferDirect = direct && config.quotaLinks.length > 0
     let quotaProfiles = preferDirect ? current?.quotaProfiles : undefined
     try {
       let raw: Record<string, any>
       let parsed: AccountView
       try {
-        raw = preferDirect && (!refreshUsage || directQuota)
-          ? await this.deps.cli.listAccounts(undefined, { refreshStaleUsage: false })
-          : refreshUsage
-            ? await this.deps.cli.listAccounts(server, { refreshUsage: true })
-            : server
-              ? await this.deps.cli.listAccounts(server)
-              : await this.deps.cli.listAccounts()
+        // Orca first: it refreshes what is stale, within its own throttles and Retry-After. A
+        // forced refresh (`refreshUsage`) bypasses both and costs a request per account, so it is
+        // never asked for; Live quota only fills the gaps Orca leaves (below).
+        raw = server ? await this.deps.cli.listAccounts(server) : await this.deps.cli.listAccounts(undefined, { refreshStaleUsage: true })
         parsed = parseAccounts(raw)
         if (preferDirect) {
           quotaProfiles = { claude: raw.claude, codex: raw.codex, antigravity: raw.antigravity, opencode: raw.opencode, devin: raw.devin }
@@ -949,7 +959,7 @@ export class Rotator {
       // Saved accounts a direct check can serve are linked as they appear (unless unlinked by
       // hand), and checked in this same read.
       let links = config.quotaLinks
-      if (!server && this.deps.refreshProfileQuota && this.deps.quotaStatus) {
+      if (direct && this.deps.quotaStatus) {
         try {
           const { added, off, unavailable } = this.deps.quotaStatus(raw, parsed.seats)
           const turnedOff = new Set(off)
@@ -967,9 +977,13 @@ export class Rotator {
           this.deps.log(`direct quota: automatic linking failed: ${String((error as Error)?.message ?? error)}`)
         }
       }
-      if (!server && links.length && this.deps.refreshProfileQuota) {
+      if (direct && links.length) {
+        // Only the gaps: an account whose reading from Orca is missing or older than its check
+        // interval. Orca reads only the account in use, and only while you use Orca.
         const linked = new Set(links)
-        await this.deps.refreshProfileQuota(raw, parsed.seats.filter((seat) => linked.has(seat.key)), directQuota)
+        const now = this.deps.now()
+        const gaps = parsed.seats.filter((seat) => linked.has(seat.key) && !orcaReadingFresh(seat, now))
+        if (gaps.length) await this.deps.refreshProfileQuota!(raw, gaps, directQuota)
       }
       const now = this.deps.now()
       const rawSeats = parsed.seats.map((s) => ({ ...s, usage: { ...s.usage } }))
@@ -1749,9 +1763,8 @@ export class Rotator {
       const low = !!leave && leave.leave && !leave.assessment.over
       if (reason === 'threshold' && from) await this.coolOverThreshold(from, config, now, pane.server)
       const chain = buildChain(view.seats, pane.agent, config)
-      // (Not when that account is one to Skip: then the ordinary pick finds another.)
       const healthyActive =
-        preferActive && active && !isExcluded(active, config) && isEligible(active, this.healthOf(active.key, pane.server), now) ? active : null
+        preferActive && active && isEligible(active, this.healthOf(active.key, pane.server), now) ? active : null
       const context = ahead && config.strategy === 'smart' ? await this.smartContext(pane.agent, view, pane.server, now) : undefined
       // The fresh reading may show the account is fine after all (its window reset since the
       // cached one): then there is nothing to leave.
@@ -1883,7 +1896,7 @@ export class Rotator {
     }
     const current = candidate(from, chain.indexOf(from))
     const others = chain
-      .map((s, i) => (s.key === from.key || isExcluded(s, config) ? null : candidate(s, i)))
+      .map((s, i) => (s.key === from.key ? null : candidate(s, i)))
       .filter((c): c is NonNullable<typeof c> => c !== null)
     return current ? (betterExpiring(current, others, config)?.seat ?? null) : null
   }
@@ -2268,8 +2281,8 @@ export class Rotator {
     return w.countdownUntil === undefined || w.countdownUntil <= now || this.presenceAt > (w.countdownFrom ?? 0)
   }
 
-  /** The order and the Skip list are changed from what the settings hold: while Orca could not be
-   *  asked for them, a change would start from an empty list and write that over the stored one. */
+  /** The account order is changed from what the settings hold: while Orca could not be asked
+   *  for it, a change would start from an empty list and write that over the stored one. */
   private listsKnown(config: Config): Config {
     if (config.held === 'settings') throw new Error("Orca's settings could not be read yet, so nothing was changed")
     return config
@@ -2292,18 +2305,6 @@ export class Rotator {
     // Entries for accounts this project does not list (another Orca server's) are kept, after.
     const others = config.chain.split(',').map((t) => t.trim()).filter((t) => t && !namesAny(view.seats, t))
     return [...keys, ...others].join(', ')
-  }
-
-  /** The account card's "Skip" switch: the `exclude` list with this account added (as
-   *  its seat key) or every entry that names it removed. */
-  async excludedChanged(seatKey: string, excluded: boolean): Promise<string> {
-    const config = this.listsKnown(await this.deps.config())
-    const view = await this.accounts()
-    const seat = view.seats.find((s) => s.key === seatKey)
-    const entries = config.exclude.split(',').map((t) => t.trim()).filter(Boolean)
-    if (!seat) return entries.join(', ')
-    const rest = entries.filter((t) => !namesAny([seat], t))
-    return (excluded ? [...rest, seat.key] : rest).join(', ')
   }
 
   /** Each service's account order as Auto or Custom order would try it (for the panel's arrows). */
@@ -2480,13 +2481,6 @@ export class Rotator {
         if (pending && !this.state.waiting.includes(pending)) {
           this.deps.log(`${pane.agent} ${pane.terminalId}: no longer waiting to hand off, not moving it`)
           return 'This session is no longer waiting to hand off.'
-        }
-        // *Skip* turned on meanwhile for the account it was going to: not handed off there. A
-        // session at a limit stays pending, and the next tick picks another account.
-        if (isExcluded(target, await this.deps.config())) {
-          this.deps.log(`${pane.agent} ${pane.terminalId}: ${toLabel} was set to Skip meanwhile, not handing off to it`)
-          if (closesUnasked) await this.waitAgain(pane, from, reason, signal?.model)
-          return `${toLabel} is set to Skip.`
         }
         if (!(await this.allowed(pane.agent))) {
           this.deps.log(`${pane.agent} ${pane.terminalId}: automatic hand-off was paused or turned off meanwhile, not moving it`)
@@ -3356,12 +3350,6 @@ export class Rotator {
         ? (room(false) ?? room(true))
         : pickNext(chain, w.model && w.wakeAt > now ? w.fromSeat : undefined, this.healthOn(server), config, now, { ...early, ...context })
       if (!target) {
-        // Its own account is one to Skip, so it is no target, but it has room again and no other
-        // account has: staying on an account is not being handed off to it, so the session
-        // continues where it is rather than wait for another account's reset.
-        if (!w.model && source && row && isExcluded(source, config) && isEligible(source, this.healthOf(source.key, server), now)) {
-          return this.goOnThere(w, source, view, server, config)
-        }
         if (!config.waitForReset) {
           // "When everything is used up: Stop". The account this session was to go to has no room
           // any more (it was held for the session on screen, or for unsent text, meanwhile), or
@@ -3796,8 +3784,7 @@ export class Rotator {
         const circuit = circuitState(h, now)
         return {
           ...seat,
-          ...(!this.server && this.chosenConfig?.quotaLinks.includes(s.key) ? { quotaLinked: true } : {}),
-          ...(this.lastConfig && isExcluded(s, this.lastConfig) ? { excluded: true } : {}),
+          ...(!this.server && this.chosenConfig?.directQuota && this.chosenConfig.quotaLinks.includes(s.key) ? { quotaLinked: true } : {}),
           ...(runway !== null ? { runwayMs: Math.round(runway) } : {}),
           ...(h?.cooldownUntil ? { cooldownUntil: h.cooldownUntil } : {}),
           ...(h?.reason ? { cooldownReason: h.reason } : {}),

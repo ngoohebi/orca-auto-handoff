@@ -153,6 +153,20 @@
         "description": "The session in the tab Orca is showing. You may be reading or typing in it, so it gets extra care. ask (Ask me first, default): Never handed off early. At a limit the Auto Hand-off panel asks whether to hand it off now. If you do not answer, it waits while you are using Orca, then counts down. Not now: it waits until you switch tabs. careful (Wait, then count down): Never handed off early. At a limit it waits while you are using Orca, then hands off after a short countdown that you can cancel. wait (Wait for me): Stays until you switch to another tab or press Hand off now. now (Move right away): No waiting: it hands off as soon as it is between turns, early hand-offs included, like sessions in other tabs."
       },
       {
+        "key": "direct_quota",
+        "title": "Live quota",
+        "type": "boolean",
+        "default": true,
+        "description": "Fills the gaps in Orca's usage readings. Orca reads only the account in use, and only while you are using Orca; when its reading of an account is missing or old, OAH asks the provider directly, with the sign-in Orca saved for it (Claude at most every 15 minutes, the others every 10), so accounts not in use and the time you are away stay current too. Off: usage comes only from Orca. Not every service can: Antigravity only for the account signed in to Antigravity on this Mac, OpenCode only with OpenCode Go, and never for an agent's own login."
+      },
+      {
+        "key": "console_statusline",
+        "title": "Claude status line",
+        "type": "boolean",
+        "default": true,
+        "description": "Shows each account's usage at the bottom of Claude Code, in every workspace on this computer. A status line you already had keeps showing, with these rows below it. It goes in each workspace's .claude/settings.local.json; turning it off puts back what was there."
+      },
+      {
         "key": "away_minutes",
         "title": "Advanced: Start early hand-offs after you've been away",
         "type": "number",
@@ -282,13 +296,6 @@
         "type": "string",
         "default": "",
         "description": "An optional first line of the Claude status line. Empty = account rows only. In the panel: under the Claude Status line switch."
-      },
-      {
-        "key": "exclude",
-        "title": "Advanced: Skipped accounts",
-        "type": "string",
-        "default": "",
-        "description": "Accounts never chosen automatically, separated by commas: an account (work@example.com), or one of a service (claude:work@example.com). In the panel: the Skip switch on each account card."
       },
       {
         "key": "chain",

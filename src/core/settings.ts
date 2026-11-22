@@ -4,7 +4,7 @@
 
 export type Choice = { value: string; label: string; help: string }
 /** Shown only while another setting has this value (otherwise greyed out, with why). */
-type When = { key: string; is: string | readonly string[]; why: string }
+type When = { key: string; is: string | boolean | readonly string[]; why: string }
 type Base = { key: string; title: string; help: string; when?: When }
 export type SettingSpec =
   | (Base & { kind: 'choice'; default: string; options: Choice[] })
@@ -69,7 +69,9 @@ export const BASIC_SETTINGS: SettingSpec[] = [
       { value: 'wait', label: 'Wait for me', help: 'Stays until you switch to another tab or press Hand off now.' },
       { value: 'now', label: 'Move right away', help: 'No waiting: it hands off as soon as it is between turns, early hand-offs included, like sessions in other tabs.' }
     ]
-  }
+  },
+  { key: 'direct_quota', title: 'Live quota', kind: 'boolean', default: true, help: "Fills the gaps in Orca's usage readings. Orca reads only the account in use, and only while you are using Orca; when its reading of an account is missing or old, OAH asks the provider directly, with the sign-in Orca saved for it (Claude at most every 15 minutes, the others every 10), so accounts not in use and the time you are away stay current too. Off: usage comes only from Orca. Not every service can: Antigravity only for the account signed in to Antigravity on this Mac, OpenCode only with OpenCode Go, and never for an agent's own login." },
+  { key: 'console_statusline', title: 'Claude status line', kind: 'boolean', default: true, help: "Shows each account's usage at the bottom of Claude Code, in every workspace on this computer. A status line you already had keeps showing, with these rows below it. It goes in each workspace's .claude/settings.local.json; turning it off puts back what was there." }
 ]
 
 /** Fine-tuning, folded away in the panel. */
@@ -104,15 +106,14 @@ export const ADVANCED_SETTINGS: SettingSpec[] = [
   { key: 'orca_cli_path', title: 'Orca CLI path', kind: 'text', default: '', placeholder: 'found automatically', help: 'Only if the orca command is not found by itself.' }
 ]
 
-/** Shown with the Claude status line switch in the Settings tab. */
+/** The Claude status line's optional header line: not in the panel's Settings tab (kept for anyone
+ *  who set one; set with `oah settings` or on Orca's Settings page). */
 export const STATUS_LINE_SETTINGS: SettingSpec[] = [
-  { key: 'console_statusline_format', title: 'Status line header', kind: 'text', default: '', placeholder: '{model} │ ctx {ctxbar} │ 5h reset {reset}', help: 'An optional first line of the Claude status line. Empty = account rows only.' }
+  { key: 'console_statusline_format', title: 'Status line header', kind: 'text', default: '', placeholder: '{model} │ ctx {ctxbar} │ 5h reset {reset}', help: 'An optional first line of the Claude status line. Empty = account rows only.', when: { key: 'console_statusline', is: true, why: 'Only used when Claude status line is on.' } }
 ]
 
-/** Settings with a control of their own elsewhere in the panel, not in the Settings tab:
- *  `exclude` is the "Skip" switch on each account card. */
+/** Settings with a control of their own elsewhere in the panel, not in the Settings tab (none now). */
 export const HIDDEN_SETTINGS: SettingSpec[] = [
-  { key: 'exclude', title: 'Skipped accounts', kind: 'text', default: '', placeholder: 'claude:work@example.com', help: 'Accounts never chosen automatically, separated by commas: an account (work@example.com), or one of a service (claude:work@example.com).' }
 ]
 
 export const ALL_SETTINGS: SettingSpec[] = [...BASIC_SETTINGS, ...ADVANCED_SETTINGS, ...STATUS_LINE_SETTINGS, ...HIDDEN_SETTINGS]

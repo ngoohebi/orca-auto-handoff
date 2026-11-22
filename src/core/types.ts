@@ -259,7 +259,6 @@ export type Config = {
    *  preferred seat. 0 = off. */
   autoSwapIdleAfterSeconds: number
   /** Comma-separated seats never switched *to* automatically (same tokens as `chain`). */
-  exclude: string
   autoMessage: string
   waitForReset: boolean
   retryOnApiError: boolean
@@ -296,6 +295,9 @@ export type Config = {
   /** Per-workspace or per-terminal explicit account pins (`workspaceId|terminalId` -> `seatKey`). */
   pins: Record<string, string>
   quotaLinks: string[]
+  /** Live quota: ask each saved account's provider for its usage directly (the `direct_quota`
+   *  setting). Off: usage comes from Orca only, and no direct check is made. */
+  directQuota: boolean
   /** Set while the settings cannot be trusted, so every service counts as off whatever was chosen
    *  (worker.ts `configReader`): `settings` = Orca could not be asked for them yet, `upgrade` = the
    *  settings of an older version are not carried over yet. The panel says so. */
@@ -325,7 +327,6 @@ export const DEFAULT_CONFIG: Config = {
   switchCooldownMinutes: 5,
   minHeadroomGap: 10,
   autoSwapIdleAfterSeconds: 900,
-  exclude: '',
   autoMessage: 'Continue.',
   waitForReset: true,
   retryOnApiError: true,
@@ -346,7 +347,8 @@ export const DEFAULT_CONFIG: Config = {
   awayMinutes: 10,
   modelWindowPolicy: 'fallback-model',
   pins: {},
-  quotaLinks: []
+  quotaLinks: [],
+  directQuota: true
 }
 
 /** Auto (`pick: smart`) with the thresholds of Early when away, for tests. */
@@ -414,8 +416,6 @@ export type Snapshot = {
     quotaLinked?: boolean
     cooldownUntil?: number
     cooldownReason?: string
-    /** Never chosen automatically (the "Skip" switch, the `exclude` setting). */
-    excluded?: boolean
     /** How long until the first window is used up at the current pace (usage-history.ts); absent
      *  when the pace is unknown. Observed only: nothing switches on it yet. */
     runwayMs?: number

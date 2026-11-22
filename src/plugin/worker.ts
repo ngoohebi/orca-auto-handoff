@@ -176,7 +176,6 @@ export async function activateThin(orca: OrcaWorkerApi, opts: ThinWorkerOptions 
   orca.panels.handle('rotator.setService', (input) => rpc('setService', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.settings', (input) => rpc('settings', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.moveSeat', (input) => rpc('moveSeat', (input ?? {}) as Record<string, unknown>))
-  orca.panels.handle('rotator.setExcluded', (input) => rpc('setExcluded', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.clearCooldown', (input) => rpc('clearCooldown', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.switchTo', (input) => rpc('switchTo', (input ?? {}) as Record<string, unknown>, 60_000))
   orca.panels.handle('rotator.focus', () => rpc('focus', {}))

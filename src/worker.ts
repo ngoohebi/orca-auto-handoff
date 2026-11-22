@@ -121,7 +121,6 @@ export function configFrom(s: Record<string, unknown>): Config {
     waitForReset: v.when_all_used !== 'stop',
     switchCooldownMinutes: num('switch_cooldown_minutes'),
     minHeadroomGap: d.minHeadroomGap,
-    exclude: str('exclude'),
     autoMessage: str('auto_message'),
     retryOnApiError: num('max_api_retries') > 0,
     maxApiRetries: num('max_api_retries'),
@@ -139,6 +138,7 @@ export function configFrom(s: Record<string, unknown>): Config {
     presenceSeconds: num('active_presence_seconds'),
     reminderMinutes: num('active_reminder_minutes'),
     restoreUnsent: v.restore_unsent_text as boolean,
+    directQuota: v.direct_quota !== false,
     awayMinutes: num('away_minutes'),
     services: Object.fromEntries(PROVIDERS.map((p) => [p, typeof s[`service_${p}`] === 'boolean' ? s[`service_${p}`] : d.services[p]])) as Config['services']
   }
@@ -514,8 +514,8 @@ export async function activateWith(
     }
     return panelSettings()
   })
-  /** The order and the Skip list are each one setting that is read, changed and written back: one
-   *  such change at a time, so two quick presses never start from the same list and lose one. */
+  /** The account order is one setting that is read, changed and written back: one such change
+   *  at a time, so two quick presses never start from the same list and lose one. */
   let listChange: Promise<unknown> = Promise.resolve()
   const inTurn = <T>(change: () => Promise<T>): Promise<T> => {
     const run = listChange.then(change, change)
@@ -555,42 +555,16 @@ export async function activateWith(
   })
   orca.panels.handle('rotator.switchTo', async ({ seatKey, acceptDraft, draft: shown }) => {
     if (typeof seatKey !== 'string') throw invalid('seatKey is required')
-    // A choice made by hand must not be undone by the plugin: automatic hand-off for the service
-    // stops as soon as the account is selected (before any automatic move that waits behind it
-    // can run), and the user turns it on again when they want automatic hand-offs back.
+    // An early hand-off by hand: automatic hand-off stays on and goes on by its usual rules.
     rotator.notePresence()
-    let turnedOff = false
     // Unsent text is given up only by the panel's second confirmation, which names the text it
     // showed: `acceptDraft` must be exactly `true`, and without the text nothing is accepted.
     const accepted = acceptDraft === true && typeof shown?.terminalId === 'string' && typeof shown?.text === 'string' ? { terminalId: shown.terminalId, text: shown.text } : undefined
-    const { message, switched, provider, draft } = await rotator.forceTo(
-      seatKey,
-      async (chosen) => {
-        if (rotator.held) {
-          // Every service only counts as off (the settings are held): the choice is still kept
-          // for when the hold ends, as far as Orca takes it. The hand-off by hand goes on either way.
-          try {
-            if ((await orca.settings.get(`service_${chosen}`)) === false) return
-            await store(`service_${chosen}`, false)
-          } catch {
-            return
-          }
-        } else {
-          if (rotator.services[chosen] === false) return
-          await store(`service_${chosen}`, false)
-        }
-        await rotator.refreshServices(false)
-        turnedOff = true
-      },
-      accepted
-    )
+    const { message, switched, draft } = await rotator.forceTo(seatKey, undefined, accepted)
     // The pane shows unsent text that cannot go along: nothing was handed off, the panel asks.
     if (draft !== undefined) return { message, draft }
-    if (!switched || !turnedOff) return { message }
-    rotator.publishNow()
-    const off = `${PROVIDER_NAME[provider]}: automatic hand-off is now off, because you chose an account yourself. Turn it on again in the panel.`
-    void orca.host.call('notifications.show', { title: 'Auto Hand-off', body: off }).catch(() => undefined)
-    return { message: `${message}. ${off}` }
+    if (switched) rotator.publishNow()
+    return { message }
   })
   orca.panels.handle('rotator.focus', async () => {
     if (await rotator.refreshFocus()) rotator.publishNow()
@@ -607,16 +581,6 @@ export async function activateWith(
     rotator.notePresence()
     const message = await rotator.handoffNow(terminalId)
     return message ? { ok: true as const, message } : { ok: true as const }
-  })
-  orca.panels.handle('rotator.setExcluded', async ({ seatKey, excluded }) => {
-    if (typeof seatKey !== 'string' || typeof excluded !== 'boolean') throw invalid('seatKey and excluded are required')
-    rotator.notePresence()
-    await inTurn(async () => {
-      await store('exclude', await rotator.excludedChanged(seatKey, excluded))
-      // As for the order: the Skip switch is drawn from the settings as the engine last read them.
-      await rotator.refreshServices()
-    })
-    return { ok: true as const }
   })
   orca.panels.handle('rotator.declineHandoff', async ({ terminalId }) => {
     if (typeof terminalId !== 'string') throw invalid('terminalId is required')

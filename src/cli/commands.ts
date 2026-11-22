@@ -146,12 +146,6 @@ export async function runCli(
         const res = await client.call('setService', { provider, enabled })
         return ok(`${provider}: automatic hand-off ${enabled ? 'on' : 'off'}`, res)
       }
-      case 'skip': {
-        const seat = resolveSeat(await snap(), words[1])
-        const excluded = parseOnOff(words[2], true)
-        await client.call('setExcluded', { seatKey: seat.key, excluded })
-        return ok(`${seat.label}: ${excluded ? 'skipped by automatic hand-off' : 'no longer skipped'}`, { seatKey: seat.key, excluded })
-      }
       case 'clear': {
         const seat = resolveSeat(await snap(), words[1])
         await client.call('clearCooldown', { seatKey: seat.key })

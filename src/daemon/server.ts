@@ -127,10 +127,28 @@ export class OahDaemon {
     })
   }
 
+  /** The `console_statusline` setting, applied: the wrapper in, or out of, every workspace on
+   *  this computer. Only a change of the setting removes it, never startup or a focus change. */
+  private async applyStatusLine(on: boolean): Promise<string> {
+    try {
+      const said = on ? await this.consoleLine.installEverywhere() : await this.consoleLine.uninstallEverywhere()
+      this.log(said)
+      const line = await this.consoleLine.status().catch(() => null)
+      if (line) this.broadcast('consoleLine', line)
+      return said
+    } catch (error) {
+      const said = `Claude status line: ${String((error as Error)?.message ?? error)}`
+      this.log(said)
+      return said
+    }
+  }
+
   async start(): Promise<void> {
     this.store.ensureDir()
     this.store.removeStaleSocket(this.sockPath)
     await this.rotator.init()
+    // On: workspaces added while the daemon was down get the status line too.
+    if (this.store.settingValues().console_statusline === true) void this.applyStatusLine(true)
 
     await new Promise<void>((resolve, reject) => {
       const srv = createServer((socket) => this.onConnection(socket))
@@ -364,6 +382,7 @@ export class OahDaemon {
         if (p.key !== undefined) {
           this.rotator.notePresence()
           const values = this.store.setSetting(String(p.key), p.value)
+          if (p.key === 'console_statusline') await this.applyStatusLine(values.console_statusline === true)
           await this.rotator.refreshServices()
           this.consoleLine.invalidate()
           this.rotator.publishNow()
@@ -385,18 +404,6 @@ export class OahDaemon {
         })
         return { ok: true }
       }
-      case 'setExcluded': {
-        if (typeof p.seatKey !== 'string' || typeof p.excluded !== 'boolean') {
-          throw new Error('seatKey and excluded (boolean) are required')
-        }
-        this.rotator.notePresence()
-        await this.inTurn(async () => {
-          const exclude = await this.rotator.excludedChanged(p.seatKey, p.excluded)
-          this.store.setSetting('exclude', exclude)
-          await this.rotator.refreshServices()
-        })
-        return { ok: true }
-      }
       case 'clearCooldown': {
         if (typeof p.seatKey !== 'string') throw new Error('seatKey is required')
         this.rotator.notePresence()
@@ -410,22 +417,11 @@ export class OahDaemon {
           p.acceptDraft === true && typeof p.draft?.terminalId === 'string' && typeof p.draft?.text === 'string'
             ? { terminalId: p.draft.terminalId, text: p.draft.text }
             : undefined
-        let turnedOff = false
-        const { message, switched, provider, draft } = await this.rotator.forceTo(
-          p.seatKey,
-          async (chosen) => {
-            if (this.rotator.services[chosen] === false) return
-            this.store.setSetting(`service_${chosen}`, false)
-            await this.rotator.refreshServices(false)
-            turnedOff = true
-          },
-          accepted
-        )
+        // An early hand-off by hand: automatic hand-off stays on and goes on by its usual rules.
+        const { message, switched, draft } = await this.rotator.forceTo(p.seatKey, undefined, accepted)
         if (draft !== undefined) return { message, draft }
-        if (!switched || !turnedOff) return { message }
-        this.rotator.publishNow()
-        const off = `${PROVIDER_NAME[provider]}: automatic hand-off is now off, because you chose an account yourself.`
-        return { message: `${message}. ${off}` }
+        if (switched) this.rotator.publishNow()
+        return { message }
       }
       case 'handoff': {
         this.rotator.notePresence()
@@ -464,10 +460,12 @@ export class OahDaemon {
       case 'consoleLine': {
         if (typeof p.enabled !== 'boolean') return this.consoleLine.status()
         this.rotator.notePresence()
-        const message = p.enabled ? await this.consoleLine.install() : await this.consoleLine.uninstall()
-        const state = await this.consoleLine.status()
-        this.broadcast('consoleLine', state)
-        return { ...state, message }
+        // The status line is one setting for every workspace: `oah statusline install` turns it on.
+        const values = this.store.setSetting('console_statusline', p.enabled)
+        this.broadcast('settings', values)
+        const said = await this.applyStatusLine(p.enabled)
+        const now = await this.consoleLine.status()
+        return { ...now, message: said }
       }
       case 'history': {
         const snap: Snapshot = this.rotator.snapshot()
@@ -482,6 +480,10 @@ export class OahDaemon {
       case 'event.workspace': {
         this.rotator.notePresence()
         if (await this.rotator.refreshFocus()) this.rotator.publishNow()
+        // A workspace opened since the status line was turned on gets it too.
+        if (this.store.settingValues().console_statusline === true) {
+          await this.consoleLine.ensureFocused().catch((error: Error) => this.log(`console status line: ${error.message}`))
+        }
         const line = await this.consoleLine.status().catch(() => null)
         if (line) this.broadcast('consoleLine', line)
         return { ok: true }
