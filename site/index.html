@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OAH v0.5 — Orca Auto Hand-off: CLI-First Daemon, Local Failover Proxy &amp; Thin Orca Panel</title>
-<meta name="description" content="OAH (Orca Auto Hand-off): CLI-first automatic account hand-off daemon (oah / oahd), optional local HTTP failover proxy, formal 3-state circuit breaker, and thin Orca sidebar panel for Claude, Codex, Antigravity, OpenCode and Devin.">
-<meta property="og:title" content="OAH v0.5 — Orca Auto Hand-off">
-<meta property="og:description" content="Hit a rate limit? Auto-switch to your next account and keep working. Zero-dependency CLI + daemon + optional HTTP failover proxy + thin Orca panel.">
+<title>OAH — Orca Auto Hand-off: CLI-First Daemon, Direct Live Quota &amp; Quiet Orca Panel</title>
+<meta name="description" content="OAH (Orca Auto Hand-off): CLI-first automatic account hand-off daemon (oah / oahd), direct live quota checks across Claude, Codex, Antigravity, OpenCode Go &amp; Devin, optional local HTTP failover proxy, and a quiet Orca sidebar panel.">
+<meta property="og:title" content="OAH — Orca Auto Hand-off">
+<meta property="og:description" content="Hit a rate limit? Auto-switch to your next account and keep working. Zero-dependency CLI + daemon + direct live quota + optional HTTP failover proxy + quiet Orca panel.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://ngoohebi.github.io/orca-auto-handoff/">
 <meta name="theme-color" content="#0f1115">
@@ -99,25 +99,26 @@ nav ul a:hover{color:var(--fg);text-decoration:none}
 @media (max-width:900px){.hero .wrap{grid-template-columns:1fr}.hero{padding:48px 0 40px}}
 
 .panel{background:var(--bg-2);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:16px;font-size:.84rem;max-width:420px;margin:0 auto;width:100%}
-.panel .ph{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:1rem;margin-bottom:10px}
-.panel .ph span{font-weight:500;font-size:.78rem;color:var(--fg-2)}
+.panel .ph{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:.95rem;margin-bottom:6px}
+.panel .state{color:var(--ok);font-size:.76rem;font-weight:500}
 .row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .toggle{width:34px;height:18px;border-radius:999px;background:var(--fg);position:relative;flex:none}
 .toggle::after{content:"";position:absolute;top:3px;right:3px;width:12px;height:12px;border-radius:50%;background:var(--bg-2)}
-.tabs{display:flex;gap:14px;border-bottom:1px solid var(--line);margin:12px 0 14px;color:var(--fg-3)}
+.tabs{display:flex;gap:16px;border-bottom:1px solid var(--line);margin:12px 0 14px;color:var(--fg-3)}
 .tabs b{color:var(--fg);font-weight:600;border-bottom:2px solid var(--fg);padding-bottom:6px}
 .tabs span{padding-bottom:6px}
-.card{background:var(--bg-3);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
-.card:last-child{margin-bottom:0}
-.card h4{margin:0 0 2px;font-size:.92rem;font-weight:600}
-.card .sub{color:var(--fg-3);margin-bottom:10px}
-.acct{margin-top:10px}
-.acct .row{margin-bottom:5px}
+.svc{padding:10px 0;border-top:1px solid var(--line)}
+.svc:first-of-type{border-top:0;padding-top:0}
+.svc-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.svc-head h4{margin:0;font-size:.88rem;font-weight:600}
+.svc-head small{color:var(--fg-3);font-size:.74rem}
+.acct{padding:8px 0;border-top:1px solid color-mix(in srgb,var(--line) 65%,transparent)}
+.acct:first-of-type{border-top:0;padding-top:0}
 .pill{font-size:.72rem;border:1px solid var(--line-2);border-radius:999px;padding:1px 8px;color:var(--fg-2);display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
 .pill.on::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok)}
 .pill.cool{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 50%,var(--line-2))}
-.meter{color:var(--fg-3);font-size:.76rem;margin-top:4px}
-.bar{height:6px;background:var(--line);border-radius:999px;overflow:hidden;margin-top:3px}
+.meter{color:var(--fg-3);font-size:.75rem;margin-top:4px}
+.bar{height:5px;background:var(--line);border-radius:999px;overflow:hidden;margin-top:3px}
 .bar i{display:block;height:100%;background:var(--fg-2);border-radius:999px}
 .bar i.w{background:var(--warn)}.bar i.d{background:var(--danger)}
 
@@ -183,9 +184,9 @@ footer a{color:var(--fg-2)}
     </a>
     <ul>
       <li><a href="#arch">Architecture</a></li>
-      <li><a href="#features">v0.5 Features</a></li>
+      <li><a href="#quota">Direct Quota</a></li>
+      <li><a href="#features">Features</a></li>
       <li><a href="#cli">CLI</a></li>
-      <li><a href="#proxy">HTTP Proxy</a></li>
       <li><a href="#safety">Safety</a></li>
       <li><a href="#install">Install</a></li>
     </ul>
@@ -204,14 +205,14 @@ footer a{color:var(--fg-2)}
 <section class="hero">
   <div class="wrap">
     <div>
-      <div class="eyebrow">CLI-First Daemon + Local Failover Proxy + Thin Orca Panel</div>
+      <div class="eyebrow">CLI-First Daemon · Direct Live Quota · Quiet Orca Panel</div>
       <h1>Hit a rate limit? <span>Auto-switch to your next account.</span></h1>
-      <p class="lede"><b>OAH (Orca Auto Hand-off)</b> pools Orca-managed accounts across <b>Claude, Codex, Antigravity, OpenCode, and Devin</b> — powered by a zero-dependency <code>oahd</code> daemon, a formal 3-state circuit breaker, an optional local HTTP failover proxy for API-key relays, and a thin Orca sidebar panel always attached to your current session.</p>
+      <p class="lede"><b>OAH (Orca Auto Hand-off)</b> pools Orca-managed accounts across <b>Claude, Codex, Antigravity, OpenCode, and Devin</b> — powered by a zero-dependency <code>oahd</code> daemon, automatic direct live quota checks, a 3-state circuit breaker, an optional local HTTP failover proxy, and a quiet 3-tab Orca panel.</p>
       <div class="badges">
         <span class="badge">v<b>0.5.0</b></span>
         <span class="badge">Node <b>≥ 22.18</b> · zero deps</span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
-        <span class="badge"><b>420</b> tests passing</span>
+        <span class="badge"><b>Live quota</b> on by default</span>
         <span class="badge"><b>MIT</b> license</span>
       </div>
       <div class="cta">
@@ -221,28 +222,26 @@ footer a{color:var(--fg-2)}
       <div class="cmd"><span class="dollar">$</span><span class="c">oah status --json</span><button class="copy" data-copy="oah status --json">Copy</button></div>
     </div>
 
-    <div class="panel" aria-label="The OAH panel">
-      <div class="ph">OAH <span>● Auto · Early when away · on</span></div>
-      <div class="row"><span>Automatic hand-off</span><span class="toggle"></span></div>
-      <div class="tabs"><b>Accounts</b><span>Proxy</span><span>History (14)</span><span>Settings</span></div>
-      <div class="card">
-        <h4>Claude · on screen</h4>
-        <div class="sub">2 of 3 ready · 1 half-open</div>
+    <div class="panel" aria-label="The redesigned quiet OAH panel">
+      <div class="row" style="margin-bottom:6px"><strong>Automatic hand-off</strong><span class="toggle"></span></div>
+      <div class="row"><span class="state">Auto · Early when away · on</span><span style="color:var(--fg-3);font-size:.75rem">just now ↻</span></div>
+      <div class="tabs"><b>Accounts</b><span>History</span><span>Settings</span></div>
+      <div class="svc">
+        <div class="svc-head"><h4>Claude · on screen</h4><small>2 of 3 ready</small></div>
         <div class="acct">
-          <div class="row"><span>you@example.com</span><span class="pill on">active · closed</span></div>
+          <div class="row"><span>you@example.com</span><span class="pill on">active</span></div>
           <div class="meter">5h 24% used · resets 3h40m</div><div class="bar"><i style="width:24%"></i></div>
-          <div class="meter">Week 14% used</div><div class="bar"><i style="width:14%"></i></div>
+          <div class="meter">Week 14% used · live quota</div><div class="bar"><i style="width:14%"></i></div>
         </div>
         <div class="acct">
           <div class="row"><span>work@example.com</span><span class="pill cool">half-open</span></div>
-          <div class="meter">5h 88% used</div><div class="bar"><i class="w" style="width:88%"></i></div>
+          <div class="meter">5h 88% used · week 42% used</div><div class="bar"><i class="w" style="width:88%"></i></div>
         </div>
       </div>
-      <div class="card">
-        <h4>Codex</h4>
-        <div class="sub">2 of 2 ready · ordinaryUsageAllowed</div>
+      <div class="svc">
+        <div class="svc-head"><h4>Codex</h4><small>2 of 2 ready</small></div>
         <div class="acct">
-          <div class="row"><span>team@example.com</span><span class="pill on">active · closed</span></div>
+          <div class="row"><span>team@example.com</span><span class="pill on">active</span></div>
           <div class="meter">5h 10% used · week 3% used</div><div class="bar"><i style="width:10%"></i></div>
         </div>
       </div>
@@ -254,26 +253,48 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <div class="sec-head">
       <div class="eyebrow">Architecture</div>
-      <h2>One daemon per host. One session per workspace.</h2>
-      <p class="lede">Every machine runs its own independent <code>oahd</code> daemon under <code>~/.orca/oah/</code>. The <code>oah</code> CLI and the thin Orca plugin both speak the same NDJSON protocol — eliminating multi-server routing complexity and keeping CLI, scripts, and GUI 100% in sync.</p>
+      <h2>One daemon per host. CLI-first, quiet UI on top.</h2>
+      <p class="lede">Every machine runs its own independent <code>oahd</code> daemon under <code>~/.orca/oah/</code>. The <code>oah</code> CLI and the thin Orca plugin both speak the same NDJSON protocol — so terminal scripts, headless servers, and the desktop panel share one source of truth.</p>
     </div>
     <div class="grid g4">
       <div class="tile default">
         <h3><code>oahd</code> Daemon <span class="tag">~/.orca/oah/</span></h3>
-        <p>Owns state, config, burn-rate history, circuit breakers, and hand-off orchestration. Atomic <code>0600</code> JSON files, auto-started on demand.</p>
+        <p>Owns state, config, burn-rate samples, direct quota checks, circuit breakers, and hand-off orchestration. Atomic <code>0600</code> JSON files, auto-started on demand.</p>
       </div>
       <div class="tile">
         <h3><code>oah</code> CLI <span class="tag">bin/oah</span></h3>
         <p>First-class CLI with <code>--json</code> on every command. Works locally, over SSH, or on headless <code>orca serve</code> hosts without needing the UI panel.</p>
       </div>
       <div class="tile">
-        <h3>Thin Orca Plugin <span class="tag">worker.ts</span></h3>
-        <p>Zero business logic. Connects to <code>oahd.sock</code>, relays host events, exposes native Claude <code>agent.resume</code>, and renders the 4-tab OAH panel.</p>
+        <h3>Quiet Orca Panel <span class="tag">3 tabs</span></h3>
+        <p>Thin bridge with zero business logic. Connects to <code>oahd.sock</code>, provides native Claude <code>agent.resume</code>, and renders monochrome <b>Accounts</b>, <b>History</b>, and <b>Settings</b> tabs.</p>
       </div>
       <div class="tile">
         <h3>HTTP Proxy <span class="tag">opt-in</span></h3>
-        <p>Optional <code>127.0.0.1:4080</code> failover proxy for Anthropic &amp; OpenAI API-key/relay endpoints with SSE streaming and latency benchmarking.</p>
+        <p>Optional <code>127.0.0.1:4080</code> failover proxy (<code>oah proxy start</code>) for Anthropic &amp; OpenAI API-key/relay endpoints with SSE streaming and <code>oah bench</code>.</p>
       </div>
+    </div>
+  </div>
+</section>
+
+<section id="quota">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Direct Live Quota</div>
+      <h2>Current numbers for every saved account — even while you're away</h2>
+      <p class="lede">Orca only polls the active account while you are using Orca. With <b>Live quota</b> on (the default), OAH fills missing or stale readings directly from each provider using the sign-in Orca already saved — never copying tokens or writing the Keychain.</p>
+    </div>
+    <div class="tscroll">
+      <table class="tbl">
+        <thead><tr><th>Provider</th><th>Direct Quota Source</th><th>Cadence &amp; Safeguards</th></tr></thead>
+        <tbody>
+          <tr><td>Claude</td><td>OAuth profile identity verification → Anthropic usage API</td><td>At most every 15 min. Expired sign-ins run Claude Code's own <code>claude -p /usage</code> so Claude Code renews them cleanly.</td></tr>
+          <tr><td>Codex</td><td><code>codex app-server</code> → <code>account/rateLimits/read</code> per managed <code>CODEX_HOME</code></td><td>At most every 10 min. Verified by backend <code>accountId</code>; gates on <code>ordinaryUsageAllowed</code> (ignoring <code>codex_bengalfox</code>).</td></tr>
+          <tr><td>Antigravity</td><td>Google identity verification → Cloud Code quota API</td><td>Direct check for the account signed in on this Mac; falls back to Orca's cached readings for other saved profiles.</td></tr>
+          <tr><td>OpenCode Go</td><td>OpenCode Go usage API</td><td>Includes rolling, weekly, and monthly windows.</td></tr>
+          <tr><td>Devin</td><td>Devin status API</td><td>Reports daily (<code>day</code>) and weekly (<code>week</code>) windows.</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </section>
@@ -281,9 +302,8 @@ footer a{color:var(--fg-2)}
 <section id="features">
   <div class="wrap">
     <div class="sec-head">
-      <div class="eyebrow">What's New in v0.5.0</div>
-      <h2>Hardened by real-world fleet usage</h2>
-      <p class="lede">Incorporates battle-tested reliability patterns from Orca's multi-account community (<code>#20512</code>) and local proxy HA workflows.</p>
+      <div class="eyebrow">Reliability &amp; Controls</div>
+      <h2>Built for long-running agent fleets</h2>
     </div>
     <div class="grid g3">
       <div class="tile">
@@ -291,12 +311,8 @@ footer a{color:var(--fg-2)}
         <p>Formal <code>closed → open → half_open → closed</code> state machine shared by subscription accounts and proxy providers. Healthy <code>closed</code> accounts always outrank recovering <code>half_open</code> ones.</p>
       </div>
       <div class="tile">
-        <h3>Codex <code>ordinaryUsageAllowed</code> Gate</h3>
-        <p>Never fooled by the <code>codex_bengalfox</code> Spark bucket sitting at 0% when ordinary Codex quota is exhausted. Expired logins map cleanly to <code>sign-in</code> instead of looping.</p>
-      </div>
-      <div class="tile">
         <h3>Nested-Window Pacing</h3>
-        <p>Computes whole-window projection (<code>usedPercent / elapsedFraction</code>, guarded at ≥5% elapsed) across 5h, weekly, and model windows alongside 2-sample burn-rate runway.</p>
+        <p>Combines 2-sample burn-rate runway with whole-window projection (<code>usedPercent / elapsedFraction</code>, guarded at ≥5% elapsed) across 5h, weekly, and model windows.</p>
       </div>
       <div class="tile">
         <h3>Model-Window Policy</h3>
@@ -304,11 +320,15 @@ footer a{color:var(--fg-2)}
       </div>
       <div class="tile">
         <h3>Per-Workspace Pinning</h3>
-        <p>Run <code>oah pin &lt;workspace|terminal&gt; &lt;account&gt;</code> to lock dedicated long-running sessions onto one account while the rest of your fleet rotates freely.</p>
+        <p>Run <code>oah pin &lt;workspace|terminal&gt; &lt;account&gt;</code> to lock dedicated sessions onto one account while the rest of your fleet rotates automatically.</p>
       </div>
       <div class="tile">
-        <h3>Instant <code>StopFailure</code> Hook + Live Probes</h3>
-        <p>Zero-regex Claude limit detection via <code>oah event stop-failure</code>, plus fallback probes for <code>codex app-server</code>, free <code>claude -p "/usage"</code>, and OpenCode Go.</p>
+        <h3>Claude Status Line (One Toggle)</h3>
+        <p>On by default in Settings across every workspace on this computer. Preserves any existing status line and prints OAH's live multi-account bars beneath it (~40 ms, no CLI calls).</p>
+      </div>
+      <div class="tile">
+        <h3>Instant <code>StopFailure</code> Hook</h3>
+        <p>Zero-regex Claude limit detection via <code>oah event stop-failure</code> — catches limits immediately on both Terminal and Chat sessions.</p>
       </div>
     </div>
   </div>
@@ -322,7 +342,7 @@ footer a{color:var(--fg-2)}
     </div>
     <div class="trace">
       <div class="term">
-        <div class="t">Accounts, Pinning &amp; Active Query</div>
+        <div class="t">Accounts, Pinning &amp; Settings</div>
         <div><span class="dim">$</span> <span class="k">oah status</span> <span class="dim"># usage, runway, cooldowns, circuit</span></div>
         <div><span class="dim">$</span> <span class="k">oah active</span> claude --json</div>
         <div><span class="dim">$</span> <span class="k">oah use</span> work@example.com</div>
@@ -331,7 +351,7 @@ footer a{color:var(--fg-2)}
         <div><span class="dim">$</span> <span class="k">oah sync export</span> &gt; oah-config.json</div>
       </div>
       <div class="term">
-        <div class="t">Local HTTP Proxy, Providers &amp; Bench</div>
+        <div class="t">Optional HTTP Proxy &amp; Bench</div>
         <div><span class="dim">$</span> <span class="k">oah provider add</span> anthropic Primary https://api.anthropic.com sk-…</div>
         <div><span class="dim">$</span> <span class="k">oah provider add</span> anthropic Backup https://relay.example.com sk-…</div>
         <div><span class="dim">$</span> <span class="k">oah bench</span></div>
@@ -339,27 +359,6 @@ footer a{color:var(--fg-2)}
         <div><span class="y">340ms [ok]</span>    Backup (anthropic)</div>
         <div><span class="dim">$</span> <span class="k">oah proxy start</span> --port 4080</div>
       </div>
-    </div>
-  </div>
-</section>
-
-<section id="proxy">
-  <div class="wrap">
-    <div class="sec-head">
-      <div class="eyebrow">Dual-Plane Failover</div>
-      <h2>Subscription hand-offs + optional API-key HTTP proxy</h2>
-      <p class="lede">Use Orca-managed subscription accounts for session hand-off/resume, or enable the opt-in local HTTP proxy for mid-turn zero-interruption failover across API-key relays — both managed from the same CLI and OAH Panel.</p>
-    </div>
-    <div class="tscroll">
-      <table class="tbl">
-        <thead><tr><th>Capability</th><th>Subscription Plane (Default ON)</th><th>Local HTTP Proxy Plane (Opt-In)</th></tr></thead>
-        <tbody>
-          <tr><td>Accounts</td><td>Orca-managed Claude, Codex, Antigravity, OpenCode, Devin (never reads tokens)</td><td>API keys &amp; third-party relays in <code>~/.orca/oah/providers.json</code> (<code>0600</code>)</td></tr>
-          <tr><td>Failover point</td><td>Between turns / at rate limit / early when away / <code>StopFailure</code> hook</td><td>Mid-request on HTTP <code>429</code>, <code>5xx</code>, <code>529</code>, or timeout before stream starts</td></tr>
-          <tr><td>Recovery</td><td>Claude exact <code>agent.resume</code> + draft restore; summary hand-off for others</td><td>Transparent SSE stream retry with optional <code>modelMap</code> rewriting</td></tr>
-          <tr><td>Circuit breaker</td><td>Shared 3-state (<code>closed</code> / <code>open</code> / <code>half_open</code>)</td><td>Shared 3-state with exponential backoff &amp; <code>Retry-After</code></td></tr>
-        </tbody>
-      </table>
     </div>
   </div>
 </section>
@@ -383,9 +382,9 @@ footer a{color:var(--fg-2)}
       <div class="tile">
         <h3>Zero-Trust Local Footprint</h3>
         <ul class="check">
-          <li><b>Never touches subscription tokens or keychains:</b> delegates all selection to <code>orca account select</code>.</li>
-          <li><b>Private owner-only storage:</b> <code>~/.orca/oah/</code> is mode <code>0700</code>, files mode <code>0600</code>; <code>oah sync export</code> redacts API keys automatically.</li>
-          <li><b>No shell interpolation:</b> runs <code>orca</code> and <code>git</code> via argument arrays only.</li>
+          <li><b>Credentials stay with Orca:</b> never writes the Keychain, never copies subscription tokens, delegates account switches to <code>orca account select</code>.</li>
+          <li><b>Owner-only local storage:</b> <code>~/.orca/oah/</code> is mode <code>0700</code>, files mode <code>0600</code>; <code>oah sync export</code> redacts API keys automatically.</li>
+          <li><b>No shell interpolation:</b> runs external CLIs via argument arrays only.</li>
           <li><b>Zero npm dependencies:</b> pure TypeScript running natively on Node.js ≥ 22.18.</li>
         </ul>
       </div>
@@ -397,7 +396,7 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <div class="sec-head">
       <div class="eyebrow">Install</div>
-      <h2>CLI in 10 seconds, thin Orca panel in two commands</h2>
+      <h2>CLI in 10 seconds, quiet Orca panel in two commands</h2>
     </div>
     <ol>
       <li>
@@ -410,7 +409,7 @@ cd orca-auto-handoff
       </li>
       <li>
         <div>
-          <p>Install the thin Orca plugin for instant event push, native Claude <code>agent.resume</code>, and the 4-tab sidebar panel:</p>
+          <p>Install the thin Orca plugin for instant event push, native Claude <code>agent.resume</code>, and the 3-tab sidebar panel:</p>
           <pre><code>orca plugin install ngoohebi/orca-auto-handoff
 # approve with the printed fingerprint:
 orca plugin install ngoohebi/orca-auto-handoff --approve ap1-…</code></pre>
@@ -424,8 +423,8 @@ orca plugin install ngoohebi/orca-auto-handoff --approve ap1-…</code></pre>
     </ol>
     <details>
       <summary>Developing &amp; testing OAH</summary>
-      <pre style="margin-top:12px"><code>npm run test:cli                 # 15 standalone Node tests (v0.5 core, daemon, probes, proxy, CLI, thin bridge)
-npm run test:plugin              # 420 tests across all 15 suites via `orca plugin test`
+      <pre style="margin-top:12px"><code>npm run test:cli                 # standalone Node tests (core v0.5, daemon, probes, proxy, CLI, thin bridge)
+npm run test:plugin              # full suite via `orca plugin test`
 npm run typecheck                # strict TypeScript check (zero npm dependencies)
 npm run validate                 # validates orca-plugin.json
 ./bin/oah debug --json           # daemon status, bridge state &amp; recent events</code></pre>
