@@ -126,7 +126,7 @@ test('oah CLI: help, version, status, --json, pause/resume, service, config', as
     assert.equal(rpc.code, 0)
     assert.equal(JSON.parse(rpc.stdout).version, VERSION)
 
-    // v0.5.0: active, pin/pins/unpin, event stop-failure, proxy, provider, sync export
+    // v0.5.0: active, pin/pins/unpin, event stop-failure, sync export
     const active = await runCli(['active', 'claude', '--json'], client, { autoStart: false })
     assert.equal(active.code, 0)
     assert.equal(JSON.parse(active.stdout).active[0].label, 'work@example.com')
@@ -147,17 +147,11 @@ test('oah CLI: help, version, status, --json, pause/resume, service, config', as
     assert.equal(stopEv.code, 0)
     assert.equal(JSON.parse(stopEv.stdout).handled, false)
 
-    const pAdd = await runCli(['provider', 'add', 'anthropic', 'RelayA', 'http://127.0.0.1:9999', 'sk-test', '--priority', '1', '--json'], client, { autoStart: false })
-    assert.equal(pAdd.code, 0)
-    const pId = JSON.parse(pAdd.stdout).provider.id
-    const pList = await runCli(['provider', 'list', '--json'], client, { autoStart: false })
-    assert.equal(JSON.parse(pList.stdout).providers.length, 1)
-    assert.equal(JSON.parse(pList.stdout).providers[0].apiKey, undefined)
-
-    const pOff = await runCli(['provider', 'off', pId, '--json'], client, { autoStart: false })
-    assert.equal(JSON.parse(pOff.stdout).enabled, false)
-    const pRm = await runCli(['provider', 'rm', pId, '--json'], client, { autoStart: false })
-    assert.equal(JSON.parse(pRm.stdout).ok, true)
+    // The HTTP proxy is gone: its commands are unknown.
+    for (const words of [['proxy', 'status'], ['provider', 'list'], ['bench']]) {
+      const gone = await runCli([...words, '--json'], client, { autoStart: false })
+      assert.ok(gone.code !== 0, words.join(' '))
+    }
 
     const exp = await runCli(['sync', 'export'], client, { autoStart: false })
     assert.equal(exp.code, 0)

@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { ALL_SETTINGS, checked, settingValues, type SettingValues } from '../core/settings.ts'
-import { DEFAULT_CONFIG, PROVIDERS, type Config, type ProxyProvider, type RotatorState } from '../core/types.ts'
+import { DEFAULT_CONFIG, PROVIDERS, type Config, type RotatorState } from '../core/types.ts'
 import type { UsageCache } from '../core/usage-cache.ts'
 import type { UsageSamples } from '../core/usage-history.ts'
 
@@ -83,7 +83,6 @@ export class FileStore {
   readonly statePath: string
   readonly usagePath: string
   readonly samplesPath: string
-  readonly providersPath: string
   readonly liveDir: string
   private rawConfig: Record<string, unknown> | null = null
 
@@ -93,7 +92,6 @@ export class FileStore {
     this.statePath = join(home, 'state.json')
     this.usagePath = join(home, 'usage.json')
     this.samplesPath = join(home, 'samples.json')
-    this.providersPath = join(home, 'providers.json')
     this.liveDir = join(home, 'live')
   }
 
@@ -207,37 +205,11 @@ export class FileStore {
     return raw.pins && typeof raw.pins === 'object' && !Array.isArray(raw.pins) ? { ...(raw.pins as Record<string, string>) } : {}
   }
 
-  /** Link or unlink by hand. An Unlink is remembered (`quotaUnlinks`), so automatic linking never
-   *  links that account again; a Link by hand forgets it. */
-  setQuotaLink(seatKey: string, enabled: boolean): void {
-    const raw = this.loadRawConfig()
-    const links = new Set(this.loadConfig().quotaLinks)
-    const unlinks = new Set(this.getQuotaUnlinks())
-    if (enabled) {
-      links.add(seatKey)
-      unlinks.delete(seatKey)
-    } else {
-      links.delete(seatKey)
-      unlinks.add(seatKey)
-    }
-    raw.quotaLinks = [...links].sort()
-    raw.quotaUnlinks = [...unlinks].sort()
-    this.writeJson(this.configPath, raw)
-    this.rawConfig = raw
-  }
-
-  /** Accounts the user unlinked by hand: automatic linking leaves them alone. */
-  getQuotaUnlinks(): string[] {
-    const raw = this.loadRawConfig()
-    return Array.isArray(raw.quotaUnlinks) ? raw.quotaUnlinks.filter((key): key is string => typeof key === 'string') : []
-  }
-
-  /** Links the given accounts unless they are linked already or were unlinked by hand; returns
-   *  the ones newly linked (none: nothing is written). */
+  /** Links the given accounts for Live quota unless they are linked already; returns the ones
+   *  newly linked (none: nothing is written). */
   autoLinkQuota(seatKeys: string[]): string[] {
     const links = new Set(this.loadConfig().quotaLinks)
-    const unlinks = new Set(this.getQuotaUnlinks())
-    const added = seatKeys.filter((key) => !links.has(key) && !unlinks.has(key))
+    const added = seatKeys.filter((key) => !links.has(key))
     if (!added.length) return []
     const raw = this.loadRawConfig()
     raw.quotaLinks = [...new Set([...links, ...added])].sort()
@@ -266,20 +238,10 @@ export class FileStore {
     return pins
   }
 
-  loadProviders(): ProxyProvider[] {
-    const data = this.readJson<ProxyProvider[]>(this.providersPath)
-    return Array.isArray(data) ? data : []
-  }
-
-  saveProviders(providers: ProxyProvider[]): void {
-    this.writeJson(this.providersPath, providers)
-  }
-
   exportConfig(): Record<string, unknown> {
     return {
       schema: 'oah-config/v1',
-      settings: this.loadRawConfig(),
-      providers: this.loadProviders().map(({ apiKey: _redacted, ...rest }) => rest)
+      settings: this.loadRawConfig()
     }
   }
 

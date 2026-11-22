@@ -134,7 +134,7 @@ test('FileStore persists config, state, and enforces 0700/0600 permissions', () 
 
     store.setSetting('timing', 'at-limit')
     store.setSetting('service_codex', false)
-    store.setQuotaLink('codex:test-account', true)
+    assert.deepEqual(store.autoLinkQuota(['codex:test-account']), ['codex:test-account'])
 
     // Re-read from disk with a fresh FileStore instance
     const reloaded = new FileStore(join(dir, 'oah'))
@@ -142,15 +142,10 @@ test('FileStore persists config, state, and enforces 0700/0600 permissions', () 
     assert.equal(cfg.runningSessions, 'limit')
     assert.equal(cfg.services.codex, false)
     assert.deepEqual(cfg.quotaLinks, ['codex:test-account'])
-    reloaded.setQuotaLink('codex:test-account', false)
-    assert.deepEqual(new FileStore(join(dir, 'oah')).loadConfig().quotaLinks, [])
-    // Automatic linking links what is new, and never an account unlinked by hand...
+    // Automatic linking links only what is new.
     assert.deepEqual(reloaded.autoLinkQuota(['codex:test-account', 'claude:a1']), ['claude:a1'])
     assert.deepEqual(reloaded.autoLinkQuota(['claude:a1']), [])
-    assert.deepEqual(new FileStore(join(dir, 'oah')).loadConfig().quotaLinks, ['claude:a1'])
-    // ...until it is linked by hand again.
-    reloaded.setQuotaLink('codex:test-account', true)
-    assert.deepEqual(reloaded.getQuotaUnlinks(), [])
+    assert.deepEqual(new FileStore(join(dir, 'oah')).loadConfig().quotaLinks, ['claude:a1', 'codex:test-account'])
     assert.equal(cfg.services.claude, true)
     assert.equal(statSync(reloaded.home).mode & 0o777, 0o700)
     assert.equal(statSync(reloaded.configPath).mode & 0o777, 0o600)
@@ -264,7 +259,7 @@ test('OahDaemon routes host.call requests to a registered Orca plugin bridge', a
   }
 })
 
-test('accounts a direct check can serve are turned on automatically and checked in the same read; the others say why, or that they were turned off', async () => {
+test('accounts a direct check can serve are turned on automatically and checked in the same read', async () => {
   const cli = fakeCli({
     codex: { activeAccountId: 'c1', accounts: [{ id: 'c1' }, { id: 'c2' }, { id: 'c3' }] },
     rateLimits: { claude: { status: 'ok', session: { usedPercent: 50, resetsAt: null } } }
@@ -287,11 +282,11 @@ test('accounts a direct check can serve are turned on automatically and checked 
     readLive: async () => null,
     loadSamples: async () => null,
     saveSamples: async () => {},
-    // Only c1 and c3 have a sign-in a check can use; c3 was turned off by hand.
+    // Only c1 has a sign-in a check can use.
     quotaStatus: (_accounts, seats) => {
       const added = seats.filter((s) => s.key === 'codex:c1' && !links.includes(s.key)).map((s) => s.key)
       links = [...links, ...added]
-      return { added, off: ['codex:c3'], unavailable: { 'codex:c2': 'no saved sign-in on this computer' } }
+      return { added }
     },
     refreshProfileQuota: async (_profiles, seats) => {
       checked.push(seats.map((s) => s.key))
@@ -304,12 +299,9 @@ test('accounts a direct check can serve are turned on automatically and checked 
   const snap = rotator.snapshot()
   assert.equal(snap.seats.find((s) => s.key === 'codex:c1')?.quotaLinked, true)
   assert.equal(snap.seats.find((s) => s.key === 'codex:c2')?.quotaLinked, undefined)
-  assert.equal(snap.seats.find((s) => s.key === 'codex:c2')?.quotaUnavailable, 'no saved sign-in on this computer')
-  assert.equal(snap.seats.find((s) => s.key === 'codex:c3')?.quotaOff, true)
-  assert.equal(snap.seats.find((s) => s.key === 'codex:c1')?.quotaOff, undefined)
 })
 
-test('with Live quota off no direct check is made and nothing is turned on; Check now says why', async () => {
+test('with Live quota off no direct check is made and nothing is turned on; a direct check asked for says why', async () => {
   const cli = fakeCli({
     codex: { activeAccountId: 'c1', accounts: [{ id: 'c1' }] },
     rateLimits: { claude: { status: 'ok', session: { usedPercent: 50, resetsAt: null } } }
@@ -333,7 +325,7 @@ test('with Live quota off no direct check is made and nothing is turned on; Chec
     saveSamples: async () => {},
     quotaStatus: () => {
       calls.push('status')
-      return { added: [], off: [], unavailable: {} }
+      return { added: [] }
     },
     refreshProfileQuota: async () => {
       calls.push('check')

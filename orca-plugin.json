@@ -49,11 +49,11 @@
       },
       {
         "id": "rotator.installStatusLine",
-        "title": "Auto Hand-off: Install the console status line in this workspace"
+        "title": "Auto Hand-off: Turn the Claude status line on (every workspace)"
       },
       {
         "id": "rotator.uninstallStatusLine",
-        "title": "Auto Hand-off: Remove the console status line from this workspace"
+        "title": "Auto Hand-off: Turn the Claude status line off (every workspace)"
       }
     ],
     "events": [

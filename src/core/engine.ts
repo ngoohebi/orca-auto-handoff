@@ -102,10 +102,9 @@ export type Deps = {
   loadUsage(): Promise<unknown>
   saveUsage(cache: UsageCache): Promise<void>
   refreshProfileQuota?(accounts: Record<string, any>, seats: Seat[], force: boolean): Promise<void>
-  /** Direct checks, account by account: turns on the ones a check can serve that are not on yet
-   *  and were not turned off by hand (`added`), and says which were turned off (`off`) and why a
-   *  check cannot serve the others (`unavailable`). */
-  quotaStatus?(accounts: Record<string, any>, seats: Seat[]): { added: string[]; off: string[]; unavailable: Record<string, string> }
+  /** Live quota: turns direct checks on for the accounts a check can serve that are not on yet,
+   *  and returns those (`added`). */
+  quotaStatus?(accounts: Record<string, any>, seats: Seat[]): { added: string[] }
   /** The text of a pane's live usage file for this key (`live/claude-<key>.tsv`, written by the
    *  console status line wrapper), or `null` when there is none. Read-only. */
   readLive(liveKey: string): Promise<string | null>
@@ -969,18 +968,12 @@ export class Rotator {
           }))
         }
       }
-      // Saved accounts a direct check can serve are linked as they appear (unless unlinked by
-      // hand), and checked in this same read.
+      // Saved accounts a direct check can serve are linked as they appear, and checked in this
+      // same read.
       let links = config.quotaLinks
       if (direct && this.deps.quotaStatus) {
         try {
-          const { added, off, unavailable } = this.deps.quotaStatus(raw, parsed.seats)
-          const turnedOff = new Set(off)
-          for (const seat of parsed.seats) {
-            if (turnedOff.has(seat.key)) seat.quotaOff = true
-            const why = unavailable[seat.key]
-            if (why) seat.quotaUnavailable = why
-          }
+          const { added } = this.deps.quotaStatus(raw, parsed.seats)
           if (added.length) {
             links = [...new Set([...links, ...added])]
             if (this.chosenConfig) this.chosenConfig = { ...this.chosenConfig, quotaLinks: links }

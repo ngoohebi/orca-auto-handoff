@@ -8,11 +8,10 @@ import { Rotator, type Cli, type Deps, type HostLike, type StatusEvent } from '.
 import { PROVIDER_NAME } from '../core/labels.ts'
 import { liveFileName } from '../core/live-usage.ts'
 import { ConsoleStatusLine, nodeFiles, type Files } from '../core/statusline-files.ts'
-import { PROVIDERS, type Provider, type ProxyProvider, type Snapshot } from '../core/types.ts'
+import { PROVIDERS, type Provider, type Snapshot } from '../core/types.ts'
 import { VERSION } from '../core/version.ts'
 import { createLineParser, encodeMessage, type RpcRequest, type RpcResponse, type WireMessage } from './ipc.ts'
 import { OrcaTransport } from './orca-transport.ts'
-import { benchProviders, LocalProxy } from './proxy.ts'
 import { FileStore, socketPathFor } from './store.ts'
 
 const MAX_TICK_MS = 30_000
@@ -42,7 +41,6 @@ export class OahDaemon {
   readonly transport: OrcaTransport
   readonly rotator: Rotator
   readonly consoleLine: ConsoleStatusLine
-  readonly proxy: LocalProxy
   private readonly log: (msg: string) => void
   private readonly now: () => number
   private readonly startedAt: number
@@ -105,26 +103,15 @@ export class OahDaemon {
       }),
       quotaStatus: opts.cli
         ? undefined
-        : (accounts, seats) => {
-            const unavailable: Record<string, string> = {}
-            for (const seat of seats) {
-              const why = directQuotaUnavailable(accounts, seat)
-              if (why) unavailable[seat.key] = why
-            }
-            const added = this.store.autoLinkQuota(seats.filter((seat) => !unavailable[seat.key]).map((seat) => seat.key))
-            return { added, off: this.store.getQuotaUnlinks(), unavailable }
-          },
+        : (accounts, seats) => ({
+            added: this.store.autoLinkQuota(seats.filter((seat) => !directQuotaUnavailable(accounts, seat)).map((seat) => seat.key))
+          }),
       readLive: async (liveKey) => this.store.readLive(liveFileName(liveKey)),
       loadSamples: async () => this.store.loadSamples(),
       saveSamples: async (s) => this.store.saveSamples(s)
     }
 
     this.rotator = new Rotator(deps)
-    this.proxy = new LocalProxy({
-      getProviders: () => this.store.loadProviders(),
-      now: this.now,
-      log: this.log
-    })
   }
 
   /** The `console_statusline` setting, applied: the wrapper in, or out of, every workspace on
@@ -188,7 +175,6 @@ export class OahDaemon {
     this.clients.clear()
     this.subscribers.clear()
     this.rotator.dispose()
-    await this.proxy.stop()
     if (this.server) {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()))
       this.server = null
@@ -351,16 +337,6 @@ export class OahDaemon {
         if (p.refresh) this.rotator.notePresence()
         await Promise.all([this.rotator.accounts(!!p.refresh, !!p.refresh, p.directQuota === true), this.rotator.refreshFocus()])
         if (!p.refresh) await this.rotator.syncLivePanes(false)
-        return this.rotator.snapshot()
-      }
-      case 'quota.link': {
-        if (typeof p.seatKey !== 'string' || typeof p.linked !== 'boolean') throw new Error('Account and link state are required.')
-        const view = await this.rotator.accounts()
-        if (this.rotator.snapshot().server) throw new Error('Quota links are available for local accounts only.')
-        if (!view.seats.some((seat) => seat.key === p.seatKey && seat.accountId !== 'system')) throw new Error('Choose a saved Orca account.')
-        this.store.setQuotaLink(p.seatKey, p.linked)
-        await this.rotator.accounts(true)
-        this.rotator.publishNow()
         return this.rotator.snapshot()
       }
       case 'pause': {
@@ -541,67 +517,6 @@ export class OahDaemon {
         const pins = this.store.removePin(p.target.trim())
         await this.rotator.refreshServices()
         return { pins }
-      }
-      case 'proxy.status': {
-        return this.proxy.status()
-      }
-      case 'proxy.start': {
-        const port = typeof p.port === 'number' && p.port >= 0 ? p.port : 4080
-        return this.proxy.start(port)
-      }
-      case 'proxy.stop': {
-        await this.proxy.stop()
-        return this.proxy.status()
-      }
-      case 'provider.list': {
-        return { providers: this.store.loadProviders().map(({ apiKey: _k, ...rest }) => rest) }
-      }
-      case 'provider.add': {
-        const kind = p.kind === 'anthropic' || p.kind === 'openai' ? p.kind : null
-        if (!kind) throw new Error('kind must be "anthropic" or "openai"')
-        if (typeof p.name !== 'string' || !p.name.trim()) throw new Error('name is required')
-        if (typeof p.baseUrl !== 'string' || !/^https?:\/\//.test(p.baseUrl.trim())) throw new Error('valid http(s) baseUrl is required')
-        if (typeof p.apiKey !== 'string' || !p.apiKey.trim()) throw new Error('apiKey is required')
-        const list = this.store.loadProviders()
-        const id =
-          typeof p.id === 'string' && p.id.trim()
-            ? p.id.trim()
-            : `${kind}-${p.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Math.random().toString(36).slice(2, 6)}`
-        const entry: ProxyProvider = {
-          id,
-          kind,
-          name: p.name.trim(),
-          baseUrl: p.baseUrl.trim(),
-          apiKey: p.apiKey.trim(),
-          priority: typeof p.priority === 'number' ? p.priority : list.length + 1,
-          enabled: p.enabled !== false,
-          ...(p.modelMap && typeof p.modelMap === 'object' ? { modelMap: p.modelMap as Record<string, string> } : {})
-        }
-        const next = [...list.filter((x) => x.id !== id), entry]
-        this.store.saveProviders(next)
-        const { apiKey: _k, ...safe } = entry
-        return { provider: safe }
-      }
-      case 'provider.rm': {
-        if (typeof p.id !== 'string' || !p.id.trim()) throw new Error('id is required')
-        const list = this.store.loadProviders()
-        const next = list.filter((x) => x.id !== p.id.trim())
-        if (next.length === list.length) throw new Error(`No provider "${p.id}"`)
-        this.store.saveProviders(next)
-        return { ok: true, id: p.id.trim() }
-      }
-      case 'provider.toggle': {
-        if (typeof p.id !== 'string' || typeof p.enabled !== 'boolean') throw new Error('id and enabled (boolean) are required')
-        const list = this.store.loadProviders()
-        const target = list.find((x) => x.id === p.id)
-        if (!target) throw new Error(`No provider "${p.id}"`)
-        target.enabled = p.enabled
-        this.store.saveProviders(list)
-        return { ok: true, id: target.id, enabled: target.enabled }
-      }
-      case 'provider.bench': {
-        const list = this.store.loadProviders()
-        return { results: await benchProviders(list) }
       }
       case 'sync.export': {
         return this.store.exportConfig()

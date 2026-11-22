@@ -272,63 +272,6 @@ export async function runCli(
         })
         return ok(res.detail, res)
       }
-      case 'proxy': {
-        const sub = words[1] ?? 'status'
-        if (sub === 'status') {
-          const st = await client.call<{ running: boolean; host: string; port: number; providers: any[] }>('proxy.status', {})
-          const text = st.running ? `Proxy running on http://${st.host}:${st.port} (${st.providers.length} providers)` : 'Proxy is stopped'
-          return ok(text, st)
-        }
-        if (sub === 'start') {
-          const port = Number(flags.port) > 0 ? Number(flags.port) : 4080
-          const st = await client.call<{ running: boolean; host: string; port: number }>('proxy.start', { port })
-          return ok(`Proxy listening on http://${st.host}:${st.port}`, st)
-        }
-        if (sub === 'stop') {
-          const st = await client.call('proxy.stop', {})
-          return ok('Proxy stopped', st)
-        }
-        throw new Error(`Unknown proxy subcommand "${sub}". Use: start, stop, status.`)
-      }
-      case 'provider': {
-        const sub = words[1] ?? 'list'
-        if (sub === 'list') {
-          const res = await client.call<{ providers: { id: string; kind: string; name: string; baseUrl: string; priority: number; enabled: boolean }[] }>('provider.list', {})
-          const text =
-            res.providers.length === 0
-              ? 'No proxy providers configured. Add one with: oah provider add <anthropic|openai> <name> <baseUrl> <apiKey>'
-              : res.providers.map((p) => `${p.enabled ? '●' : '○'} ${p.id}  [${p.kind}]  #${p.priority}  ${p.name}  ${p.baseUrl}`).join('\n')
-          return ok(text, res)
-        }
-        if (sub === 'add') {
-          const [kind, name, baseUrl, apiKey] = words.slice(2)
-          if (!kind || !name || !baseUrl || !apiKey) {
-            throw new Error('Usage: oah provider add <anthropic|openai> <name> <baseUrl> <apiKey> [--priority N]')
-          }
-          const priority = Number(flags.priority) > 0 ? Number(flags.priority) : undefined
-          const res = await client.call<{ provider: { id: string; name: string } }>('provider.add', { kind, name, baseUrl, apiKey, priority })
-          return ok(`Added provider ${res.provider.name} (${res.provider.id})`, res)
-        }
-        if (sub === 'rm') {
-          if (!words[2]) throw new Error('Usage: oah provider rm <id>')
-          const res = await client.call('provider.rm', { id: words[2] })
-          return ok(`Removed provider ${words[2]}`, res)
-        }
-        if (sub === 'on' || sub === 'off') {
-          if (!words[2]) throw new Error(`Usage: oah provider ${sub} <id>`)
-          const res = await client.call('provider.toggle', { id: words[2], enabled: sub === 'on' })
-          return ok(`Provider ${words[2]} ${sub === 'on' ? 'enabled' : 'disabled'}`, res)
-        }
-        throw new Error(`Unknown provider subcommand "${sub}". Use: list, add, rm, on, off.`)
-      }
-      case 'bench': {
-        const res = await client.call<{ results: { id: string; name: string; kind: string; latencyMs: number; band: string; ok: boolean; error?: string }[] }>('provider.bench', {})
-        const text =
-          res.results.length === 0
-            ? 'No proxy providers to benchmark.'
-            : res.results.map((r) => `${r.ok ? `${r.latencyMs}ms [${r.band}]` : `ERROR (${r.error})`}  ${r.name} (${r.kind})`).join('\n')
-        return ok(text, res)
-      }
       case 'sync': {
         const sub = words[1]
         if (sub === 'export') {

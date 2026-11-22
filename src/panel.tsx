@@ -254,9 +254,6 @@ export function setup(ctx: PanelContext): void {
  *  Codex OpenAI's green, Antigravity Google's blue, Devin Cognition's blue; OpenCode's mark is
  *  near-black, so a light neutral stands in. */
 const brandMark = (p: Provider) => `assets/brand/${p}-mark.png`
-/** The title badge's marks: geometric shapes of one width, ● early hand-offs on, ○ only at a
- *  limit, ■ paused, and ◐ (Early when away, the user is here), which is drawn so it can be a
- *  brighter, lighter green than Orca's one green for text. */
 /** What automatic hand-off is doing right now, beside its switch: the state only, in words that
  *  need no legend (how accounts are picked is on the Settings tab). Colour backs the words:
  *  amber while paused, green while early hand-offs are on or wait for you to step away, quiet

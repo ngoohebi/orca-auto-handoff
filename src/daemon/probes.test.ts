@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { DatabaseSync } from 'node:sqlite'
 import type { Seat } from '../core/types.ts'
-import { directQuotaUnavailable, managedProfileQuota, parseCodexUsage, probeClaudeUsage, parseAntigravityQuota, parseClaudeOAuthQuota, parseClaudeUsageJson, parseCodexRateLimits, parseDevinQuota, parseOpenCodeUsage } from './probes.ts'
+import { directQuotaUnavailable, managedProfileQuota, parseCodexUsage, probeClaudeUsage, parseAntigravityQuota, parseClaudeOAuthQuota, parseClaudeUsageJson, parseDevinQuota, parseOpenCodeUsage } from './probes.ts'
 
 test('linked OpenCode Go and Devin checks use the credentials of their own saved profiles', async () => {
   const root = mkdtempSync(join(tmpdir(), 'oah-data-profile-quota-'))
@@ -121,50 +121,6 @@ test('parseClaudeOAuthQuota reads subscription windows and the fullest known mod
   assert.equal(quota.weekly?.usedPercent, 42)
   assert.equal(quota.model?.name, 'opus')
   assert.equal(parseClaudeOAuthQuota({ five_hour: null }, 1000).known, false)
-})
-
-test('parseCodexRateLimits: ignores codex_bengalfox, honors ordinaryUsageAllowed, and preserves accountId', () => {
-  const now = 1_790_000_000_000
-  const parsed = parseCodexRateLimits(
-    {
-      jsonrpc: '2.0',
-      id: 2,
-      result: {
-        accountId: 'acc-codex-1',
-        ordinaryUsageAllowed: false,
-        rateLimitReachedType: 'weekly',
-        rateLimitsByLimitId: {
-          codex_bengalfox: { primary: { usedPercent: 0, windowDurationMins: 10080, resetsAt: 1790480193 } },
-          codex: { primary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: 1790480193 } }
-        }
-      }
-    },
-    now
-  )
-  assert.equal(parsed.accountId, 'acc-codex-1')
-  assert.equal(parsed.usage.known, true)
-  assert.equal(parsed.usage.ordinaryUsageAllowed, false)
-  assert.equal(parsed.usage.rateLimitReachedType, 'weekly')
-  assert.equal(parsed.usage.weekly?.usedPercent, 100)
-  assert.equal(parsed.usage.weekly?.resetsAt, 1790480193 * 1000)
-})
-
-test('parseCodexRateLimits: maps RPC -32600 authentication error to sign-in, never rate limit', () => {
-  const parsed = parseCodexRateLimits({
-    jsonrpc: '2.0',
-    id: 2,
-    error: { code: -32600, message: 'codex account authentication required to read rate limits' }
-  })
-  assert.equal(parsed.usage.known, false)
-  assert.equal(parsed.usage.reason, 'sign-in')
-})
-
-test('parseCodexRateLimits: identifies a rate limit on the quota request', () => {
-  const parsed = parseCodexRateLimits({
-    error: { code: -32000, message: 'Quota request returned HTTP 429 Too Many Requests' }
-  })
-  assert.equal(parsed.usage.known, false)
-  assert.equal(parsed.usage.reason, 'rate-limited')
 })
 
 test('parseClaudeUsageJson: parses free claude -p /usage JSON output including Fable model window', () => {

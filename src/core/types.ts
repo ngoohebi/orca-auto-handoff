@@ -56,10 +56,6 @@ export type Seat = {
   usage: SeatUsage
   /** Direct quota check failure, kept separately from the displayed fallback reading. */
   directQuotaIssue?: { reason: UsageReason | 'native-sign-in-required'; retryAt: number }
-  /** Why a direct check cannot serve this account, in a few words (`directQuotaUnavailable`). */
-  quotaUnavailable?: string
-  /** The direct check was turned off for this account by hand; it stays off. */
-  quotaOff?: boolean
   /** Which per-pane live files describe this account (live-usage.ts): its Claude profile id,
    *  `system` for Claude's own login, or both when a managed account is that same login. Local
    *  Claude accounts only; never part of a snapshot. */
@@ -120,18 +116,6 @@ export type SeatHealth = {
   circuit?: CircuitState
   /** Consecutive failures/limits since the last clean turn or manual clear. */
   consecutiveFailures?: number
-}
-
-/** An API-key or third-party relay provider routed by `oah proxy`. */
-export type ProxyProvider = {
-  id: string
-  kind: 'anthropic' | 'openai'
-  name: string
-  baseUrl: string
-  apiKey: string
-  priority: number
-  enabled: boolean
-  modelMap?: Record<string, string>
 }
 
 /** How long a strike counts, and how long an expired cooldown is remembered. */

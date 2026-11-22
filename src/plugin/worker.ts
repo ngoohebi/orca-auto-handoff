@@ -171,7 +171,6 @@ export async function activateThin(orca: OrcaWorkerApi, opts: ThinWorkerOptions 
 
   // Relay account pool and daemon controls to oahd.
   orca.panels.handle('rotator.snapshot', (input) => rpc('snapshot', (input ?? {}) as Record<string, unknown>))
-  orca.panels.handle('rotator.linkQuota', (input) => rpc('quota.link', input))
   orca.panels.handle('rotator.pause', (input) => rpc('pause', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.setService', (input) => rpc('setService', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.settings', (input) => rpc('settings', (input ?? {}) as Record<string, unknown>))
@@ -184,10 +183,6 @@ export async function activateThin(orca: OrcaWorkerApi, opts: ThinWorkerOptions 
   orca.panels.handle('rotator.declineHandoff', (input) => rpc('declineHandoff', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.consoleLine', (input) => rpc('consoleLine', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.debug', () => rpc('debug', {}))
-  orca.panels.handle('rotator.proxyStatus', () => rpc('proxy.status', {}))
-  orca.panels.handle('rotator.proxyStart', (input) => rpc('proxy.start', (input ?? {}) as Record<string, unknown>))
-  orca.panels.handle('rotator.proxyStop', () => rpc('proxy.stop', {}))
-  orca.panels.handle('rotator.bench', () => rpc('provider.bench', {}))
   orca.panels.handle('rotator.pins', () => rpc('pins', {}))
   orca.panels.handle('rotator.pin', (input) => rpc('pin', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.unpin', (input) => rpc('unpin', (input ?? {}) as Record<string, unknown>))
