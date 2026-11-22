@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OAH — Orca Auto Hand-off: CLI-first automatic account switching for Orca</title>
-<meta name="description" content="OAH (Orca Auto Hand-off): CLI-first automatic account switching daemon (oah / oahd) with a thin Orca panel. When a Claude, Codex, Antigravity, OpenCode or Devin account hits a limit, OAH hands the session off to your next account and keeps working.">
-<meta property="og:title" content="OAH — Orca Auto Hand-off: CLI-first automatic account switching for Orca">
-<meta property="og:description" content="Hit a rate limit? Auto-switch to your next account and keep working, on the same provider with the same context. Claude, Codex, Antigravity, OpenCode and Devin.">
+<title>OAH v0.5 — Orca Auto Hand-off: CLI-First Daemon, Local Failover Proxy &amp; Thin Orca Panel</title>
+<meta name="description" content="OAH (Orca Auto Hand-off): CLI-first automatic account hand-off daemon (oah / oahd), optional local HTTP failover proxy, formal 3-state circuit breaker, and thin Orca sidebar panel for Claude, Codex, Antigravity, OpenCode and Devin.">
+<meta property="og:title" content="OAH v0.5 — Orca Auto Hand-off">
+<meta property="og:description" content="Hit a rate limit? Auto-switch to your next account and keep working. Zero-dependency CLI + daemon + optional HTTP failover proxy + thin Orca panel.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://ngoohebi.github.io/orca-auto-handoff/">
 <meta name="theme-color" content="#0f1115">
@@ -51,19 +51,18 @@ a:hover{text-decoration:underline}
 code,pre,kbd{font-family:var(--mono);font-size:.9em}
 code{background:var(--bg-3);border:1px solid var(--line);border-radius:5px;padding:.08em .4em;color:var(--fg);overflow-wrap:anywhere}
 pre{background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;overflow-x:auto;line-height:1.55;margin:0}
-pre code{background:none;border:0;padding:0;font-size:.88rem}
+pre code{background:none;border:0;padding:0;font-size:.86rem}
 h1,h2,h3{line-height:1.2;letter-spacing:-.01em;margin:0}
 h2{font-size:clamp(1.5rem,2.6vw,2rem);font-weight:700}
 h3{font-size:1.05rem;font-weight:600}
 p{margin:0 0 1em}
 .wrap{max-width:1120px;margin:0 auto;padding:0 20px}
 .eyebrow{color:var(--accent);font-weight:600;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase;margin-bottom:10px}
-.lede{color:var(--fg-2);font-size:1.08rem;max-width:62ch}
+.lede{color:var(--fg-2);font-size:1.06rem;max-width:66ch}
 section{padding:72px 0;border-top:1px solid var(--line)}
 section:first-of-type{border-top:0}
-.sec-head{margin-bottom:36px;max-width:70ch}
+.sec-head{margin-bottom:36px;max-width:72ch}
 
-/* nav */
 nav{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
 nav .wrap{display:flex;align-items:center;gap:20px;height:58px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:700;color:var(--fg)}
@@ -79,11 +78,10 @@ nav ul a:hover{color:var(--fg);text-decoration:none}
 .gh:hover{text-decoration:none;opacity:.9}
 @media (max-width:760px){nav ul{display:none}.iconbtn{margin-left:auto}.brand{white-space:nowrap}.brand small{display:none}}
 
-/* hero */
 .hero{padding:72px 0 64px}
 .hero .wrap{display:grid;grid-template-columns:1.1fr .9fr;gap:48px;align-items:center}
 .hero .wrap>*{min-width:0}
-.hero h1{font-size:clamp(2.1rem,4.6vw,3.4rem);font-weight:700;letter-spacing:-.025em;margin-bottom:18px}
+.hero h1{font-size:clamp(2.1rem,4.6vw,3.3rem);font-weight:700;letter-spacing:-.025em;margin-bottom:18px}
 .hero h1 span{color:var(--accent)}
 .badges{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 26px}
 .badge{font-size:.78rem;font-weight:500;color:var(--fg-2);background:var(--bg-2);border:1px solid var(--line);border-radius:999px;padding:3px 10px}
@@ -100,105 +98,76 @@ nav ul a:hover{color:var(--fg);text-decoration:none}
 .copy:hover{color:var(--fg)}
 @media (max-width:900px){.hero .wrap{grid-template-columns:1fr}.hero{padding:48px 0 40px}}
 
-/* panel mock */
-.panel{background:var(--bg-2);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:16px;font-size:.84rem;max-width:400px;margin:0 auto;width:100%}
+.panel{background:var(--bg-2);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:16px;font-size:.84rem;max-width:420px;margin:0 auto;width:100%}
 .panel .ph{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:1rem;margin-bottom:10px}
-.panel .ph span{font-weight:500;font-size:.8rem;color:var(--fg-2)}
+.panel .ph span{font-weight:500;font-size:.78rem;color:var(--fg-2)}
 .row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .toggle{width:34px;height:18px;border-radius:999px;background:var(--fg);position:relative;flex:none}
 .toggle::after{content:"";position:absolute;top:3px;right:3px;width:12px;height:12px;border-radius:50%;background:var(--bg-2)}
-.tabs{display:flex;gap:16px;border-bottom:1px solid var(--line);margin:12px 0 14px;color:var(--fg-3)}
+.tabs{display:flex;gap:14px;border-bottom:1px solid var(--line);margin:12px 0 14px;color:var(--fg-3)}
 .tabs b{color:var(--fg);font-weight:600;border-bottom:2px solid var(--fg);padding-bottom:6px}
 .tabs span{padding-bottom:6px}
 .card{background:var(--bg-3);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
 .card:last-child{margin-bottom:0}
 .card h4{margin:0 0 2px;font-size:.92rem;font-weight:600}
 .card .sub{color:var(--fg-3);margin-bottom:10px}
-.acct{margin-top:12px}
-.acct .row{margin-bottom:6px}
+.acct{margin-top:10px}
+.acct .row{margin-bottom:5px}
 .pill{font-size:.72rem;border:1px solid var(--line-2);border-radius:999px;padding:1px 8px;color:var(--fg-2);display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
 .pill.on::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok)}
 .pill.cool{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 50%,var(--line-2))}
-.meter{color:var(--fg-3);font-size:.76rem;margin-top:5px}
+.meter{color:var(--fg-3);font-size:.76rem;margin-top:4px}
 .bar{height:6px;background:var(--line);border-radius:999px;overflow:hidden;margin-top:3px}
 .bar i{display:block;height:100%;background:var(--fg-2);border-radius:999px}
 .bar i.w{background:var(--warn)}.bar i.d{background:var(--danger)}
-.ghost{display:inline-block;border:1px solid var(--line-2);border-radius:7px;padding:4px 10px;margin-top:8px;color:var(--fg-2);background:var(--bg-2)}
-.muted{color:var(--fg-3)}
 
-/* steps */
-.steps{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;counter-reset:s}
-.step{background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius);padding:16px 14px;position:relative}
-.step::before{counter-increment:s;content:counter(s);display:inline-grid;place-items:center;width:26px;height:26px;border-radius:50%;background:var(--accent-soft);color:var(--accent);font-weight:700;font-size:.8rem;margin-bottom:10px}
-.step h3{font-size:.95rem;margin-bottom:4px}
-.step p{color:var(--fg-2);font-size:.86rem;margin:0}
-@media (max-width:1000px){.steps{grid-template-columns:repeat(3,1fr)}}
-@media (max-width:600px){.steps{grid-template-columns:1fr 1fr}}
-
-/* trace */
-.trace{margin-top:28px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.term{background:#0b0d11;color:#d7dce4;border:1px solid #232a35;border-radius:var(--radius);padding:14px 16px;font-family:var(--mono);font-size:.82rem;line-height:1.6;overflow-x:auto}
-:root[data-theme="light"] .term{background:#1b1f26;border-color:#2a3140}
-@media (prefers-color-scheme: light){:root:not([data-theme="dark"]) .term{background:#1b1f26;border-color:#2a3140}}
-.term .t{color:#8a93a3;font-size:.74rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
-.term .k{color:#22c1b4}.term .y{color:#e2b53c}.term .r{color:#e5564f}.term .dim{color:#7c8595}.term .g{color:#4fd18b}
-@media (max-width:760px){.trace{grid-template-columns:1fr}}
-
-/* grid cards */
 .grid{display:grid;gap:14px}
 .grid>*{min-width:0}
 .g3{grid-template-columns:repeat(3,1fr)}
 .g2{grid-template-columns:repeat(2,1fr)}
-.g5{grid-template-columns:repeat(5,1fr)}
-@media (max-width:900px){.g3,.g5{grid-template-columns:repeat(2,1fr)}}
-@media (max-width:560px){.g3,.g2,.g5{grid-template-columns:1fr}}
+.g4{grid-template-columns:repeat(4,1fr)}
+@media (max-width:900px){.g3,.g4{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:560px){.g3,.g2,.g4{grid-template-columns:1fr}}
 .tile{min-width:0;background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius);padding:20px}
 .tile h3{margin-bottom:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .tile p{color:var(--fg-2);font-size:.92rem;margin:0}
 .tile .tag{font-family:var(--mono);font-size:.74rem;color:var(--accent);background:var(--accent-soft);border-radius:5px;padding:2px 7px}
 .tile.default{border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
 
-/* table */
+.trace{margin-top:24px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.term{background:#0b0d11;color:#d7dce4;border:1px solid #232a35;border-radius:var(--radius);padding:14px 16px;font-family:var(--mono);font-size:.82rem;line-height:1.65;overflow-x:auto}
+:root[data-theme="light"] .term{background:#1b1f26;border-color:#2a3140}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]) .term{background:#1b1f26;border-color:#2a3140}}
+.term .t{color:#8a93a3;font-size:.74rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
+.term .k{color:#22c1b4}.term .y{color:#e2b53c}.term .r{color:#e5564f}.term .dim{color:#7c8595}.term .g{color:#4fd18b}
+@media (max-width:760px){.trace{grid-template-columns:1fr}}
+
 .tbl{width:100%;border-collapse:collapse;font-size:.9rem;background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
 .tbl th,.tbl td{text-align:left;vertical-align:top;padding:11px 14px;border-top:1px solid var(--line)}
 .tbl th{background:var(--bg-3);color:var(--fg-2);font-weight:600;font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;border-top:0}
-.tbl-pair td:first-child{width:34%}
-.tbl-keys td:first-child{width:24%}
-.tbl-keys td:nth-child(2){white-space:nowrap}
-.tbl .st{color:var(--fg-3);font-size:.8rem;white-space:normal;margin-top:2px}
 .tbl td{color:var(--fg-2)}
-.tbl td code{white-space:nowrap}
+.tbl td:first-child{color:var(--fg);font-weight:500}
 .tscroll{overflow-x:auto;border-radius:var(--radius)}
 @media (max-width:640px){
   .tbl,.tbl tbody,.tbl tr,.tbl td{display:block;width:auto}
   .tbl thead{display:none}
   .tbl tr{padding:12px 14px;border-top:1px solid var(--line)}
   .tbl tr:first-child{border-top:0}
-  .tbl td{padding:0;border-top:0}
-  .tbl td:first-child{width:auto;color:var(--fg);font-weight:600;margin-bottom:6px}
-  .tbl .st{font-weight:400}
-  .tbl-keys td:nth-child(2){font-size:.8rem;color:var(--fg-3);margin-bottom:6px}
-  .tbl-keys td:nth-child(2)::before{content:"Default: "}
-  .tbl td code{white-space:normal;overflow-wrap:anywhere}
+  .tbl td{padding:0;border-top:0;margin-bottom:4px}
 }
-details{margin-top:18px}
-summary{cursor:pointer;color:var(--accent);font-weight:600}
 
-/* checklist */
 .check{list-style:none;padding:0;margin:0;display:grid;gap:10px}
-.check li{position:relative;padding-left:30px;color:var(--fg-2);min-width:0}
-.check li::before{content:"";position:absolute;left:0;top:4px;width:18px;height:18px;border-radius:50%;background:var(--accent-soft);background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 8.5l2.5 2.5L12 5.5' fill='none' stroke='%2322c1b4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");background-size:12px;background-position:center;background-repeat:no-repeat}
+.check li{position:relative;padding-left:28px;color:var(--fg-2);min-width:0}
+.check li::before{content:"";position:absolute;left:0;top:4px;width:16px;height:16px;border-radius:50%;background:var(--accent-soft);background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 8.5l2.5 2.5L12 5.5' fill='none' stroke='%2322c1b4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");background-size:11px;background-position:center;background-repeat:no-repeat}
 .check li b{color:var(--fg)}
 
-/* install */
 .install ol{padding-left:0;list-style:none;counter-reset:i;display:grid;gap:18px;margin:0}
-.install ol>li{display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;align-items:start;min-width:0}
-.install li>div{min-width:0}
+.install ol>li{display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;align-items:start}
 .install li::before{counter-increment:i;content:counter(i);display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:var(--accent);color:var(--accent-fg);font-weight:700;font-size:.85rem;margin-top:2px}
 .install li p{margin:0 0 8px}
-.note{background:var(--accent-soft);border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);border-radius:10px;padding:12px 16px;color:var(--fg-2);font-size:.92rem;margin-top:22px}
-.note b{color:var(--fg)}
 
+details{margin-top:18px}
+summary{cursor:pointer;color:var(--accent);font-weight:600}
 footer{border-top:1px solid var(--line);padding:36px 0 48px;color:var(--fg-3);font-size:.88rem}
 footer .wrap{display:flex;flex-wrap:wrap;gap:12px 28px;align-items:center}
 footer a{color:var(--fg-2)}
@@ -210,15 +179,14 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <a class="brand" href="#top">
       <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="var(--accent)"/><path d="M9 19a7 7 0 1 1 14 0" stroke="var(--accent-fg)" stroke-width="3" fill="none" stroke-linecap="round"/><path d="M16 19l5-6" stroke="var(--accent-fg)" stroke-width="3" stroke-linecap="round"/></svg>
-      OAH <small>CLI + Orca plugin</small>
+      OAH <small>v0.5 · CLI + Orca Plugin</small>
     </a>
     <ul>
-      <li><a href="#cli">CLI &amp; Daemon</a></li>
-      <li><a href="#how">How it works</a></li>
-      <li><a href="#triggers">Triggers</a></li>
-      <li><a href="#strategies">How it decides</a></li>
-      <li><a href="#ui">In the app</a></li>
-      <li><a href="#settings">Settings</a></li>
+      <li><a href="#arch">Architecture</a></li>
+      <li><a href="#features">v0.5 Features</a></li>
+      <li><a href="#cli">CLI</a></li>
+      <li><a href="#proxy">HTTP Proxy</a></li>
+      <li><a href="#safety">Safety</a></li>
       <li><a href="#install">Install</a></li>
     </ul>
     <button class="iconbtn" id="theme" title="Toggle light and dark" aria-label="Toggle light and dark">
@@ -236,59 +204,111 @@ footer a{color:var(--fg-2)}
 <section class="hero">
   <div class="wrap">
     <div>
-      <div class="eyebrow">CLI-first Daemon + Thin Orca Plugin · Claude, Codex, Antigravity, OpenCode, Devin</div>
+      <div class="eyebrow">CLI-First Daemon + Local Failover Proxy + Thin Orca Panel</div>
       <h1>Hit a rate limit? <span>Auto-switch to your next account.</span></h1>
-      <p class="lede">OAH (Orca Auto Hand-off) is a standalone <code>oah</code> CLI and <code>oahd</code> daemon with a thin Orca sidebar panel. Claude stays Claude, Codex stays Codex: a session always keeps its provider. When an account hits a limit or runs low while you are away, <code>oahd</code> cools it down and hands the session off to the next healthy account — resuming Claude sessions in place with context and unsent text, or starting a summary hand-off for Codex, Antigravity, OpenCode and Devin.</p>
+      <p class="lede"><b>OAH (Orca Auto Hand-off)</b> pools Orca-managed accounts across <b>Claude, Codex, Antigravity, OpenCode, and Devin</b> — powered by a zero-dependency <code>oahd</code> daemon, a formal 3-state circuit breaker, an optional local HTTP failover proxy for API-key relays, and a thin Orca sidebar panel always attached to your current session.</p>
       <div class="badges">
-        <span class="badge">v<b>0.4.0</b></span>
+        <span class="badge">v<b>0.5.0</b></span>
         <span class="badge">Node <b>≥ 22.18</b> · zero deps</span>
         <span class="badge">Orca <b>≥ 1.4.261</b></span>
+        <span class="badge"><b>420</b> tests passing</span>
         <span class="badge"><b>MIT</b> license</span>
-        <span class="badge"><b>410</b> tests, real captured banners</span>
-        <span class="badge">Never hands off <b>across services</b></span>
       </div>
       <div class="cta">
-        <a class="btn primary" href="#install">Install</a>
-        <a class="btn" href="#cli">Explore oah CLI</a>
+        <a class="btn primary" href="#install">Get Started</a>
+        <a class="btn" href="#cli">Explore CLI</a>
       </div>
       <div class="cmd"><span class="dollar">$</span><span class="c">oah status --json</span><button class="copy" data-copy="oah status --json">Copy</button></div>
     </div>
 
     <div class="panel" aria-label="The OAH panel">
-      <div class="ph">OAH <span>◐ Auto · Early when away · waiting</span></div>
+      <div class="ph">OAH <span>● Auto · Early when away · on</span></div>
       <div class="row"><span>Automatic hand-off</span><span class="toggle"></span></div>
-      <div class="tabs"><b>Accounts</b><span>History (13)</span><span>Settings</span></div>
+      <div class="tabs"><b>Accounts</b><span>Proxy</span><span>History (14)</span><span>Settings</span></div>
       <div class="card">
-        <h4>claude · on screen</h4>
-        <div class="row"><span>Automatic hand-off</span><span class="toggle"></span></div>
-        <div class="sub">2 of 3 ready · 1 limited</div>
+        <h4>Claude · on screen</h4>
+        <div class="sub">2 of 3 ready · 1 half-open</div>
         <div class="acct">
-          <div class="row"><span>you@example.com</span><span class="pill on">active</span></div>
-          <div class="meter">5h 25%</div><div class="bar"><i style="width:25%"></i></div>
-          <div class="meter">Week 5%</div><div class="bar"><i style="width:5%"></i></div>
-          <div class="meter">fable week 7%</div><div class="bar"><i style="width:7%"></i></div>
+          <div class="row"><span>you@example.com</span><span class="pill on">active · closed</span></div>
+          <div class="meter">5h 24% used · resets 3h40m</div><div class="bar"><i style="width:24%"></i></div>
+          <div class="meter">Week 14% used</div><div class="bar"><i style="width:14%"></i></div>
         </div>
         <div class="acct">
-          <div class="row"><span>work@example.com</span><span class="pill cool">⏸ 1h20m</span></div>
-          <div class="meter">5h 100%</div><div class="bar"><i class="d" style="width:100%"></i></div>
-          <div class="meter">Week 62%</div><div class="bar"><i style="width:62%"></i></div>
-          <span class="ghost">Clear</span>
-        </div>
-        <div class="acct">
-          <div class="row"><span>third@example.com</span></div>
-          <div class="muted">No usage yet: Orca reports it once this account runs.</div>
-          <span class="ghost">Hand off to this account</span>
+          <div class="row"><span>work@example.com</span><span class="pill cool">half-open</span></div>
+          <div class="meter">5h 88% used</div><div class="bar"><i class="w" style="width:88%"></i></div>
         </div>
       </div>
       <div class="card">
-        <h4>codex</h4>
-        <div class="row"><span>Automatic hand-off</span><span class="toggle"></span></div>
-        <div class="sub">2 of 2 ready</div>
+        <h4>Codex</h4>
+        <div class="sub">2 of 2 ready · ordinaryUsageAllowed</div>
         <div class="acct">
-          <div class="row"><span>you@example.com</span><span class="pill on">active</span></div>
-          <div class="meter">5h 84%</div><div class="bar"><i class="w" style="width:84%"></i></div>
-          <div class="meter">Week 31%</div><div class="bar"><i style="width:31%"></i></div>
+          <div class="row"><span>team@example.com</span><span class="pill on">active · closed</span></div>
+          <div class="meter">5h 10% used · week 3% used</div><div class="bar"><i style="width:10%"></i></div>
         </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="arch">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Architecture</div>
+      <h2>One daemon per host. One session per workspace.</h2>
+      <p class="lede">Every machine runs its own independent <code>oahd</code> daemon under <code>~/.orca/oah/</code>. The <code>oah</code> CLI and the thin Orca plugin both speak the same NDJSON protocol — eliminating multi-server routing complexity and keeping CLI, scripts, and GUI 100% in sync.</p>
+    </div>
+    <div class="grid g4">
+      <div class="tile default">
+        <h3><code>oahd</code> Daemon <span class="tag">~/.orca/oah/</span></h3>
+        <p>Owns state, config, burn-rate history, circuit breakers, and hand-off orchestration. Atomic <code>0600</code> JSON files, auto-started on demand.</p>
+      </div>
+      <div class="tile">
+        <h3><code>oah</code> CLI <span class="tag">bin/oah</span></h3>
+        <p>First-class CLI with <code>--json</code> on every command. Works locally, over SSH, or on headless <code>orca serve</code> hosts without needing the UI panel.</p>
+      </div>
+      <div class="tile">
+        <h3>Thin Orca Plugin <span class="tag">worker.ts</span></h3>
+        <p>Zero business logic. Connects to <code>oahd.sock</code>, relays host events, exposes native Claude <code>agent.resume</code>, and renders the 4-tab OAH panel.</p>
+      </div>
+      <div class="tile">
+        <h3>HTTP Proxy <span class="tag">opt-in</span></h3>
+        <p>Optional <code>127.0.0.1:4080</code> failover proxy for Anthropic &amp; OpenAI API-key/relay endpoints with SSE streaming and latency benchmarking.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">What's New in v0.5.0</div>
+      <h2>Hardened by real-world fleet usage</h2>
+      <p class="lede">Incorporates battle-tested reliability patterns from Orca's multi-account community (<code>#20512</code>) and local proxy HA workflows.</p>
+    </div>
+    <div class="grid g3">
+      <div class="tile">
+        <h3>3-State Circuit Breaker</h3>
+        <p>Formal <code>closed → open → half_open → closed</code> state machine shared by subscription accounts and proxy providers. Healthy <code>closed</code> accounts always outrank recovering <code>half_open</code> ones.</p>
+      </div>
+      <div class="tile">
+        <h3>Codex <code>ordinaryUsageAllowed</code> Gate</h3>
+        <p>Never fooled by the <code>codex_bengalfox</code> Spark bucket sitting at 0% when ordinary Codex quota is exhausted. Expired logins map cleanly to <code>sign-in</code> instead of looping.</p>
+      </div>
+      <div class="tile">
+        <h3>Nested-Window Pacing</h3>
+        <p>Computes whole-window projection (<code>usedPercent / elapsedFraction</code>, guarded at ≥5% elapsed) across 5h, weekly, and model windows alongside 2-sample burn-rate runway.</p>
+      </div>
+      <div class="tile">
+        <h3>Model-Window Policy</h3>
+        <p>Configure <code>model_window_policy</code> as <code>fallback-model</code> (try <code>/model &lt;next&gt;</code> first), <code>rotate</code> (proactively rotate on Fable/Opus weekly caps), or <code>ignore</code>.</p>
+      </div>
+      <div class="tile">
+        <h3>Per-Workspace Pinning</h3>
+        <p>Run <code>oah pin &lt;workspace|terminal&gt; &lt;account&gt;</code> to lock dedicated long-running sessions onto one account while the rest of your fleet rotates freely.</p>
+      </div>
+      <div class="tile">
+        <h3>Instant <code>StopFailure</code> Hook + Live Probes</h3>
+        <p>Zero-regex Claude limit detection via <code>oah event stop-failure</code>, plus fallback probes for <code>codex app-server</code>, free <code>claude -p "/usage"</code>, and OpenCode Go.</p>
       </div>
     </div>
   </div>
@@ -297,278 +317,76 @@ footer a{color:var(--fg-2)}
 <section id="cli">
   <div class="wrap">
     <div class="sec-head">
-      <div class="eyebrow">CLI &amp; Daemon Architecture</div>
-      <h2>One CLI, one daemon, thin UI bridge</h2>
-      <p class="lede"><code>oahd</code> owns all state, settings, usage cache, burn-rate history and hand-off logic in <code>~/.orca/oah/</code> over a local Unix socket (<code>oahd.sock</code>). The <code>oah</code> CLI and the thin Orca plugin both talk to <code>oahd</code> — so local desktop, headless <code>orca serve</code> hosts, paired servers, scripts and agents all share one source of truth.</p>
-    </div>
-    <div class="grid g3">
-      <div class="tile default">
-        <h3><code>oah</code> CLI <span class="tag">bin/oah</span></h3>
-        <p>First-class command line with <code>--json</code> on every subcommand. Auto-starts <code>oahd</code> on demand; supports status, refresh, hand-off, account switching, pause/resume, skip, custom order, config, history, statusline and daemon control.</p>
-      </div>
-      <div class="tile">
-        <h3><code>oahd</code> Daemon <span class="tag">~/.orca/oah/</span></h3>
-        <p>Background Node.js daemon (zero npm dependencies). Persists <code>config.json</code>, <code>state.json</code>, <code>usage.json</code> and <code>samples.json</code> atomically with <code>0600</code> permissions, runs the periodic tick loop and watches live pane files.</p>
-      </div>
-      <div class="tile">
-        <h3>Thin Orca Plugin <span class="tag">src/plugin/worker.ts</span></h3>
-        <p>Zero business logic or local state. Connects to <code>oahd.sock</code>, forwards <code>agent.status.changed</code> and <code>workspace.changed</code> events, provides native <code>agent.resume</code> and desktop notifications, and renders the OAH sidebar panel.</p>
-      </div>
+      <div class="eyebrow">CLI Reference</div>
+      <h2>Scriptable, fast, <code>--json</code> everywhere</h2>
     </div>
     <div class="trace">
       <div class="term">
-        <div class="t">oah CLI — daily controls</div>
-        <div><span class="dim">$</span> <span class="k">oah</span> <span class="dim"># accounts, usage, runway &amp; cooldowns</span></div>
+        <div class="t">Accounts, Pinning &amp; Active Query</div>
+        <div><span class="dim">$</span> <span class="k">oah status</span> <span class="dim"># usage, runway, cooldowns, circuit</span></div>
+        <div><span class="dim">$</span> <span class="k">oah active</span> claude --json</div>
         <div><span class="dim">$</span> <span class="k">oah use</span> work@example.com</div>
-        <div><span class="dim">$</span> <span class="k">oah config set</span> timing at-limit</div>
-        <div><span class="dim">$</span> <span class="k">oah service</span> codex off</div>
-        <div><span class="dim">$</span> <span class="k">oah pause</span> <span class="dim">|</span> <span class="k">oah resume</span></div>
-        <div><span class="dim">$</span> <span class="k">oah history</span> --limit 10 --json</div>
+        <div><span class="dim">$</span> <span class="k">oah pin</span> ws-main personal@example.com</div>
+        <div><span class="dim">$</span> <span class="k">oah config set</span> model_window_policy rotate</div>
+        <div><span class="dim">$</span> <span class="k">oah sync export</span> &gt; oah-config.json</div>
       </div>
       <div class="term">
-        <div class="t">oahd daemon — lifecycle &amp; status</div>
-        <div><span class="dim">$</span> <span class="k">oah daemon status</span></div>
-        <div><span class="g">oahd 0.4.0 running</span> (pid 48210)</div>
-        <div>  <span class="dim">uptime:</span> 4h12m</div>
-        <div>  <span class="dim">socket:</span> ~/.orca/oah/oahd.sock</div>
-        <div>  <span class="dim">orca bridge:</span> <span class="g">connected</span></div>
+        <div class="t">Local HTTP Proxy, Providers &amp; Bench</div>
+        <div><span class="dim">$</span> <span class="k">oah provider add</span> anthropic Primary https://api.anthropic.com sk-…</div>
+        <div><span class="dim">$</span> <span class="k">oah provider add</span> anthropic Backup https://relay.example.com sk-…</div>
+        <div><span class="dim">$</span> <span class="k">oah bench</span></div>
+        <div><span class="g">112ms [fast]</span>  Primary (anthropic)</div>
+        <div><span class="y">340ms [ok]</span>    Backup (anthropic)</div>
+        <div><span class="dim">$</span> <span class="k">oah proxy start</span> --port 4080</div>
       </div>
     </div>
   </div>
 </section>
 
-<section id="how">
+<section id="proxy">
   <div class="wrap">
     <div class="sec-head">
-      <div class="eyebrow">How it works</div>
-      <h2>Six steps, one hand-off, no cascade</h2>
-      <p class="lede">Detection runs when a pane turns <code>done</code> or <code>waiting</code>. A limit banner among the last five meaningful lines, shaped like a CLI status line and not an agent reply, starts the sequence.</p>
-    </div>
-    <div class="steps">
-      <div class="step"><h3>Cool down</h3><p>The limited account is set aside until the reset time parsed from the banner, else Orca's <code>resetsAt</code>, else the default cooldown.</p></div>
-      <div class="step"><h3>Pick the next</h3><p>Auto takes the account of the same service that will last longest at its pace; Custom order takes the highest account in your order that has room.</p></div>
-      <div class="step"><h3>Select</h3><p>Runs <code>orca account select</code>, so new sessions use the new account too.</p></div>
-      <div class="step"><h3>Close</h3><p>Reads the input box twice, a second apart, and once more right before closing the pane, through the host API or the Orca CLI when the pane is in another workspace. Typing in progress calls the hand-off off. If the hand-off fails before the pane is closed, the next account is tried, up to three times.</p></div>
-      <div class="step"><h3>Resume</h3><p>Calls <code>agent.resume</code> on the same session id. Services that cannot resume (Codex, Antigravity, OpenCode, Devin) start a new session from a summary instead (at most 4,096 characters), and only at a real limit.</p></div>
-      <div class="step"><h3>First message</h3><p>Types the configured message, "Continue." by default, and the agent carries on. Only where a limit or API error interrupted the work: a session that had finished its turn and was handed off early is resumed and left ready. Plain text you had typed and not sent is put back, unsent (Claude).</p></div>
-    </div>
-
-    <div class="trace">
-      <div class="term">
-        <div class="t">Claude pane, before</div>
-        <div class="dim">⏺ Running the migration now…</div>
-        <div><span class="r">⎿</span>  5-hour limit reached ∙ resets 3pm</div>
-        <div class="dim">❯</div>
-      </div>
-      <div class="term">
-        <div class="t">OAH (oahd), moments later</div>
-        <div><span class="k">cooldown</span>  you@example.com <span class="dim">until 15:00</span></div>
-        <div><span class="k">select  </span>  orca account select work@example.com</div>
-        <div><span class="k">close   </span>  pane 3</div>
-        <div><span class="k">resume  </span>  agent.resume 7f3a… <span class="dim">on work@example.com</span></div>
-        <div><span class="k">send    </span>  "Continue."</div>
-        <div><span class="g">✓</span> one hand-off, same session, same workspace</div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="triggers">
-  <div class="wrap">
-    <div class="sec-head">
-      <div class="eyebrow">Triggers</div>
-      <h2>Every reason a session hands off, and what happens</h2>
-      <p class="lede">Each banner is handled once per session, so a transcript Orca redraws after a restore is never handed off twice. Usage numbers come from Orca's own <code>orca account list</code>. The plugin never reads tokens or keychains.</p>
+      <div class="eyebrow">Dual-Plane Failover</div>
+      <h2>Subscription hand-offs + optional API-key HTTP proxy</h2>
+      <p class="lede">Use Orca-managed subscription accounts for session hand-off/resume, or enable the opt-in local HTTP proxy for mid-turn zero-interruption failover across API-key relays — both managed from the same CLI and OAH Panel.</p>
     </div>
     <div class="tscroll">
-    <table class="tbl tbl-pair">
-      <thead><tr><th>Trigger</th><th>Action</th></tr></thead>
-      <tbody>
-        <tr><td>Rate-limit banner in the session's latest output</td><td>Cool the account down until the parsed reset time, hand off, resume.</td></tr>
-        <tr><td>Model-specific cap (for example a Claude Fable weekly cap)</td><td>Hand off to an account known to have room for that model, then type <code>/model &lt;next&gt;</code> from <em>Model fallback</em> in place, then try an account not known to be full for that model, then wait. <code>/model</code> is never typed into a pane whose input box holds unsent text.</td></tr>
-        <tr><td>API error (529, overloaded, stream disconnected)</td><td>Type the first message again after a Fibonacci backoff from 5 s to 120 s, up to <em>API error retries</em> (0 = never). Only while the pane is still between turns, and never into an input box that holds unsent text.</td></tr>
-        <tr><td>Sign-in failure</td><td>12-hour cooldown on that account, then hand off.</td></tr>
-        <tr><td>A turn ends while the account is about to run out (<em>Early when away</em>, once you have been away 10 minutes; Claude sessions)</td><td>Hand off, when the account would run out within 10 minutes at its current pace, or has less than 1 % of its 5-hour window left (97 % of the 5-hour or 99 % of the weekly window while the pace is unknown). The account left behind stays out of rotation until its window resets. While you are at Orca, and with <em>At limit</em>, this never happens: a session hands off only at a real limit.</td></tr>
-        <tr><td>A limit hits the session on screen</td><td><em>Ask me first</em> (default): you are notified and the panel asks "Hand off the session on screen?" with <em>Hand off now</em> or <em>Not now</em>; no answer acts like the next choice, <em>Not now</em> waits for another tab. <em>Wait, then count down</em>: wait while you are using Orca; otherwise a 60-second countdown with a notification. <em>Wait for me</em>: hand off once you switch tabs. <em>Move right away</em>: no waiting. A waiting session also offers <em>Hand off now</em> (which says why when it cannot), <em>Not now</em> and <em>Don't hand off</em>.</td></tr>
-        <tr><td>Every account of the service limited</td><td><em>Wait and resume</em>: the session waits and continues when the earliest account frees up; if its own account frees up first, it continues where it is. Carry on in the waiting pane yourself and the wait ends. Close it yourself and the session is not resumed. <em>Stop</em>: the session stops and you are told, also one waiting on screen.</td></tr>
-        <tr><td>A higher account in your order is healthy again (<em>Custom order</em>)</td><td><b>Switch back.</b> New sessions use it, and with <em>Early when away</em>, once you are away, Claude sessions on lower accounts hand off back when they finish a turn or sit idle; they are resumed and left ready, without the first message.</td></tr>
-        <tr><td>A Claude session idles on an account that is about to run out, or another account's weekly quota would expire unused (<em>Early when away</em>, you away)</td><td>Hand it off after <em>Hand off idle sessions after</em>, 15 minutes by default.</td></tr>
-        <tr><td><code>orca account select</code> fails for an account</td><td>Skip that account for 10 minutes and take the next.</td></tr>
-      </tbody>
-    </table>
-    </div>
-
-    <div class="grid g3" style="margin-top:28px">
-      <div class="tile"><h3>Guards on hand-offs</h3><p>Plain text you typed and did not send goes with a Claude session and is put back unsent; if it cannot be put back, the notification quotes its first 300 characters and History keeps all of it to copy. Pasted images or blocks, text over 4,000 characters, text with escape sequences, queued messages, and unsent text in Codex, Antigravity, OpenCode or Devin keep the session where it is until you send or clear it. The session on screen is never handed off early. Early, idle and switch-back hand-offs also need at least 10 % more room on the target, and change a service's selection at most once per 5 minutes; hard limits ignore those two. Claude's grey prompt suggestion is reported like typed text, so it may come back as real text, never sent without Enter.</p></div>
-      <div class="tile"><h3>Panes it did not start</h3><p>A restored pane has no recorded account. If it hits a limit while Orca shows plenty of room on the active account, the plugin cools nothing and simply resumes the session there.</p></div>
-      <div class="tile"><h3>Off switches</h3><p>Detection is heuristic. Run <code>oah pause</code> (or flip the top switch) to pause every service, <code>oah service &lt;name&gt; off</code> for one service, or <code>oah skip &lt;account&gt;</code> to keep an account out of automatic rotation.</p></div>
+      <table class="tbl">
+        <thead><tr><th>Capability</th><th>Subscription Plane (Default ON)</th><th>Local HTTP Proxy Plane (Opt-In)</th></tr></thead>
+        <tbody>
+          <tr><td>Accounts</td><td>Orca-managed Claude, Codex, Antigravity, OpenCode, Devin (never reads tokens)</td><td>API keys &amp; third-party relays in <code>~/.orca/oah/providers.json</code> (<code>0600</code>)</td></tr>
+          <tr><td>Failover point</td><td>Between turns / at rate limit / early when away / <code>StopFailure</code> hook</td><td>Mid-request on HTTP <code>429</code>, <code>5xx</code>, <code>529</code>, or timeout before stream starts</td></tr>
+          <tr><td>Recovery</td><td>Claude exact <code>agent.resume</code> + draft restore; summary hand-off for others</td><td>Transparent SSE stream retry with optional <code>modelMap</code> rewriting</td></tr>
+          <tr><td>Circuit breaker</td><td>Shared 3-state (<code>closed</code> / <code>open</code> / <code>half_open</code>)</td><td>Shared 3-state with exponential backoff &amp; <code>Retry-After</code></td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </section>
 
-<section id="strategies">
+<section id="safety">
   <div class="wrap">
     <div class="sec-head">
-      <div class="eyebrow">How it decides</div>
-      <h2>Four choices, sensible defaults</h2>
-      <p class="lede">Out of the box the plugin runs <b style="color:var(--fg)">Auto · Early when away</b> and picks the next account by how long it will last. While you are using Orca (and right after it starts) a session hands off only at a real limit, so it is seldom moved under you; once you have been away for 10 minutes, Claude sessions hand off shortly before an account runs out, so work does not stop at a limit. You count as here while you send or answer a prompt in the session on screen, type in a waiting session, switch tabs, use the panel or run one of its commands. Four basic settings in the panel's Settings tab change what runs: <em>Pick the next account</em>, <em>When to hand off</em>, <em>When everything is used up</em> and <em>Session on screen</em>. The rest is folded away under <em>Advanced</em>.</p>
-    </div>
-    <div class="grid g5">
-      <div class="tile"><h3>Auto</h3><p>The default. The account with the most room, judged by how fast each one is being used. Spends weekly quota that would expire unused first.</p></div>
-      <div class="tile"><h3>Custom order</h3><p>Your ranking, set with the arrows on the account cards. Hands off to the highest account with room, and goes back to a higher one once it is free again.</p></div>
-      <div class="tile"><h3>Early when away</h3><p>The default. Once you have been away a while, Claude sessions hand off shortly before an account runs out. While you are using Orca, sessions hand off only at a limit. Other services always hand off only at a limit.</p></div>
-      <div class="tile"><h3>At limit</h3><p>A session hands off only when it hits a limit. Each account is used to the end.</p></div>
-      <div class="tile"><h3>Session on screen</h3><p>Every pane of the tab Orca is showing. Never handed off early. At a limit, <em>Ask me first</em> (default) asks in the panel; unanswered, it waits while you are using Orca, then counts down. Or: <em>Wait, then count down</em>, <em>Wait for me</em>, <em>Move right away</em>.</p></div>
-    </div>
-    <p class="lede" style="margin-top:24px">The badge next to the panel's title says what is happening now: <b style="color:var(--fg)">● Auto · Early when away · on</b> (green, you are away), <b style="color:var(--fg)">◐ … · waiting</b> (you are here), <b style="color:var(--fg)">○ Auto · At limit</b> (grey) or <b style="color:var(--fg)">■ Paused</b> (amber). <b style="color:var(--fg)">When everything is used up</b>, the session waits for the first account to reset and continues by itself, or, with <em>Stop</em>, stops and you are told. Settings live in <code>~/.orca/oah/config.json</code> and stay in sync between <code>oah config</code> and the panel's Settings tab.</p>
-  </div>
-</section>
-
-<section id="providers">
-  <div class="wrap">
-    <div class="sec-head">
-      <div class="eyebrow">Providers</div>
-      <h2>Same service only, by design</h2>
-      <p class="lede">A Claude session hands off to another Claude account and a Codex session to another Codex account, never across services. How the session continues depends on what the service can do.</p>
+      <div class="eyebrow">Safety &amp; Privacy</div>
+      <h2>Fail-closed by default</h2>
     </div>
     <div class="grid g2">
       <div class="tile">
-        <h3>Claude <span class="tag">resume by session id</span></h3>
-        <p>Every Orca Claude profile shares the <code>~/.claude/projects</code> transcripts, so the exact session resumes on the next account. Usage for an account that has not run yet is unknown; such an account is a last resort, after every account with known room.</p>
-      </div>
-      <div class="tile">
-        <h3>Codex, Antigravity, OpenCode, Devin <span class="tag">summary</span></h3>
-        <p>These keep sessions per account, so the same agent is started on the next account with a hand-off summary of at most 4,096 characters: why the previous run stopped, the session title, branch, <code>git status</code>, <code>git diff --stat</code> and the last 40 lines of output. OpenCode and Devin report no usage, so only rate limits hand them off.</p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="ui">
-  <div class="wrap">
-    <div class="sec-head">
-      <div class="eyebrow">In the app</div>
-      <h2>Panel, commands, console line</h2>
-    </div>
-    <div class="grid g2">
-      <div class="tile">
-        <h3>Panel</h3>
-        <p>Gauge icon in the right sidebar. The badge next to the title says what is happening now (● on, ◐ waiting, ○ at limit, ■ paused, in one fixed-width slot). One section per service, with its brand colour, its own <em>Automatic hand-off</em> switch on a line of its own and "n of m ready"; the service on screen comes first, marked "· on screen". Each account with 5-hour, weekly and model bars, a status word, a cooldown with its reason and <em>Clear</em>, a <em>Skip</em> switch, arrows for <em>Custom order</em> and, on each standby account of the service on screen, <em>Hand off to this account</em> (it asks first; new sessions then start on that account and the session on screen hands off too if it is between turns; text that cannot go along is shown, and the panel asks once more). The Claude section has the <em>Status line</em> switch and, while it is on, the <em>Status line header</em>. Plus the pause switch, a <em>Waiting</em> box ("Hand off the session on screen?" with <em>Not now</em> / <em>Hand off now</em>; <em>Don't hand off</em>; <em>Cancel</em>), History in words with local times (<em>Limit reached</em>, <em>Running low</em>, <em>Back to preferred</em> …), and a Settings tab with Basic and Advanced settings, where each dropdown lists its default first, e.g. "Auto (Default)". There is no status bar item.</p>
-      </div>
-      <div class="tile">
-        <h3>Commands</h3>
-        <p>Start new Claude or Codex sessions on the next account. Hand off this workspace's session to another account. Pause or resume automatic hand-off. Refresh usage. Install or remove the console status line. Running one counts as a sign that you are here.</p>
-      </div>
-      <div class="tile">
-        <h3>Console status line for Claude panes</h3>
-        <p>Orca's own hook leaves Claude Code without a visible status line. The plugin's wrapper forwards every payload to Orca, then prints one row per account of the pane's service: percent left in the 5-hour, 7-day and best-model windows, green above 50 %, red at 20 or less. Every row shows the same numbers as the panel, and idle panes refresh every 10 seconds. ▶ marks this pane's account, ⏸ a cooldown. About 40 ms per render, no CLI calls.</p>
-        <pre style="margin-top:12px"><code>▶ you    5h ██████░░  78%  7d ████████  96%  fable ████████  94%
-· work   5h ████████ 100%  7d ████████ 100%  fable ████████ 100%
-· third  5h ░░░░░░░░   0%  7d ██████░░  81%  fable ██████░░  81%  ⏸1h20m</code></pre>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="settings">
-  <div class="wrap">
-    <div class="sec-head">
-      <div class="eyebrow">Settings</div>
-      <h2>Every knob, straight from the manifest</h2>
-      <p class="lede">The panel's Settings tab and <code>oah config set &lt;key&gt; &lt;value&gt;</code> both edit <code>~/.orca/oah/config.json</code>. The first four rows are all most people need; the rest are under <em>Advanced</em>.</p>
-    </div>
-    <div class="tscroll">
-    <table class="tbl tbl-keys">
-      <thead><tr><th>Key</th><th>Default</th><th>What it does</th></tr></thead>
-      <tbody>
-<tr><td><code>service_claude</code><div class="st">Automatic hand-off: Claude</div></td><td>on</td><td>Off: Claude sessions are never handed off or resumed automatically (Hand off to this account still works). The same switch exists for <code>service_codex</code>, <code>service_antigravity</code>, <code>service_opencode</code> and <code>service_devin</code>; in the panel it is the <em>Automatic hand-off</em> switch in each service's section.</td></tr>
-<tr><td><code>pick</code><div class="st">Pick the next account</div></td><td>smart</td><td>Which account a session is handed off to. smart (Auto, default): Picks the account with the most room, judged by how fast each one is being used. my-order (Custom order): Your ranking, set with the arrows in the Accounts tab. Goes back to a higher account once it is free again.</td></tr>
-<tr><td><code>timing</code><div class="st">When to hand off</div></td><td>early</td><td>When sessions are handed off to another account. early (Early when away, default): Once you have been away a while, Claude sessions hand off shortly before an account runs out, so work does not stop at a limit. While you are using Orca, sessions hand off only at a limit. Other services always hand off only at a limit. at-limit (At limit): A session hands off only when it hits a limit. Each account is used to the end.</td></tr>
-<tr><td><code>when_all_used</code><div class="st">When everything is used up</div></td><td>wait</td><td>When no account of the service has room. wait (Wait and resume, default): The session waits for the first account to reset, then continues by itself. stop (Stop): The session stops and you are told.</td></tr>
-<tr><td><code>active_terminal</code><div class="st">Session on screen</div></td><td>ask</td><td>The session in the tab Orca is showing. You may be reading or typing in it, so it gets extra care. ask (Ask me first, default): Never handed off early. At a limit the Auto Hand-off panel asks whether to hand it off now. If you do not answer, it waits while you are using Orca, then counts down. Not now: it waits until you switch tabs. careful (Wait, then count down): Never handed off early. At a limit it waits while you are using Orca, then hands off after a short countdown that you can cancel. wait (Wait for me): Stays until you switch to another tab or press Hand off now. now (Move right away): No waiting: it hands off as soon as it is between turns, early hand-offs included, like sessions in other tabs.</td></tr>
-<tr><td><code>away_minutes</code><div class="st">Advanced: Start early hand-offs after you&#x27;ve been away</div></td><td>10</td><td>Early hand-offs start only once there has been no sign of you this long (sending or answering a prompt, typing in a waiting session, switching tabs, using the Auto Hand-off panel or one of its commands). 0 = always, even while you are here. 0 to 240 min.</td></tr>
-<tr><td><code>early_minutes</code><div class="st">Advanced: Hand off this long before running out</div></td><td>10</td><td>Hand off when an account would run out within this many minutes at its current pace. 1 to 120 min.</td></tr>
-<tr><td><code>early_percent_left</code><div class="st">Advanced: Always hand off below (% left)</div></td><td>1</td><td>Also hand off when less than this much of the 5-hour window is left, however slowly it is being used. 1 % by default: an account at 99 % is left whatever its pace, since one big turn could use the rest. 0 = by pace only. 0 to 50 %.</td></tr>
-<tr><td><code>idle_minutes</code><div class="st">Advanced: Hand off idle sessions after</div></td><td>15</td><td>A session idle this long is handed off from an account that is about to run out, or to an account whose weekly quota would expire unused. 0 = never: idle sessions stay, and expiring quota is spent only by new sessions. 0 to 1440 min.</td></tr>
-<tr><td><code>switch_cooldown_minutes</code><div class="st">Advanced: Minimum time between early hand-offs</div></td><td>5</td><td>Early hand-offs never change the account more often than this. A limit always hands off. 0 to 240 min.</td></tr>
-<tr><td><code>active_countdown_seconds</code><div class="st">Advanced: Countdown for the session on screen</div></td><td>60</td><td>How long the countdown lasts before the session on screen hands off anyway. 10 to 3600 s.</td></tr>
-<tr><td><code>active_presence_seconds</code><div class="st">Advanced: Keep the session on screen waiting after your last activity</div></td><td>300</td><td>You count as using Orca for this long after your last activity (sending or answering a prompt, typing in a waiting session, switching tabs, using the Auto Hand-off panel or one of its commands). 10 to 3600 s.</td></tr>
-<tr><td><code>active_reminder_minutes</code><div class="st">Advanced: Remind me when the session on screen has waited</div></td><td>10</td><td>One reminder when the session on screen has waited this long to hand off. 0 = none. 0 to 1440 min.</td></tr>
-<tr><td><code>restore_unsent_text</code><div class="st">Advanced: Put unsent text back after a hand-off</div></td><td>on</td><td>Claude: text typed and not sent goes back, unsent, into the session after a hand-off. Off, and for other services: the session waits until the text is sent or cleared. Pasted images or blocks, queued messages, and text over 4,000 characters always wait.</td></tr>
-<tr><td><code>auto_message</code><div class="st">Advanced: First message after a limit</div></td><td>Continue.</td><td>Typed into a session whose work was interrupted (a limit or an API error) once it continues, and when a waiting session wakes. Empty = none after a hand-off; an API error retry then types “continue”.</td></tr>
-<tr><td><code>max_api_retries</code><div class="st">Advanced: API error retries</div></td><td>6</td><td>Retry a turn that failed with a passing API error (overloaded, 5xx) at most this many times in a row, with growing pauses. 0 = never retry. 0 to 50.</td></tr>
-<tr><td><code>model_fallback</code><div class="st">Advanced: Model fallback</div></td><td><em>empty</em></td><td>At a model limit, when no other account is known to have room for that model, try these models on the same account before handing off. Per service, separated by semicolons.</td></tr>
-<tr><td><code>default_cooldown_minutes</code><div class="st">Advanced: Cooldown when a limit gives no reset time</div></td><td>60</td><td>How long an account is set aside when its limit message gives no reset time. 1 to 1440 min.</td></tr>
-<tr><td><code>poll_interval_seconds</code><div class="st">Advanced: Read usage every</div></td><td>60</td><td>How often usage is read from Orca. 15 to 3600 s.</td></tr>
-<tr><td><code>handoff_max_chars</code><div class="st">Advanced: Hand-off summary size</div></td><td>6000</td><td>Services that cannot resume (Codex, Antigravity, OpenCode, Devin) start the new session with a summary this long at most. Orca takes at most 4,096 characters, so a larger value changes nothing. 500 to 50000 chars.</td></tr>
-<tr><td><code>orca_cli_path</code><div class="st">Advanced: Orca CLI path</div></td><td><em>empty</em></td><td>Only if the orca command is not found by itself.</td></tr>
-<tr><td><code>console_statusline_format</code><div class="st">Status line header</div></td><td><em>empty</em></td><td>An optional first line of the Claude status line. Empty = account rows only. In the panel: under the Claude Status line switch.</td></tr>
-<tr><td><code>exclude</code><div class="st">Advanced: Skipped accounts</div></td><td><em>empty</em></td><td>Accounts never chosen automatically, separated by commas: an account (work@example.com), or one of a service (claude:work@example.com). In the panel: the Skip switch on each account card.</td></tr>
-<tr><td><code>chain</code><div class="st">Advanced: Custom order</div></td><td><em>empty</em></td><td>Set with the arrows in the panel when Pick the next account is Custom order (Auto ignores it): accounts, as the panel writes them (claude:&lt;account id&gt;) or by email (work@example.com, claude:work@example.com), or every account of a service (claude:*), separated by commas.</td></tr>
-      </tbody>
-    </table>
-    </div>
-  </div>
-</section>
-
-<section id="trust">
-  <div class="wrap">
-    <div class="sec-head">
-      <div class="eyebrow">Permissions</div>
-      <h2>What it runs, and what it never touches</h2>
-      <p class="lede">Orca shows you exactly this before the plugin is enabled, and the approval fingerprint is bound to the plugin, version, files and access.</p>
-    </div>
-    <div class="grid g2">
-      <div class="tile">
-        <h3>Host capabilities</h3>
+        <h3>Session Protection</h3>
         <ul class="check">
-          <li><b>agent:read, agent:launch</b> to see pane status and resume sessions</li>
-          <li><b>terminal:read, terminal:send</b> to read the last lines and type the first message</li>
-          <li><b>workspace:read, notifications:show</b></li>
-          <li><b>storage:own, settings:own</b> for history and your settings</li>
+          <li><b>Never interrupts a running turn:</b> hands off only between turns, when idle, or at a limit.</li>
+          <li><b>On-screen care:</b> <code>ask</code> (default), <code>careful</code> (presence-aware countdown), <code>wait</code>, or <code>now</code>.</li>
+          <li><b>Unsent draft preservation:</b> reads the input box twice before closing; restores plain text (≤4,000 chars) unsent via bracketed paste on Claude; parks if queued messages or pasted images exist.</li>
+          <li><b>Same-service invariant:</b> Claude only hands off to Claude, Codex only to Codex.</li>
         </ul>
       </div>
       <div class="tile">
-        <h3>Outside the host API</h3>
+        <h3>Zero-Trust Local Footprint</h3>
         <ul class="check">
-          <li>Runs the <b>orca CLI</b>: <code>account select</code>, <code>account list</code>, <code>terminal close</code>, <code>terminal send</code>, <code>terminal read</code> (only to ask whether a pane holds unsent text; that text is put back after a hand-off, or shown when the panel asks before a hand-off by hand), <code>terminal list</code> (only to see which terminal tab is in front). Always an argument list, never a shell.</li>
-          <li>For a project on a paired Orca server: loads Orca's own runtime client from the app bundle (<code>cli/runtime/client.js</code>, and before it the store helper <code>shared/remote-runtime/host-store/runtime-environment-store-execution.js</code>) to list and select that server's accounts, and to look up, read-only, which Orca a workspace runs on. The list call passes <code>refreshUsage: false, refreshStaleUsage: true</code>: no forced refresh, but that Orca may refresh readings it considers stale. These are Orca internals, not a published API</li>
-          <li>Stores daemon state, config, usage cache, socket (<code>oahd.sock</code>) and status files under <code>~/.orca/oah/</code> (folder mode <code>0700</code>, files mode <code>0600</code>), and, only when you install the console status line, that workspace's <code>.claude/settings.local.json</code></li>
-          <li>Runs <b>git status</b> and <b>git diff --stat</b> for hand-off summaries</li>
-          <li><b>Never</b> reads tokens, keychains or credential files</li>
-          <li>A hand-off summary carries up to 40 lines of the previous agent's output, so treat it like any pasted terminal output</li>
-        </ul>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="limits">
-  <div class="wrap">
-    <div class="sec-head">
-      <div class="eyebrow">Known limitations</div>
-      <h2>Read these before you rely on it</h2>
-      <p class="lede">None of them interrupts a turn or crosses services. The README lists the rest.</p>
-    </div>
-    <div class="grid g2">
-      <div class="tile">
-        <h3>When a session hands off</h3>
-        <ul class="check">
-          <li>Closing a pane also stops the background processes the agent left running in it (a dev server, a watcher)</li>
-          <li>If the resume fails after the pane was closed, the session stays closed. You are notified and can reopen it; the conversation is not lost</li>
-          <li>Codex, Antigravity, OpenCode and Devin start a new session from a summary, so they hand off only at a real limit or when you ask</li>
-          <li>If Orca cannot be asked whether a session is mid-turn or holds unsent text, it is not handed off until Orca answers. The same holds while Orca cannot say where a workspace runs; it is asked again at the next check</li>
-          <li>Orca cannot say whether you are in front of it, only which tab is shown: a session on screen you are reading without typing can hand off after the countdown if you do not answer the panel's question</li>
-          <li>Claude's grey prompt suggestion is reported like typed text, so it can come back as real text after a hand-off (never sent without Enter). The scroll position is not kept</li>
-        </ul>
-      </div>
-      <div class="tile">
-        <h3>Commands and the status line</h3>
-        <ul class="check">
-          <li>The hand-off command picks the first idle agent when a plain shell tab is in front</li>
-          <li>The next-account commands change the account for new sessions at once, and Orca may show its restart prompt. You do not need to press Restart</li>
-          <li><em>Hand off to this account</em> turns automatic hand-off off for that service, until you turn it on again</li>
-          <li>The console status line needs <code>sh</code> (no Windows), and installing it writes <code>.claude/settings.local.json</code> in the repository</li>
+          <li><b>Never touches subscription tokens or keychains:</b> delegates all selection to <code>orca account select</code>.</li>
+          <li><b>Private owner-only storage:</b> <code>~/.orca/oah/</code> is mode <code>0700</code>, files mode <code>0600</code>; <code>oah sync export</code> redacts API keys automatically.</li>
+          <li><b>No shell interpolation:</b> runs <code>orca</code> and <code>git</code> via argument arrays only.</li>
+          <li><b>Zero npm dependencies:</b> pure TypeScript running natively on Node.js ≥ 22.18.</li>
         </ul>
       </div>
     </div>
@@ -579,12 +397,12 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <div class="sec-head">
       <div class="eyebrow">Install</div>
-      <h2>Use the CLI right away, add the thin panel in Orca</h2>
+      <h2>CLI in 10 seconds, thin Orca panel in two commands</h2>
     </div>
     <ol>
       <li>
         <div>
-          <p>Run the <code>oah</code> CLI directly from a checkout (requires Node.js ≥ 22.18, zero npm dependencies). It auto-starts <code>oahd</code> on demand.</p>
+          <p>Run <code>oah</code> directly from a checkout (auto-starts <code>oahd</code> on demand):</p>
           <pre><code>git clone https://github.com/ngoohebi/orca-auto-handoff.git
 cd orca-auto-handoff
 ./bin/oah status</code></pre>
@@ -592,7 +410,7 @@ cd orca-auto-handoff
       </li>
       <li>
         <div>
-          <p>Install the thin Orca plugin so <code>oahd</code> gets instant event push, native Claude <code>agent.resume</code>, desktop notifications and the OAH sidebar panel.</p>
+          <p>Install the thin Orca plugin for instant event push, native Claude <code>agent.resume</code>, and the 4-tab sidebar panel:</p>
           <pre><code>orca plugin install ngoohebi/orca-auto-handoff
 # approve with the printed fingerprint:
 orca plugin install ngoohebi/orca-auto-handoff --approve ap1-…</code></pre>
@@ -600,17 +418,16 @@ orca plugin install ngoohebi/orca-auto-handoff --approve ap1-…</code></pre>
       </li>
       <li>
         <div>
-          <p>Add a second account for the service in Orca, if you have not already. Open the <b>OAH</b> panel (gauge icon, right sidebar) or control everything from your terminal with <code>oah</code>.</p>
+          <p>Open the <b>OAH</b> panel in Orca's right sidebar, or control everything from any terminal with <code>oah</code>.</p>
         </div>
       </li>
     </ol>
     <details>
-      <summary>Developing OAH</summary>
-      <pre style="margin-top:12px"><code>npm run test:cli                 # standalone Node tests (oahd daemon, oah CLI, thin plugin bridge)
-npm run test:plugin              # 410 tests via orca plugin test
+      <summary>Developing &amp; testing OAH</summary>
+      <pre style="margin-top:12px"><code>npm run test:cli                 # 15 standalone Node tests (v0.5 core, daemon, probes, proxy, CLI, thin bridge)
+npm run test:plugin              # 420 tests across all 15 suites via `orca plugin test`
 npm run typecheck                # strict TypeScript check (zero npm dependencies)
 npm run validate                 # validates orca-plugin.json
-orca plugin dev load . --json    # load thin plugin locally
 ./bin/oah debug --json           # daemon status, bridge state &amp; recent events</code></pre>
     </details>
   </div>
@@ -620,10 +437,9 @@ orca plugin dev load . --json    # load thin plugin locally
 
 <footer>
   <div class="wrap">
-    <span>OAH (Orca Auto Hand-off) · MIT license · by <a href="https://github.com/ngoohebi">ngoohebi</a></span>
+    <span>OAH v0.5.0 · MIT license · by <a href="https://github.com/ngoohebi">ngoohebi</a></span>
     <a href="https://github.com/ngoohebi/orca-auto-handoff">Source on GitHub</a>
     <a href="https://github.com/ngoohebi/orca-auto-handoff/issues">Issues</a>
-    <span>Ideas borrowed with thanks from cswap, tokenmaxx and the Orca community's rotation PRs.</span>
   </div>
 </footer>
 
@@ -638,8 +454,10 @@ orca plugin dev load . --json    # load thin plugin locally
   });
   document.querySelectorAll('.copy').forEach(function(b){
     b.addEventListener('click',function(){
-      var t=b.getAttribute('data-copy');
-      if(navigator.clipboard){navigator.clipboard.writeText(t).then(function(){b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1400);});}
+      var t=b.getAttribute('data-copy')||'';
+      navigator.clipboard&&navigator.clipboard.writeText(t).then(function(){
+        var old=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=old;},1200);
+      });
     });
   });
 })();
