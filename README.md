@@ -1,4 +1,4 @@
-# OAH — Orca Auto Hand-off v0.5.0
+# OAH (Orca Auto Hand-off) v0.5.0
 
 **Hit a rate limit? Auto-switch to your next account and keep working.**
 
