@@ -10,16 +10,16 @@ Product page: <https://ngoohebi.github.io/orca-auto-handoff/>
 
 ## Install
 
-1. Add at least two accounts of a service in **Orca → Settings → AI Provider Accounts** (for example, two Claude or Codex accounts).
-2. Install OAH in Orca:
+1. **Add accounts in Orca:** Open **Orca → Settings → AI Provider Accounts** and sign in to at least two accounts for a service (e.g., two Claude or Codex accounts).
+2. **Install & approve OAH:**
 
    ```sh
    orca plugin install ngoohebi/orca-auto-handoff
    ```
 
-   Orca shows the requested permissions and prints the same command with `--approve <fingerprint>`; run that to approve.
-3. Open the **OAH** panel (gauge icon, right sidebar). That's it — the defaults (**Auto · Early when away · Ask me first**, **Live quota** on, **Claude status line** on) need no configuration.
-4. Work as usual. While you are at Orca, sessions hand off only at a real limit; once you have been away for 10 minutes, Claude sessions hand off shortly before running out so work never stalls mid-turn.
+   Orca lists the requested capabilities and prints the exact approval command (`orca plugin install ngoohebi/orca-auto-handoff --approve ap1-…`). Run that command to enable the plugin.
+   *(To update later, run `orca plugin update ngoohebi.oah`; to install from a local checkout, run `orca plugin install . --json` and approve with the printed fingerprint.)*
+3. **Open the OAH panel:** Click the **OAH** gauge icon in Orca's right sidebar. Everything works out of the box with **Auto · Early when away**, **Live quota** on, and **Claude status line** on — no configuration needed.
 
 ---
 
@@ -101,16 +101,6 @@ All settings are in the **OAH** panel's **Settings** tab (stored in `~/.orca/oah
 
 ---
 
-## Optional: `oah` CLI (Power Users / Headless)
-
-You never need the command line for everyday use in Orca. Under the hood, OAH runs a lightweight local background helper (`oahd` on `~/.orca/oah/oahd.sock`) so state and timers survive panel closes and reloads. If you want terminal automation, scripting, or headless `orca serve` control, the optional **`oah` CLI** (`bin/oah`, `--json` on every command) exposes the same engine:
-
-- **Status & controls:** `oah status`, `oah active [service]`, `oah refresh`, `oah use <account> [--force]`, `oah handoff`, `oah next [service]`, `oah pause|resume`, `oah service <svc> on|off`, `oah clear <account>`, `oah order up|down <account>`, `oah history`, `oah config [get|set]`
-- **Pinning & waiting responses:** `oah pin <workspace|terminal> <account>`, `oah unpin <id>`, `oah pins`, `oah now|notnow|cancel <terminalId>`
-- **Sync, hooks & daemon:** `oah sync export|import <file>`, `oah event stop-failure`, `oah session`, `oah daemon start|stop|restart|status|logs`
-
----
-
 ## Permissions & Privacy
 
 - **Credentials stay with Orca and provider CLIs:** OAH never writes the macOS Keychain, never creates accounts, and never copies subscription tokens into its own config.
@@ -138,3 +128,27 @@ orca plugin check . --json       # renders the panel against the real worker
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+## CLI (Optional)
+
+You never need the command line for everyday use in Orca. Under the hood, OAH runs a lightweight local background helper (`oahd` on `~/.orca/oah/oahd.sock`) so state and timers survive panel closes and reloads. For scripts, automation, or headless `orca serve` hosts, the optional **`oah` CLI** (`bin/oah`, `--json` on every command) exposes the same engine:
+
+| Command | Arguments / Flags | What it does |
+|---|---|---|
+| `oah` / `oah status` | `[--json]` | Show accounts, 5h/day/week usage, runway, cooldowns, circuit state, and waiting sessions |
+| `oah active` | `[service] [--json]` | Print active account(s) with key and circuit state for scripts and external agents |
+| `oah refresh` | `[--json]` | Refresh usage, then show status |
+| `oah use` | `<account> [--force]` | Select `<account>` and hand off the on-screen session (`--force` overrides non-portable unsent text) |
+| `oah handoff` / `oah next` | `[service] [--json]` | Hand off the focused workspace session, or select the next healthy account for new launches |
+| `oah pause` / `oah resume` | `[--json]` | Turn global automatic hand-off off or on (`oah service <svc> on\|off` per service) |
+| `oah clear` / `oah order` | `<account>` / `up\|down` | End cooldown & reset circuit breaker, or reorder Custom order |
+| `oah pin` / `oah unpin` / `oah pins` | `<id> <account>` | Pin a workspace or terminal ID to one account, remove a pin, or list pins |
+| `oah now` / `oah notnow` / `oah cancel` | `<terminalId>` | Answer a waiting on-screen hand-off |
+| `oah history` | `[--limit 50] [--json]` | Show recent hand-off history |
+| `oah config` | `[get [key]] \| set <k> <v>` | Read or update `~/.orca/oah/config.json` (aliases: `oah settings`, `oah set`) |
+| `oah statusline` | `[status\|install\|remove]` | Check, enable, or disable the Claude status line |
+| `oah event` | `stop-failure [--session <id>]` | Instant Claude Code `StopFailure` hook trigger |
+| `oah sync` | `export \| import <file>` | Export or import portable config JSON |
+| `oah session` / `oah daemon` | `start\|stop\|restart\|status\|logs` | Persistent NDJSON stdio session and `oahd` lifecycle control |

@@ -179,6 +179,7 @@ footer a{color:var(--fg-2)}
       <li><a href="#panel">Panel</a></li>
       <li><a href="#safety">Safety</a></li>
       <li><a href="#install">Install</a></li>
+      <li><a href="#cli">CLI</a></li>
     </ul>
     <button class="iconbtn" id="theme" title="Toggle light and dark" aria-label="Toggle light and dark">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9c0-.5 0-1-.1-1.4A7 7 0 0 1 12 3z"/></svg>
@@ -368,36 +369,59 @@ footer a{color:var(--fg-2)}
   <div class="wrap">
     <div class="sec-head">
       <div class="eyebrow">Install</div>
-      <h2>Two commands and an approval</h2>
+      <h2>Ready in under a minute</h2>
+      <p class="lede">Requires Orca <b>≥ 1.4.261</b> and at least two saved accounts for a service.</p>
     </div>
     <ol>
       <li>
         <div>
-          <p>Install from GitHub. Orca prints the permissions and an approval fingerprint:</p>
-          <pre><code>orca plugin install ngoohebi/orca-auto-handoff</code></pre>
+          <p><b>Add accounts in Orca:</b> Open <b>Settings → AI Provider Accounts</b> and sign in to two or more accounts for a service (for example, two Claude or Codex accounts).</p>
         </div>
       </li>
       <li>
         <div>
-          <p>Approve with the printed fingerprint:</p>
-          <pre><code>orca plugin install ngoohebi/orca-auto-handoff --approve ap1-…</code></pre>
+          <p><b>Install &amp; approve OAH:</b> Run the install command, then re-run with the approval fingerprint Orca prints:</p>
+          <pre><code>orca plugin install ngoohebi/orca-auto-handoff
+orca plugin install ngoohebi/orca-auto-handoff --approve ap1-…</code></pre>
         </div>
       </li>
       <li>
         <div>
-          <p>Open the <b>OAH</b> panel (gauge icon, right sidebar). Add a second account for a service in Orca if you haven't already — no other setup needed.</p>
+          <p><b>Open the OAH panel:</b> Click the gauge icon in Orca's right sidebar. Everything works immediately with <b>Auto · Early when away</b>, <b>Live quota</b> on, and the <b>Claude status line</b> on — no extra setup needed.</p>
         </div>
       </li>
     </ol>
     <details>
-      <summary>Optional: <code>oah</code> CLI (for scripts, automation, or headless servers)</summary>
-      <p style="color:var(--fg-2);margin-top:12px">You never need the CLI for everyday use in Orca. For terminal automation, headless <code>orca serve</code> hosts, or workspace pinning, the optional <code>oah</code> CLI talks to the same local background helper (<code>~/.orca/oah/oahd.sock</code>) with <code>--json</code> on every command:</p>
-      <pre style="margin-top:8px"><code>oah status --json                # accounts, usage, runway, cooldowns &amp; circuit state
-oah active claude --json         # active account for scripts &amp; external agents
-oah use work@example.com         # select account + hand off on-screen session
-oah pin &lt;workspace&gt; &lt;account&gt;    # pin a workspace/terminal out of auto-rotation
-oah sync export &gt; oah.json       # portable config backup</code></pre>
+      <summary>Updating or installing from a local checkout</summary>
+      <pre style="margin-top:12px"><code>orca plugin update ngoohebi.oah          # update an existing install
+orca plugin install . --json             # install from a local git checkout (approve with printed fingerprint)</code></pre>
     </details>
+  </div>
+</section>
+
+<section id="cli">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Optional</div>
+      <h2>The <code>oah</code> CLI</h2>
+      <p class="lede">You never need the command line for everyday use in Orca. For terminal automation, scripting, or headless <code>orca serve</code> hosts, the optional <code>oah</code> CLI talks to the same local background helper (<code>~/.orca/oah/oahd.sock</code>) with <code>--json</code> on every command.</p>
+    </div>
+    <div class="tscroll">
+      <table class="tbl">
+        <thead><tr><th>Command</th><th>Arguments</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><code>oah status</code></td><td><code>[--json]</code></td><td>Accounts, 5h/day/week usage, runway, cooldowns, circuit state &amp; waiting sessions</td></tr>
+          <tr><td><code>oah active</code></td><td><code>[service] [--json]</code></td><td>Active account(s) for scripts and external agents</td></tr>
+          <tr><td><code>oah use</code></td><td><code>&lt;account&gt; [--force]</code></td><td>Select account and hand off the on-screen session</td></tr>
+          <tr><td><code>oah handoff</code> / <code>next</code></td><td><code>[service] [--json]</code></td><td>Hand off focused workspace session, or pick next healthy account for new launches</td></tr>
+          <tr><td><code>oah pause</code> / <code>resume</code></td><td><code>[--json]</code></td><td>Global automatic hand-off off or on (<code>oah service &lt;svc&gt; on|off</code> per service)</td></tr>
+          <tr><td><code>oah clear</code> / <code>order</code></td><td><code>&lt;account&gt;</code> / <code>up|down</code></td><td>End cooldown &amp; reset circuit breaker, or reorder Custom order</td></tr>
+          <tr><td><code>oah pin</code> / <code>unpin</code> / <code>pins</code></td><td><code>&lt;id&gt; &lt;account&gt;</code></td><td>Pin a workspace or terminal out of automatic rotation</td></tr>
+          <tr><td><code>oah config</code></td><td><code>[get [k]] | set &lt;k&gt; &lt;v&gt;</code></td><td>Read or update <code>~/.orca/oah/config.json</code></td></tr>
+          <tr><td><code>oah sync</code> / <code>daemon</code></td><td><code>export|import|status|logs</code></td><td>Portable config export/import and background helper control</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </section>
 
