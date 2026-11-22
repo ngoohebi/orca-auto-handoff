@@ -8,7 +8,7 @@ Product page: <https://ngoohebi.github.io/orca-auto-handoff/>
 
 ---
 
-## Quick Start
+## Install
 
 1. Add at least two accounts of a service in **Orca → Settings → AI Provider Accounts** (for example, two Claude or Codex accounts).
 2. Install OAH in Orca:
@@ -101,13 +101,12 @@ All settings are in the **OAH** panel's **Settings** tab (stored in `~/.orca/oah
 
 ---
 
-## Optional: `oah` CLI & Local HTTP Proxy (Power Users / Headless)
+## Optional: `oah` CLI (Power Users / Headless)
 
-You never need the command line for everyday use in Orca. Under the hood, OAH runs a lightweight local background helper (`oahd` on `~/.orca/oah/oahd.sock`) so state and timers survive panel closes and reloads. If you want terminal automation, scripting, headless `orca serve` control, or an API-key failover proxy, the optional **`oah` CLI** (`bin/oah`, `--json` on every command) exposes the same engine:
+You never need the command line for everyday use in Orca. Under the hood, OAH runs a lightweight local background helper (`oahd` on `~/.orca/oah/oahd.sock`) so state and timers survive panel closes and reloads. If you want terminal automation, scripting, or headless `orca serve` control, the optional **`oah` CLI** (`bin/oah`, `--json` on every command) exposes the same engine:
 
 - **Status & controls:** `oah status`, `oah active [service]`, `oah refresh`, `oah use <account> [--force]`, `oah handoff`, `oah next [service]`, `oah pause|resume`, `oah service <svc> on|off`, `oah clear <account>`, `oah order up|down <account>`, `oah history`, `oah config [get|set]`
 - **Pinning & waiting responses:** `oah pin <workspace|terminal> <account>`, `oah unpin <id>`, `oah pins`, `oah now|notnow|cancel <terminalId>`
-- **Optional API-key HTTP proxy & bench:** `oah proxy start [--port 4080]|stop|status`, `oah provider list|add|on|off|rm`, `oah bench`
 - **Sync, hooks & daemon:** `oah sync export|import <file>`, `oah event stop-failure`, `oah session`, `oah daemon start|stop|restart|status|logs`
 
 ---

@@ -114,10 +114,13 @@ nav ul a:hover{color:var(--fg);text-decoration:none}
 .acct{padding:8px 0;border-top:1px solid color-mix(in srgb,var(--line) 65%,transparent)}
 .acct:first-of-type{border-top:0;padding-top:0}
 .pill{font-size:.72rem;border:1px solid var(--line-2);border-radius:999px;padding:1px 8px;color:var(--fg-2);display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
-.pill.on::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok)}
-.pill.cool{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 50%,var(--line-2))}
-.bar{height:5px;background:var(--line);border-radius:999px;overflow:hidden;margin-top:4px}
-.bar i{display:block;height:100%;background:var(--fg-2);border-radius:999px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex:none}
+.dot.ok{background:var(--ok)}.dot.ready{border:1.5px solid var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--danger)}
+.sbtn{font-size:.72rem;border:1px solid var(--line-2);border-radius:6px;padding:2px 8px;color:var(--fg-2);background:transparent;white-space:nowrap}
+.src{color:var(--fg-3);font-size:.72rem;margin-top:4px}
+.bmeta{display:flex;justify-content:space-between;color:var(--fg-3);font-size:.73rem;margin-top:5px}
+.bar{height:5px;background:var(--line);border-radius:999px;overflow:hidden;margin-top:3px}
+.bar i{display:block;height:100%;background:var(--ok);border-radius:999px}
 .bar i.w{background:var(--warn)}.bar i.d{background:var(--danger)}
 
 .grid{display:grid;gap:14px}
@@ -211,27 +214,38 @@ footer a{color:var(--fg-2)}
 
     <div class="panel" aria-label="The quiet 3-tab OAH panel">
       <div class="row" style="margin-bottom:6px"><strong>Automatic hand-off</strong><span class="toggle"></span></div>
-      <div class="row"><span class="state">Auto · Early when away · on</span><span style="color:var(--fg-3);font-size:.75rem">just now ↻</span></div>
+      <div class="row"><span class="state">Early hand-offs on</span><span style="color:var(--fg-3);font-size:.75rem">just now ↻</span></div>
       <div class="tabs"><b>Accounts</b><span>History</span><span>Settings</span></div>
       <div class="svc">
         <div class="svc-head"><h4>Claude · on screen</h4><small>2 of 3 ready</small></div>
         <div class="acct">
-          <div class="row"><span>you@example.com <span class="pill on">active</span></span><span style="color:var(--fg-3);font-size:.74rem">5h 24% · wk 14%</span></div>
+          <div class="row"><span style="display:inline-flex;align-items:center;gap:6px"><i class="dot ok"></i><span>you@example.com</span><span style="color:var(--ok);font-size:.74rem">· active</span></span></div>
+          <div class="bmeta"><span>5h</span><span>76% left · resets in 3h 40m</span></div>
           <div class="bar"><i style="width:24%"></i></div>
+          <div class="bmeta"><span>Week</span><span>86% left · resets in 4d</span></div>
+          <div class="bar"><i style="width:14%"></i></div>
+          <div class="src">From Orca · just now</div>
         </div>
         <div class="acct">
-          <div class="row"><span>work@example.com <span class="pill cool">half-open</span></span><span style="color:var(--accent);font-size:.74rem">Early hand off</span></div>
-          <div class="bar"><i class="w" style="width:88%"></i></div>
+          <div class="row"><span style="display:inline-flex;align-items:center;gap:6px"><i class="dot ready"></i><span>work@example.com</span><span style="color:var(--ok);font-size:.74rem">· ready</span></span><span class="sbtn">Early hand off</span></div>
+          <div class="bmeta"><span>5h</span><span>92% left · resets in 4h 50m</span></div>
+          <div class="bar"><i style="width:8%"></i></div>
+          <div class="bmeta"><span>Week</span><span>64% left · resets in 3d</span></div>
+          <div class="bar"><i style="width:36%"></i></div>
+          <div class="src">Live quota · 2m ago</div>
         </div>
         <div class="acct">
-          <div class="row"><span>backup@example.com <span class="pill cool">⏸ 1h12m</span></span><span style="color:var(--fg-2);font-size:.74rem">End cooldown</span></div>
+          <div class="row"><span style="display:inline-flex;align-items:center;gap:6px"><i class="dot bad"></i><span>backup@example.com</span><span style="color:var(--danger);font-size:.74rem">· limited</span></span><span class="sbtn">End cooldown</span></div>
+          <div class="bmeta"><span>5h</span><span>0% left · resets in 1h 12m</span></div>
           <div class="bar"><i class="d" style="width:100%"></i></div>
+          <div class="src" style="color:var(--danger)">Rate limit · ends in 1h 12m</div>
         </div>
       </div>
       <div class="svc">
         <div class="svc-head"><h4>Codex</h4><small>2 of 2 ready</small></div>
         <div class="acct">
-          <div class="row"><span>team@example.com <span class="pill on">active</span></span><span style="color:var(--fg-3);font-size:.74rem">5h 10% · wk 3%</span></div>
+          <div class="row"><span style="display:inline-flex;align-items:center;gap:6px"><i class="dot ok"></i><span>team@example.com</span><span style="color:var(--ok);font-size:.74rem">· active</span></span></div>
+          <div class="bmeta"><span>5h</span><span>90% left · resets in 4h 55m</span></div>
           <div class="bar"><i style="width:10%"></i></div>
         </div>
       </div>
@@ -376,14 +390,13 @@ footer a{color:var(--fg-2)}
       </li>
     </ol>
     <details>
-      <summary>Optional: <code>oah</code> CLI &amp; local HTTP proxy (for scripts, headless servers, or API-key relays)</summary>
-      <p style="color:var(--fg-2);margin-top:12px">You never need the CLI for everyday use in Orca. For terminal automation, headless <code>orca serve</code> hosts, workspace pinning, or an opt-in local HTTP failover proxy (<code>127.0.0.1:4080</code>), the optional <code>oah</code> CLI talks to the same local background helper (<code>~/.orca/oah/oahd.sock</code>) with <code>--json</code> on every command:</p>
+      <summary>Optional: <code>oah</code> CLI (for scripts, automation, or headless servers)</summary>
+      <p style="color:var(--fg-2);margin-top:12px">You never need the CLI for everyday use in Orca. For terminal automation, headless <code>orca serve</code> hosts, or workspace pinning, the optional <code>oah</code> CLI talks to the same local background helper (<code>~/.orca/oah/oahd.sock</code>) with <code>--json</code> on every command:</p>
       <pre style="margin-top:8px"><code>oah status --json                # accounts, usage, runway, cooldowns &amp; circuit state
 oah active claude --json         # active account for scripts &amp; external agents
 oah use work@example.com         # select account + hand off on-screen session
 oah pin &lt;workspace&gt; &lt;account&gt;    # pin a workspace/terminal out of auto-rotation
-oah proxy start --port 4080      # optional local HTTP failover proxy + `oah bench`
-oah sync export &gt; oah.json       # portable config backup (API keys redacted)</code></pre>
+oah sync export &gt; oah.json       # portable config backup</code></pre>
     </details>
   </div>
 </section>
