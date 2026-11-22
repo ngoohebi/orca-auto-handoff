@@ -1013,6 +1013,96 @@ function Waiting({ snap }: { snap: Snapshot }) {
   )
 }
 
+/** Local HTTP proxy state & latency bench results, loaded when the Proxy tab opens. */
+const proxyState = atom<{ running: boolean; host: string; port: number; providers: any[] } | null>(null)
+const benchResults = atom<{ id: string; name: string; kind: string; latencyMs: number; band: string; ok: boolean; error?: string }[] | null>(null)
+
+function loadProxy(): Promise<void> {
+  return plugin
+    .request('rotator.proxyStatus', {})
+    .then((st) => set(proxyState, st), () => undefined)
+}
+
+function ProxyView() {
+  const st = read(proxyState)
+  const bench = read(benchResults)
+  if (st === null) {
+    void loadProxy()
+    return <Skeleton shape="text" lines={4} label="Loading proxy status" />
+  }
+  return (
+    <Stack gap="md">
+      <Row justify="between" align="center" gap="sm">
+        <Stack gap="xs">
+          <Text weight="semibold">Local HTTP Failover Proxy</Text>
+          <Text size="xs" muted>
+            {st.running ? `Listening on http://${st.host}:${st.port}` : 'Stopped (opt-in for API-key & relay providers)'}
+          </Text>
+        </Stack>
+        <Row gap="xs">
+          <Button
+            size="sm"
+            variant={st.running ? 'ghost' : 'solid'}
+            disabled={read(busy) !== null}
+            onPress={() =>
+              act('proxy', async () => {
+                const next = st.running ? await plugin.request('rotator.proxyStop', {}) : await plugin.request('rotator.proxyStart', {})
+                set(proxyState, next)
+                return next.running ? `Proxy started on http://${next.host}:${next.port}` : 'Proxy stopped'
+              })
+            }
+          >
+            {st.running ? 'Stop' : 'Start'}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={read(busy) !== null || st.providers.length === 0}
+            onPress={() =>
+              act('bench', async () => {
+                const res = await plugin.request('rotator.bench', {})
+                set(benchResults, res.results)
+                return `Benchmarked ${res.results.length} providers`
+              })
+            }
+          >
+            Bench
+          </Button>
+        </Row>
+      </Row>
+      {st.providers.length === 0 ? (
+        <EmptyState
+          title="No API-key providers configured"
+          description="Add relay or API-key endpoints with `oah provider add <anthropic|openai> <name> <baseUrl> <apiKey>`."
+        />
+      ) : (
+        <Stack gap="sm">
+          {st.providers.map((p: any) => {
+            const b = bench?.find((x) => x.id === p.id)
+            const tone: Tone = p.circuit === 'open' ? 'danger' : p.circuit === 'half_open' ? 'warning' : 'success'
+            return (
+              <Box key={p.id} border radius="md" padding="sm">
+                <Row justify="between" align="center" gap="sm">
+                  <Stack gap="xs">
+                    <Text weight="semibold">{p.name}</Text>
+                    <Text size="xs" muted>
+                      {p.kind} · #{p.priority} · {p.baseUrl}
+                    </Text>
+                  </Stack>
+                  <Row gap="xs" align="center">
+                    {b ? <Badge tone={b.band === 'fast' ? 'success' : b.band === 'ok' ? 'warning' : 'danger'}>{b.ok ? `${b.latencyMs}ms` : 'err'}</Badge> : null}
+                    <Badge tone={tone}>{p.circuit}</Badge>
+                  </Row>
+                </Row>
+              </Box>
+            )
+          })}
+        </Stack>
+      )}
+    </Stack>
+  )
+}
+
 export default function Panel() {
   const snap = read(snapshot)
   if (!snap) return <Skeleton shape="text" lines={6} label="Loading accounts" />
@@ -1132,6 +1222,9 @@ export default function Panel() {
       <Tabs label="View" value={read(tab)} onChange={(v: string) => set(tab, v)}>
         <Tab value="accounts" label="Accounts">
           <Accounts snap={snap} />
+        </Tab>
+        <Tab value="proxy" label="Proxy">
+          <ProxyView />
         </Tab>
         <Tab value="history" label={`History (${snap.history.length})`}>
           <History snap={snap} />

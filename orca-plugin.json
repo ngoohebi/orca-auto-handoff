@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "oah",
   "name": "OAH",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "OAH (Orca Auto Hand-off): CLI-first automatic account hand-off daemon (`oah` / `oahd`) with a thin Orca panel and event bridge.",
   "author": {
     "name": "ngoohebi",
@@ -235,6 +235,29 @@
         "type": "string",
         "default": "",
         "description": "At a model limit, when no other account is known to have room for that model, try these models on the same account before handing off. Per service, separated by semicolons."
+      },
+      {
+        "key": "model_window_policy",
+        "title": "Advanced: Per-model weekly cap policy",
+        "type": "string",
+        "default": "fallback-model",
+        "enum": [
+          "fallback-model",
+          "rotate",
+          "ignore"
+        ],
+        "description": "How per-model weekly windows (e.g. Claude Fable) affect rotation."
+      },
+      {
+        "key": "live_probes",
+        "title": "Advanced: Live fallback quota probes",
+        "type": "string",
+        "default": "auto",
+        "enum": [
+          "auto",
+          "off"
+        ],
+        "description": "When Orca readings are stale or missing, probe Codex app-server, Claude /usage, or OpenCode Go directly."
       },
       {
         "key": "default_cooldown_minutes",

@@ -44,9 +44,10 @@ export function formatStatus(snap: Snapshot, version: string, now = Date.now()):
         ? `5h ${pct(s.usage.session)}${s.usage.session?.resetsAt ? ` (${span(s.usage.session.resetsAt - now)})` : ''} · week ${pct(s.usage.weekly)}${s.usage.weekly?.resetsAt ? ` (${span(s.usage.weekly.resetsAt - now)})` : ''}`
         : 'no usage yet'
       const state = cooling ? `limited ${span(s.cooldownUntil! - now)}` : s.active ? 'active' : 'ready'
+      const circuit = s.circuit && s.circuit !== 'closed' ? `  [${s.circuit.replace('_', '-')}]` : ''
       const skip = s.excluded ? '  [skipped]' : ''
       const runway = s.runwayMs !== undefined ? `  ~${span(s.runwayMs)} left` : ''
-      out.push(`  ${s.active ? '●' : '○'} ${s.label}  ${state}  ${usage}${runway}${skip}`)
+      out.push(`  ${s.active ? '●' : '○'} ${s.label}  ${state}  ${usage}${runway}${circuit}${skip}`)
     }
   }
 
@@ -115,7 +116,8 @@ export const HELP_TEXT = [
   'Usage: oah <command> [options]',
   '',
   'Status & inspection:',
-  '  oah [status] [--json]               Accounts, usage, cooldowns and waiting sessions',
+  '  oah [status] [--json]               Accounts, usage, cooldowns, circuit state and waiting sessions',
+  '  oah active [service] [--json]       Active account(s) for scripts and external agents',
   '  oah refresh [--json]                Ask Orca to refresh usage, then show status',
   '  oah history [--limit N] [--json]    Recent hand-off history',
   '  oah debug [--json]                  Daemon health and recent status events',
@@ -128,8 +130,20 @@ export const HELP_TEXT = [
   '  oah pause | resume                  Turn automatic hand-off off or on globally',
   '  oah service <service> on|off        Turn automatic hand-off on or off for one service',
   '  oah skip <account> [on|off]         Skip an account during automatic hand-off',
-  '  oah clear <account>                 Clear an account cooldown',
+  '  oah clear <account>                 Clear an account cooldown / reset circuit breaker',
   '  oah order up|down <account>         Move an account in the custom order',
+  '  oah pin <id> <account>              Pin a workspace or terminal to one account',
+  '  oah unpin <id> | oah pins           Remove or list explicit pins',
+  '',
+  'Local HTTP proxy & API-key providers:',
+  '  oah proxy start [--port 4080]|stop|status',
+  '  oah provider list|add|rm|on|off     Manage API-key / relay failover providers',
+  '  oah bench [--json]                  Benchmark endpoint latency across providers',
+  '',
+  'Hooks, sync & sessions:',
+  '  oah event stop-failure              Instant Claude StopFailure hook trigger',
+  '  oah sync export | import <file>     Export or import portable config JSON',
+  '  oah session                         Persistent NDJSON stdio session attached to oahd',
   '',
   'Waiting session responses:',
   '  oah now <terminalId>                Hand off a waiting on-screen session now',

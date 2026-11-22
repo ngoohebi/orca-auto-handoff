@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { ALL_SETTINGS, checked, settingValues, type SettingValues } from '../core/settings.ts'
-import { DEFAULT_CONFIG, PROVIDERS, type Config, type RotatorState } from '../core/types.ts'
+import { DEFAULT_CONFIG, PROVIDERS, type Config, type ProxyProvider, type RotatorState } from '../core/types.ts'
 import type { UsageCache } from '../core/usage-cache.ts'
 import type { UsageSamples } from '../core/usage-history.ts'
 
@@ -68,6 +68,9 @@ export function configFromStored(s: Record<string, unknown>): Config {
     reminderMinutes: num('active_reminder_minutes'),
     restoreUnsent: v.restore_unsent_text as boolean,
     awayMinutes: num('away_minutes'),
+    modelWindowPolicy: v.model_window_policy as Config['modelWindowPolicy'],
+    liveProbes: v.live_probes as Config['liveProbes'],
+    pins: s.pins && typeof s.pins === 'object' && !Array.isArray(s.pins) ? { ...(s.pins as Record<string, string>) } : {},
     services: Object.fromEntries(
       PROVIDERS.map((p) => [p, typeof s[`service_${p}`] === 'boolean' ? s[`service_${p}`] : d.services[p]])
     ) as Config['services']
@@ -80,6 +83,7 @@ export class FileStore {
   readonly statePath: string
   readonly usagePath: string
   readonly samplesPath: string
+  readonly providersPath: string
   readonly liveDir: string
   private rawConfig: Record<string, unknown> | null = null
 
@@ -89,6 +93,7 @@ export class FileStore {
     this.statePath = join(home, 'state.json')
     this.usagePath = join(home, 'usage.json')
     this.samplesPath = join(home, 'samples.json')
+    this.providersPath = join(home, 'providers.json')
     this.liveDir = join(home, 'live')
   }
 
@@ -186,6 +191,67 @@ export class FileStore {
 
   saveSamples(samples: UsageSamples): void {
     this.writeJson(this.samplesPath, samples)
+  }
+
+  getPins(): Record<string, string> {
+    const raw = this.loadRawConfig()
+    return raw.pins && typeof raw.pins === 'object' && !Array.isArray(raw.pins) ? { ...(raw.pins as Record<string, string>) } : {}
+  }
+
+  setPin(target: string, seatKey: string): Record<string, string> {
+    const raw = this.loadRawConfig()
+    const pins = this.getPins()
+    pins[target] = seatKey
+    raw.pins = pins
+    this.rawConfig = raw
+    this.writeJson(this.configPath, raw)
+    return pins
+  }
+
+  removePin(target: string): Record<string, string> {
+    const raw = this.loadRawConfig()
+    const pins = this.getPins()
+    delete pins[target]
+    raw.pins = pins
+    this.rawConfig = raw
+    this.writeJson(this.configPath, raw)
+    return pins
+  }
+
+  loadProviders(): ProxyProvider[] {
+    const data = this.readJson<ProxyProvider[]>(this.providersPath)
+    return Array.isArray(data) ? data : []
+  }
+
+  saveProviders(providers: ProxyProvider[]): void {
+    this.writeJson(this.providersPath, providers)
+  }
+
+  exportConfig(): Record<string, unknown> {
+    return {
+      schema: 'oah-config/v1',
+      settings: this.loadRawConfig(),
+      providers: this.loadProviders().map(({ apiKey: _redacted, ...rest }) => rest)
+    }
+  }
+
+  importConfig(payload: Record<string, unknown>): Record<string, unknown> {
+    const incoming = (payload.settings && typeof payload.settings === 'object' ? payload.settings : payload) as Record<string, unknown>
+    for (const [k, v] of Object.entries(incoming)) {
+      if (k === 'pins' && v && typeof v === 'object' && !Array.isArray(v)) {
+        const raw = this.loadRawConfig()
+        raw.pins = { ...(v as Record<string, string>) }
+        this.rawConfig = raw
+        this.writeJson(this.configPath, raw)
+        continue
+      }
+      try {
+        this.setSetting(k, v)
+      } catch {
+        // Ignore unknown/deprecated keys on import.
+      }
+    }
+    return this.settingValues()
   }
 
   readLive(fileName: string): string | null {

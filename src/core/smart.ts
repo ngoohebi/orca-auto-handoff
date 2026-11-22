@@ -21,7 +21,21 @@ export const TARGET_HORIZONS = 3
 const FALLBACK_HORIZON_MINUTES = 10
 /** Park instead of moving when the account being left resets this soon. */
 export const SHORT_WAIT_MS = 5 * MIN
+const FIVE_HOURS_MS = 5 * HOUR
 const WEEK_MS = 7 * 24 * HOUR
+/** Minimum elapsed fraction of a window before whole-window pace extrapolation is trusted (5 %). */
+export const MIN_ELAPSED_FRACTION = 0.05
+
+/** Whole-window pace projection (`usedPercent / elapsedFraction`) without needing sample history.
+ *  Returns `null` when reset is unknown or less than 5 % of the window has elapsed. */
+export function wholeWindowPace(w: UsageWindow | undefined, durationMs: number, now: number): number | null {
+  if (!w || w.reset || typeof w.resetsAt !== 'number' || w.resetsAt <= now) return null
+  const remaining = w.resetsAt - now
+  const elapsed = durationMs - remaining
+  const frac = elapsed / durationMs
+  if (frac < MIN_ELAPSED_FRACTION || frac > 1) return null
+  return w.usedPercent / frac
+}
 
 export type SeatState = 'out' | 'low' | 'ok' | 'unknown'
 
@@ -37,6 +51,8 @@ export type Assessment = {
   over: boolean
   /** Why it is Low: which window, and whether by its pace or only by its level. */
   low?: { window: WindowName; by: 'pace' | 'level' }
+  /** Highest nested whole-window overrun (> 100 % projected at reset), if any. */
+  nestedOverrun?: { window: WindowName; projectedPercent: number }
 }
 
 /** What the engine knows beyond the accounts themselves. */
@@ -88,31 +104,52 @@ export function assess(
   if (!u.known) return { ...base, state: cooling ? 'out' : 'unknown', over: false }
   const session = current(u.session, now)
   const weekly = current(u.weekly, now)
+  const model = current(u.model, now)
   const s = leftOf(u.session?.reset ? { usedPercent: 0, resetsAt: null } : session)
   const w = leftOf(u.weekly?.reset ? { usedPercent: 0, resetsAt: null } : weekly)
-  const m = leftOf(current(u.model, now))
+  const m = leftOf(model)
   if (s !== undefined) left.s = s
   if (w !== undefined) left.w = w
   if (m !== undefined) left.m = m
-  const over = (!!session && session.usedPercent >= 100) || (!!weekly && weekly.usedPercent >= 100)
-  if (cooling || over) return { ...base, state: 'out', over }
+  // Nested whole-window pace projection across every window (zero history required).
+  const projections: { window: WindowName; projectedPercent: number }[] = []
+  const ps = wholeWindowPace(session, FIVE_HOURS_MS, now)
+  const pw = wholeWindowPace(weekly, WEEK_MS, now)
+  const pm = config.modelWindowPolicy !== 'ignore' ? wholeWindowPace(model, WEEK_MS, now) : null
+  if (ps !== null && ps > 100) projections.push({ window: 's', projectedPercent: ps })
+  if (pw !== null && pw > 100) projections.push({ window: 'w', projectedPercent: pw })
+  if (pm !== null && pm > 100) projections.push({ window: 'm', projectedPercent: pm })
+  const nestedOverrun = projections.sort((a, b) => b.projectedPercent - a.projectedPercent)[0]
+  const withNested = nestedOverrun ? { ...base, nestedOverrun } : base
+  const rotateModel = config.modelWindowPolicy === 'rotate'
+  const over =
+    u.ordinaryUsageAllowed === false ||
+    (!!session && session.usedPercent >= 100) ||
+    (!!weekly && weekly.usedPercent >= 100) ||
+    (rotateModel && !!model && model.usedPercent >= 100)
+  if (cooling || over) return { ...withNested, state: 'out', over }
   const horizon = horizonMs(config)
-  if (horizon > 0 && runway && runway.ms < horizon) return { ...base, state: 'low', over, low: { window: runway.win, by: 'pace' } }
+  if (horizon > 0 && runway && runway.ms < horizon && (runway.win !== 'm' || rotateModel)) {
+    return { ...withNested, state: 'low', over, low: { window: runway.win, by: 'pace' } }
+  }
   // "Also hand off below this much left": the 5-hour window's level, whatever the pace.
   if (session && config.floorFiveHour < 100 && session.usedPercent >= config.floorFiveHour) {
-    return { ...base, state: 'low', over, low: { window: 's', by: 'level' } }
+    return { ...withNested, state: 'low', over, low: { window: 's', by: 'level' } }
   }
   // No pace for a window: its level alone decides. So it does when the readings are too old to
   // forecast with (no runway from them), whatever pace the last half hour still shows.
   const latest = samples[samples.length - 1]
   const stale = !latest || now - latest.t > RUNWAY_MAX_AGE_MS
   if ((rate.s === null || stale) && session && config.lowFiveHour < 100 && session.usedPercent >= config.lowFiveHour) {
-    return { ...base, state: 'low', over, low: { window: 's', by: 'level' } }
+    return { ...withNested, state: 'low', over, low: { window: 's', by: 'level' } }
   }
   if ((rate.w === null || stale) && weekly && config.lowSevenDay < 100 && weekly.usedPercent >= config.lowSevenDay) {
-    return { ...base, state: 'low', over, low: { window: 'w', by: 'level' } }
+    return { ...withNested, state: 'low', over, low: { window: 'w', by: 'level' } }
   }
-  return { ...base, state: 'ok', over }
+  if (rotateModel && (rate.m === null || stale) && model && config.lowSevenDay < 100 && model.usedPercent >= config.lowSevenDay) {
+    return { ...withNested, state: 'low', over, low: { window: 'm', by: 'level' } }
+  }
+  return { ...withNested, state: 'ok', over }
 }
 
 /**
@@ -187,10 +224,11 @@ function weeklyResetOf(seat: Seat): number {
   return seat.usage.known && !seat.usage.weekly?.reset ? (seat.usage.weekly?.resetsAt ?? Number.POSITIVE_INFINITY) : Number.POSITIVE_INFINITY
 }
 
-/** Least room across the 5-hour and weekly windows; unknown counts as the middle. */
-export function headroom(seat: Pick<Seat, 'usage'>): number {
+/** Least room across the 5-hour and weekly (plus model when `modelWindowPolicy === 'rotate'`) windows; unknown counts as the middle. */
+export function headroom(seat: Pick<Seat, 'usage'>, config?: Pick<Config, 'modelWindowPolicy'>): number {
   if (!seat.usage.known) return 50
-  return 100 - Math.max(seat.usage.session?.usedPercent ?? 0, seat.usage.weekly?.usedPercent ?? 0)
+  const m = config?.modelWindowPolicy === 'rotate' ? (seat.usage.model?.usedPercent ?? 0) : 0
+  return 100 - Math.max(seat.usage.session?.usedPercent ?? 0, seat.usage.weekly?.usedPercent ?? 0, m)
 }
 
 /**
@@ -211,7 +249,7 @@ export function rank(candidates: readonly Candidate[], config: Config): Candidat
     c.chainIndex,
     c.expiring ? 0 : 1,
     weeklyResetOf(c.seat),
-    -headroom(c.seat),
+    -headroom(c.seat, config),
     c.turn
   ]
   return [...candidates].sort((a, b) => {

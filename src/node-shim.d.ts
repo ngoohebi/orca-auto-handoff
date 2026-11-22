@@ -42,6 +42,31 @@ declare module 'node:fs' {
   export type FSWatcher = { close(): void; on(event: string, cb: () => void): unknown }
   export function watch(path: string, listener: () => void): FSWatcher
 }
+declare module 'node:http' {
+  export type IncomingMessage = {
+    method?: string
+    url?: string
+    headers: Record<string, string | string[] | undefined>
+    on(event: 'data', cb: (chunk: Uint8Array | string) => void): IncomingMessage
+    on(event: 'end', cb: () => void): IncomingMessage
+    on(event: 'error', cb: (err: Error) => void): IncomingMessage
+  }
+  export type ServerResponse = {
+    statusCode: number
+    headersSent: boolean
+    setHeader(name: string, value: string | string[]): void
+    writeHead(statusCode: number, headers?: Record<string, string | string[]>): ServerResponse
+    write(chunk: Uint8Array | string): boolean
+    end(chunk?: Uint8Array | string): void
+  }
+  export type Server = {
+    listen(port: number, host?: string, cb?: () => void): Server
+    close(cb?: (err?: Error) => void): Server
+    address(): { port: number; address: string } | string | null
+    on(event: 'error', cb: (err: Error & { code?: string }) => void): Server
+  }
+  export function createServer(listener: (req: IncomingMessage, res: ServerResponse) => void): Server
+}
 declare module 'node:net' {
   export type Socket = {
     write(data: string): boolean
@@ -94,6 +119,12 @@ declare const process: {
   platform: string
   execPath: string
   pid: number
+  stdin: {
+    isTTY?: boolean
+    setEncoding(encoding: 'utf8'): void
+    on(event: 'data', cb: (chunk: string) => void): unknown
+    on(event: 'end' | 'close', cb: () => void): unknown
+  }
   stdout: { write(data: string): boolean; isTTY?: boolean }
   stderr: { write(data: string): boolean; isTTY?: boolean }
   exit(code?: number): never

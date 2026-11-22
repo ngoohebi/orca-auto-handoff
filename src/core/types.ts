@@ -37,6 +37,9 @@ export type SeatUsage = {
   weekly?: UsageWindow
   /** A model-specific weekly bucket (Claude `fableWeekly`, ...). */
   model?: UsageWindow & { name: string }
+  /** Codex `account/rateLimits/read`: false when ordinary work is blocked even if Spark/other buckets show 0 %. */
+  ordinaryUsageAllowed?: boolean
+  rateLimitReachedType?: string
   updatedAt?: number
 }
 
@@ -53,6 +56,8 @@ export type Seat = {
    *  `system` for Claude's own login, or both when a managed account is that same login. Local
    *  Claude accounts only; never part of a snapshot. */
   liveKeys?: string[]
+  /** Managed CODEX_HOME directory for live `codex app-server` probing; never serialized in snapshots. */
+  codexHome?: string
 }
 
 export type SignalKind = 'rate_limit' | 'model_cap' | 'api_error' | 'auth'
@@ -86,6 +91,8 @@ export type SeenSignal = {
   earlier?: { fingerprint: string; occurrences: number; line?: string }[]
 }
 
+export type CircuitState = 'closed' | 'open' | 'half_open'
+
 /** Per-seat state. Every field is optional: entries stored by older versions hold only
  *  `cooldownUntil` and `reason`. */
 export type SeatHealth = {
@@ -101,6 +108,22 @@ export type SeatHealth = {
   resetKnown?: boolean
   /** When the last cooldown expired. */
   freedAt?: number
+  /** Formal 3-state circuit breaker: closed (healthy), open (cooling), half_open (probing recovery). */
+  circuit?: CircuitState
+  /** Consecutive failures/limits since the last clean turn or manual clear. */
+  consecutiveFailures?: number
+}
+
+/** An API-key or third-party relay provider routed by `oah proxy`. */
+export type ProxyProvider = {
+  id: string
+  kind: 'anthropic' | 'openai'
+  name: string
+  baseUrl: string
+  apiKey: string
+  priority: number
+  enabled: boolean
+  modelMap?: Record<string, string>
 }
 
 /** How long a strike counts, and how long an expired cooldown is remembered. */
@@ -260,6 +283,12 @@ export type Config = {
   restoreUnsent: boolean
   /** "Early when away": early moves start only this long after the last sign of the user; 0 = always. */
   awayMinutes: number
+  /** How per-model weekly caps (e.g. Claude Fable) are handled: fallback-model, rotate, or ignore. */
+  modelWindowPolicy: 'fallback-model' | 'rotate' | 'ignore'
+  /** Live fallback quota probes (`codex app-server`, `claude -p /usage`, OpenCode Go). */
+  liveProbes: 'auto' | 'off'
+  /** Per-workspace or per-terminal explicit account pins (`workspaceId|terminalId` -> `seatKey`). */
+  pins: Record<string, string>
   /** Set while the settings cannot be trusted, so every service counts as off whatever was chosen
    *  (worker.ts `configReader`): `settings` = Orca could not be asked for them yet, `upgrade` = the
    *  settings of an older version are not carried over yet. The panel says so. */
@@ -307,7 +336,10 @@ export const DEFAULT_CONFIG: Config = {
   presenceSeconds: 300,
   reminderMinutes: 10,
   restoreUnsent: true,
-  awayMinutes: 10
+  awayMinutes: 10,
+  modelWindowPolicy: 'fallback-model',
+  liveProbes: 'auto',
+  pins: {}
 }
 
 /** Auto (`pick: smart`) with the thresholds of Early when away, for tests. */
@@ -379,6 +411,8 @@ export type Snapshot = {
     /** How long until the first window is used up at the current pace (usage-history.ts); absent
      *  when the pace is unknown. Observed only: nothing switches on it yet. */
     runwayMs?: number
+    /** Circuit breaker state for this seat (`closed` | `open` | `half_open`). */
+    circuit?: CircuitState
   })[]
   waiting: WaitingEntry[]
   history: HistoryEntry[]

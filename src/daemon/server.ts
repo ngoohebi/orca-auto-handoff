@@ -7,10 +7,11 @@ import { Rotator, type Cli, type Deps, type HostLike, type StatusEvent } from '.
 import { PROVIDER_NAME } from '../core/labels.ts'
 import { liveFileName } from '../core/live-usage.ts'
 import { ConsoleStatusLine, nodeFiles, type Files } from '../core/statusline-files.ts'
-import { PROVIDERS, type Provider, type Snapshot } from '../core/types.ts'
+import { PROVIDERS, type Provider, type ProxyProvider, type Snapshot } from '../core/types.ts'
 import { VERSION } from '../core/version.ts'
 import { createLineParser, encodeMessage, type RpcRequest, type RpcResponse, type WireMessage } from './ipc.ts'
 import { OrcaTransport } from './orca-transport.ts'
+import { benchProviders, LocalProxy } from './proxy.ts'
 import { FileStore, socketPathFor } from './store.ts'
 
 const MAX_TICK_MS = 30_000
@@ -40,6 +41,7 @@ export class OahDaemon {
   readonly transport: OrcaTransport
   readonly rotator: Rotator
   readonly consoleLine: ConsoleStatusLine
+  readonly proxy: LocalProxy
   private readonly log: (msg: string) => void
   private readonly now: () => number
   private readonly startedAt: number
@@ -102,6 +104,11 @@ export class OahDaemon {
     }
 
     this.rotator = new Rotator(deps)
+    this.proxy = new LocalProxy({
+      getProviders: () => this.store.loadProviders(),
+      now: this.now,
+      log: this.log
+    })
   }
 
   async start(): Promise<void> {
@@ -147,6 +154,7 @@ export class OahDaemon {
     this.clients.clear()
     this.subscribers.clear()
     this.rotator.dispose()
+    await this.proxy.stop()
     if (this.server) {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()))
       this.server = null
@@ -462,6 +470,121 @@ export class OahDaemon {
       case 'event.presence': {
         this.rotator.notePresence()
         return { ok: true }
+      }
+      case 'event.stopFailure': {
+        return this.rotator.onStopFailure({
+          sessionId: typeof p.sessionId === 'string' ? p.sessionId : undefined,
+          terminalId: typeof p.terminalId === 'string' ? p.terminalId : undefined,
+          workspaceId: typeof p.workspaceId === 'string' ? p.workspaceId : undefined,
+          error: typeof p.error === 'string' ? p.error : undefined
+        })
+      }
+      case 'active': {
+        const snap = this.rotator.snapshot()
+        const want = typeof p.provider === 'string' ? p.provider.toLowerCase() : undefined
+        const activeSeats = snap.seats.filter((s) => s.active && (!want || s.provider === want))
+        return {
+          active: activeSeats.map((s) => ({
+            key: s.key,
+            provider: s.provider,
+            accountId: s.accountId,
+            label: s.label,
+            circuit: s.circuit ?? 'closed',
+            ...(s.cooldownUntil ? { cooldownUntil: s.cooldownUntil } : {}),
+            usage: s.usage
+          }))
+        }
+      }
+      case 'pins': {
+        return { pins: this.store.getPins() }
+      }
+      case 'pin': {
+        if (typeof p.target !== 'string' || !p.target.trim() || typeof p.seatKey !== 'string' || !p.seatKey.trim()) {
+          throw new Error('target (workspaceId or terminalId) and seatKey are required')
+        }
+        this.rotator.notePresence()
+        const pins = this.store.setPin(p.target.trim(), p.seatKey.trim())
+        await this.rotator.refreshServices()
+        return { pins }
+      }
+      case 'unpin': {
+        if (typeof p.target !== 'string' || !p.target.trim()) throw new Error('target is required')
+        this.rotator.notePresence()
+        const pins = this.store.removePin(p.target.trim())
+        await this.rotator.refreshServices()
+        return { pins }
+      }
+      case 'proxy.status': {
+        return this.proxy.status()
+      }
+      case 'proxy.start': {
+        const port = typeof p.port === 'number' && p.port >= 0 ? p.port : 4080
+        return this.proxy.start(port)
+      }
+      case 'proxy.stop': {
+        await this.proxy.stop()
+        return this.proxy.status()
+      }
+      case 'provider.list': {
+        return { providers: this.store.loadProviders().map(({ apiKey: _k, ...rest }) => rest) }
+      }
+      case 'provider.add': {
+        const kind = p.kind === 'anthropic' || p.kind === 'openai' ? p.kind : null
+        if (!kind) throw new Error('kind must be "anthropic" or "openai"')
+        if (typeof p.name !== 'string' || !p.name.trim()) throw new Error('name is required')
+        if (typeof p.baseUrl !== 'string' || !/^https?:\/\//.test(p.baseUrl.trim())) throw new Error('valid http(s) baseUrl is required')
+        if (typeof p.apiKey !== 'string' || !p.apiKey.trim()) throw new Error('apiKey is required')
+        const list = this.store.loadProviders()
+        const id =
+          typeof p.id === 'string' && p.id.trim()
+            ? p.id.trim()
+            : `${kind}-${p.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Math.random().toString(36).slice(2, 6)}`
+        const entry: ProxyProvider = {
+          id,
+          kind,
+          name: p.name.trim(),
+          baseUrl: p.baseUrl.trim(),
+          apiKey: p.apiKey.trim(),
+          priority: typeof p.priority === 'number' ? p.priority : list.length + 1,
+          enabled: p.enabled !== false,
+          ...(p.modelMap && typeof p.modelMap === 'object' ? { modelMap: p.modelMap as Record<string, string> } : {})
+        }
+        const next = [...list.filter((x) => x.id !== id), entry]
+        this.store.saveProviders(next)
+        const { apiKey: _k, ...safe } = entry
+        return { provider: safe }
+      }
+      case 'provider.rm': {
+        if (typeof p.id !== 'string' || !p.id.trim()) throw new Error('id is required')
+        const list = this.store.loadProviders()
+        const next = list.filter((x) => x.id !== p.id.trim())
+        if (next.length === list.length) throw new Error(`No provider "${p.id}"`)
+        this.store.saveProviders(next)
+        return { ok: true, id: p.id.trim() }
+      }
+      case 'provider.toggle': {
+        if (typeof p.id !== 'string' || typeof p.enabled !== 'boolean') throw new Error('id and enabled (boolean) are required')
+        const list = this.store.loadProviders()
+        const target = list.find((x) => x.id === p.id)
+        if (!target) throw new Error(`No provider "${p.id}"`)
+        target.enabled = p.enabled
+        this.store.saveProviders(list)
+        return { ok: true, id: target.id, enabled: target.enabled }
+      }
+      case 'provider.bench': {
+        const list = this.store.loadProviders()
+        return { results: await benchProviders(list) }
+      }
+      case 'sync.export': {
+        return this.store.exportConfig()
+      }
+      case 'sync.import': {
+        if (!p.config || typeof p.config !== 'object') throw new Error('config object is required')
+        const values = this.store.importConfig(p.config as Record<string, unknown>)
+        await this.rotator.refreshServices()
+        this.rotator.publishNow()
+        this.broadcast('settings', values)
+        return { ok: true, settings: values }
       }
       case 'debug': {
         return {

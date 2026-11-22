@@ -19,8 +19,8 @@ function parseArgs(argv: readonly string[]): { words: string[]; flags: Record<st
     const a = argv[i]!
     if (a === '--json' || a === '--force' || a === '-h' || a === '--help') {
       flags[a === '-h' ? 'help' : a.replace(/^--/, '')] = true
-    } else if (a === '--limit') {
-      flags.limit = argv[++i] ?? ''
+    } else if (a === '--limit' || a === '--port' || a === '--priority' || a === '--session' || a === '--terminal' || a === '--workspace' || a === '--error') {
+      flags[a.slice(2)] = argv[++i] ?? ''
     } else {
       words.push(a)
     }
@@ -238,6 +238,117 @@ export async function runCli(
         const params = words[2] ? (JSON.parse(words[2]) as Record<string, unknown>) : {}
         const res = await client.call(method, params)
         return ok(JSON.stringify(res, null, 2), res)
+      }
+      case 'active': {
+        const provider = words[1]?.toLowerCase()
+        const res = await client.call<{ active: { key: string; provider: string; accountId: string; label: string; circuit: string }[] }>('active', provider ? { provider } : {})
+        const text =
+          res.active.length === 0
+            ? 'No active account reported.'
+            : res.active.map((a) => `${a.provider}: ${a.label} (${a.key}) [${a.circuit}]`).join('\n')
+        return ok(text, res)
+      }
+      case 'pins': {
+        const res = await client.call<{ pins: Record<string, string> }>('pins', {})
+        const entries = Object.entries(res.pins)
+        const text = entries.length === 0 ? 'No pinned workspaces or terminals.' : entries.map(([k, v]) => `${k} -> ${v}`).join('\n')
+        return ok(text, res)
+      }
+      case 'pin': {
+        const target = words[1]
+        if (!target || !words[2]) throw new Error('Usage: oah pin <workspaceId|terminalId> <account>')
+        const seat = resolveSeat(await snap(), words[2])
+        const res = await client.call<{ pins: Record<string, string> }>('pin', { target, seatKey: seat.key })
+        return ok(`Pinned ${target} -> ${seat.label} (${seat.key})`, res)
+      }
+      case 'unpin': {
+        const target = words[1]
+        if (!target) throw new Error('Usage: oah unpin <workspaceId|terminalId>')
+        const res = await client.call<{ pins: Record<string, string> }>('unpin', { target })
+        return ok(`Unpinned ${target}`, res)
+      }
+      case 'event': {
+        const kind = words[1]
+        if (kind !== 'stop-failure') throw new Error(`Unknown event "${kind ?? ''}". Use: stop-failure`)
+        const res = await client.call<{ handled: boolean; detail: string }>('event.stopFailure', {
+          sessionId: typeof flags.session === 'string' && flags.session ? flags.session : process.env.ORCA_AGENT_SESSION_ID,
+          terminalId: typeof flags.terminal === 'string' && flags.terminal ? flags.terminal : undefined,
+          workspaceId: typeof flags.workspace === 'string' && flags.workspace ? flags.workspace : undefined,
+          error: typeof flags.error === 'string' && flags.error ? flags.error : 'rate_limit'
+        })
+        return ok(res.detail, res)
+      }
+      case 'proxy': {
+        const sub = words[1] ?? 'status'
+        if (sub === 'status') {
+          const st = await client.call<{ running: boolean; host: string; port: number; providers: any[] }>('proxy.status', {})
+          const text = st.running ? `Proxy running on http://${st.host}:${st.port} (${st.providers.length} providers)` : 'Proxy is stopped'
+          return ok(text, st)
+        }
+        if (sub === 'start') {
+          const port = Number(flags.port) > 0 ? Number(flags.port) : 4080
+          const st = await client.call<{ running: boolean; host: string; port: number }>('proxy.start', { port })
+          return ok(`Proxy listening on http://${st.host}:${st.port}`, st)
+        }
+        if (sub === 'stop') {
+          const st = await client.call('proxy.stop', {})
+          return ok('Proxy stopped', st)
+        }
+        throw new Error(`Unknown proxy subcommand "${sub}". Use: start, stop, status.`)
+      }
+      case 'provider': {
+        const sub = words[1] ?? 'list'
+        if (sub === 'list') {
+          const res = await client.call<{ providers: { id: string; kind: string; name: string; baseUrl: string; priority: number; enabled: boolean }[] }>('provider.list', {})
+          const text =
+            res.providers.length === 0
+              ? 'No proxy providers configured. Add one with: oah provider add <anthropic|openai> <name> <baseUrl> <apiKey>'
+              : res.providers.map((p) => `${p.enabled ? '●' : '○'} ${p.id}  [${p.kind}]  #${p.priority}  ${p.name}  ${p.baseUrl}`).join('\n')
+          return ok(text, res)
+        }
+        if (sub === 'add') {
+          const [kind, name, baseUrl, apiKey] = words.slice(2)
+          if (!kind || !name || !baseUrl || !apiKey) {
+            throw new Error('Usage: oah provider add <anthropic|openai> <name> <baseUrl> <apiKey> [--priority N]')
+          }
+          const priority = Number(flags.priority) > 0 ? Number(flags.priority) : undefined
+          const res = await client.call<{ provider: { id: string; name: string } }>('provider.add', { kind, name, baseUrl, apiKey, priority })
+          return ok(`Added provider ${res.provider.name} (${res.provider.id})`, res)
+        }
+        if (sub === 'rm') {
+          if (!words[2]) throw new Error('Usage: oah provider rm <id>')
+          const res = await client.call('provider.rm', { id: words[2] })
+          return ok(`Removed provider ${words[2]}`, res)
+        }
+        if (sub === 'on' || sub === 'off') {
+          if (!words[2]) throw new Error(`Usage: oah provider ${sub} <id>`)
+          const res = await client.call('provider.toggle', { id: words[2], enabled: sub === 'on' })
+          return ok(`Provider ${words[2]} ${sub === 'on' ? 'enabled' : 'disabled'}`, res)
+        }
+        throw new Error(`Unknown provider subcommand "${sub}". Use: list, add, rm, on, off.`)
+      }
+      case 'bench': {
+        const res = await client.call<{ results: { id: string; name: string; kind: string; latencyMs: number; band: string; ok: boolean; error?: string }[] }>('provider.bench', {})
+        const text =
+          res.results.length === 0
+            ? 'No proxy providers to benchmark.'
+            : res.results.map((r) => `${r.ok ? `${r.latencyMs}ms [${r.band}]` : `ERROR (${r.error})`}  ${r.name} (${r.kind})`).join('\n')
+        return ok(text, res)
+      }
+      case 'sync': {
+        const sub = words[1]
+        if (sub === 'export') {
+          const res = await client.call('sync.export', {})
+          return ok(JSON.stringify(res, null, 2), res)
+        }
+        if (sub === 'import') {
+          const file = words[2]
+          if (!file || !existsSync(file)) throw new Error('Usage: oah sync import <config.json>')
+          const parsed = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+          const res = await client.call('sync.import', { config: parsed })
+          return ok(`Imported config from ${file}`, res)
+        }
+        throw new Error('Usage: oah sync export | import <file>')
       }
       default:
         throw new Error(`Unknown command "${cmd}". Run \`oah help\`.`)

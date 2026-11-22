@@ -56,6 +56,14 @@ declare module 'orca' {
     /** For looking into a problem (`orca plugin dev request`), not used by the panel: the last
      *  few status events, the focused workspace's agents and the workspaces Orca lists. */
     'rotator.debug': { input: Record<string, never>; output: Record<string, unknown> }
+    /** Local HTTP proxy status / start / stop and endpoint latency bench (`oahd`). */
+    'rotator.proxyStatus': { input: Record<string, never>; output: { running: boolean; host: string; port: number; providers: { id: string; name: string; kind: string; baseUrl: string; priority: number; enabled: boolean; circuit: string; consecutiveFailures: number }[] } }
+    'rotator.proxyStart': { input: { port?: number }; output: { running: boolean; host: string; port: number; providers: any[] } }
+    'rotator.proxyStop': { input: Record<string, never>; output: { running: boolean; host: string; port: number; providers: any[] } }
+    'rotator.bench': { input: Record<string, never>; output: { results: { id: string; name: string; kind: string; baseUrl: string; ok: boolean; latencyMs: number; band: string; error?: string }[] } }
+    'rotator.pins': { input: Record<string, never>; output: { pins: Record<string, string> } }
+    'rotator.pin': { input: { target: string; seatKey: string }; output: { pins: Record<string, string> } }
+    'rotator.unpin': { input: { target: string }; output: { pins: Record<string, string> } }
   }
   interface PluginPanelEvents {
     /** Posted to every open panel when anything the panel shows changes. */

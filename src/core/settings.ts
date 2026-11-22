@@ -86,6 +86,29 @@ export const ADVANCED_SETTINGS: SettingSpec[] = [
   { key: 'auto_message', title: 'First message after a limit', kind: 'text', default: 'Continue.', help: 'Typed into a session whose work was interrupted (a limit or an API error) once it continues, and when a waiting session wakes. Empty = none after a hand-off; an API error retry then types “continue”.' },
   { key: 'max_api_retries', title: 'API error retries', kind: 'number', default: 6, min: 0, max: 50, unit: '', help: 'Retry a turn that failed with a passing API error (overloaded, 5xx) at most this many times in a row, with growing pauses. 0 = never retry.' },
   { key: 'model_fallback', title: 'Model fallback', kind: 'text', default: '', placeholder: 'claude=sonnet,haiku', help: 'At a model limit, when no other account is known to have room for that model, try these models on the same account before handing off. Per service, separated by semicolons.' },
+  {
+    key: 'model_window_policy',
+    title: 'Per-model weekly cap policy',
+    kind: 'choice',
+    default: 'fallback-model',
+    help: 'How per-model weekly windows (e.g. Claude Fable) affect rotation.',
+    options: [
+      { value: 'fallback-model', label: 'Model fallback first', help: 'Try /model fallback on the same account at a model cap before handing off.' },
+      { value: 'rotate', label: 'Rotate on model cap', help: 'Proactively rotate away when a model weekly window runs low and avoid accounts with 0 % left in that bucket.' },
+      { value: 'ignore', label: 'Ignore model window', help: 'Only consider the shared 5-hour and weekly windows.' }
+    ]
+  },
+  {
+    key: 'live_probes',
+    title: 'Live fallback quota probes',
+    kind: 'choice',
+    default: 'auto',
+    help: 'When Orca readings are stale or missing, probe Codex app-server, Claude /usage, or OpenCode Go directly.',
+    options: [
+      { value: 'auto', label: 'Auto fallback', help: 'Probe live only when Orca readings are stale (>10 min) or absent.' },
+      { value: 'off', label: 'Off', help: 'Use Orca readings and pane live files only.' }
+    ]
+  },
   { key: 'default_cooldown_minutes', title: 'Cooldown when a limit gives no reset time', kind: 'number', default: 60, min: 1, max: 1440, unit: 'min', help: 'How long an account is set aside when its limit message gives no reset time.' },
   { key: 'poll_interval_seconds', title: 'Read usage every', kind: 'number', default: 60, min: 15, max: 3600, unit: 's', help: 'How often usage is read from Orca.' },
   { key: 'handoff_max_chars', title: 'Hand-off summary size', kind: 'number', default: 6000, min: 500, max: 50000, unit: 'chars', help: 'Services that cannot resume (Codex, Antigravity, OpenCode, Devin) start the new session with a summary this long at most. Orca takes at most 4,096 characters, so a larger value changes nothing.' },

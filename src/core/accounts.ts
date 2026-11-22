@@ -22,10 +22,14 @@ function usageFrom(rl: unknown, row?: Json, expectedAccountId?: string): SeatUsa
   }
   const session = win(r.session)
   const weekly = win(r.weekly)
-  const known = r.status === 'ok' && !!(session || weekly)
+  const ordinaryAllowed = typeof r.ordinaryUsageAllowed === 'boolean' ? r.ordinaryUsageAllowed : undefined
+  const limitType = typeof r.rateLimitReachedType === 'string' && r.rateLimitReachedType.trim() ? r.rateLimitReachedType.trim() : undefined
+  const known = r.status === 'ok' && (!!(session || weekly) || ordinaryAllowed === false)
   const usage: SeatUsage = { known, source: known ? 'live' : 'unknown' }
   if (session) usage.session = session
   if (weekly) usage.weekly = weekly
+  if (ordinaryAllowed !== undefined) usage.ordinaryUsageAllowed = ordinaryAllowed
+  if (limitType) usage.rateLimitReachedType = limitType
   if (typeof r.updatedAt === 'number') usage.updatedAt = r.updatedAt
   // Model buckets: Claude reports e.g. `fableWeekly`, `opusWeekly`.
   for (const [k, v] of Object.entries(r)) {
@@ -38,6 +42,8 @@ function usageFrom(rl: unknown, row?: Json, expectedAccountId?: string): SeatUsa
   if (!known) {
     // Why Orca has nothing: its own failure kind and message, never guessed.
     const kind = r.usageMetadata?.failureKind
+    const errText = typeof r.error === 'string' ? r.error : ''
+    const looksAuth = /not signed in|authentication required|re-authenticate|token.*expired|invalid.*key|unauthenticated/i.test(errText)
     usage.reason =
       row?.isFetching || r.status === 'fetching'
         ? 'fetching'
@@ -45,7 +51,7 @@ function usageFrom(rl: unknown, row?: Json, expectedAccountId?: string): SeatUsa
           ? 'stale-token'
           : kind === 'rate-limited'
             ? 'rate-limited'
-            : kind === 'missing-credentials'
+            : kind === 'missing-credentials' || looksAuth
               ? 'sign-in'
               : r.status === 'error'
                 ? 'error'
@@ -112,6 +118,7 @@ export function parseAccounts(result: Json): AccountView {
       // taken from the account's home; the path stays out of seats, snapshots and storage.
       const liveKey = provider === 'claude' ? liveKeyOfHome(a.home) : undefined
       if (liveKey) seat.liveKeys = [liveKey]
+      if (provider === 'codex' && typeof a.home === 'string' && a.home.trim()) seat.codexHome = a.home.trim()
       seats.push(seat)
     }
     // The system login is a seat of its own unless it is the same person as a managed account.

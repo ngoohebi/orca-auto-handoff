@@ -126,6 +126,43 @@ test('oah CLI: help, version, status, --json, pause/resume, service, skip, confi
     assert.equal(rpc.code, 0)
     assert.equal(JSON.parse(rpc.stdout).version, VERSION)
 
+    // v0.5.0: active, pin/pins/unpin, event stop-failure, proxy, provider, sync export
+    const active = await runCli(['active', 'claude', '--json'], client, { autoStart: false })
+    assert.equal(active.code, 0)
+    assert.equal(JSON.parse(active.stdout).active[0].label, 'work@example.com')
+
+    const pin = await runCli(['pin', 'ws-1', 'personal', '--json'], client, { autoStart: false })
+    assert.equal(pin.code, 0)
+    assert.equal(JSON.parse(pin.stdout).pins['ws-1'], 'claude:a2')
+
+    const pins = await runCli(['pins'], client, { autoStart: false })
+    assert.equal(pins.code, 0)
+    assert.match(pins.stdout, /ws-1 -> claude:a2/)
+
+    const unpin = await runCli(['unpin', 'ws-1', '--json'], client, { autoStart: false })
+    assert.equal(unpin.code, 0)
+    assert.deepEqual(JSON.parse(unpin.stdout).pins, {})
+
+    const stopEv = await runCli(['event', 'stop-failure', '--error', 'rate_limit', '--json'], client, { autoStart: false })
+    assert.equal(stopEv.code, 0)
+    assert.equal(JSON.parse(stopEv.stdout).handled, false)
+
+    const pAdd = await runCli(['provider', 'add', 'anthropic', 'RelayA', 'http://127.0.0.1:9999', 'sk-test', '--priority', '1', '--json'], client, { autoStart: false })
+    assert.equal(pAdd.code, 0)
+    const pId = JSON.parse(pAdd.stdout).provider.id
+    const pList = await runCli(['provider', 'list', '--json'], client, { autoStart: false })
+    assert.equal(JSON.parse(pList.stdout).providers.length, 1)
+    assert.equal(JSON.parse(pList.stdout).providers[0].apiKey, undefined)
+
+    const pOff = await runCli(['provider', 'off', pId, '--json'], client, { autoStart: false })
+    assert.equal(JSON.parse(pOff.stdout).enabled, false)
+    const pRm = await runCli(['provider', 'rm', pId, '--json'], client, { autoStart: false })
+    assert.equal(JSON.parse(pRm.stdout).ok, true)
+
+    const exp = await runCli(['sync', 'export'], client, { autoStart: false })
+    assert.equal(exp.code, 0)
+    assert.equal(JSON.parse(exp.stdout).schema, 'oah-config/v1')
+
     const bad = await runCli(['unknown-cmd'], client, { autoStart: false })
     assert.equal(bad.code, 1)
     assert.match(bad.stderr, /Unknown command/)

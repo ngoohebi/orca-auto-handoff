@@ -21,6 +21,7 @@ import {
 import {
   blindCooldownMs,
   buildChain,
+  circuitState,
   earliestReset,
   enoughGap,
   exhausted,
@@ -1232,8 +1233,28 @@ export class Rotator {
     try {
       const pane = await this.describe(event)
       if (!pane) return
+      // Pinning: if the workspace or terminal is explicitly pinned to an account, skip automatic
+      // hand-off (it stays on its pinned account until unpinned).
+      const cfg = await this.config()
+      const pinned = cfg.pins?.[pane.terminalId] ?? cfg.pins?.[pane.workspaceId]
+      if (pinned) {
+        this.deps.log(`${pane.agent} ${pane.terminalId}: pinned to ${pinned}, skipping automatic hand-off`)
+        return
+      }
       // Paused: still note which banners exist, so un-pausing never acts on stale ones.
       await this.inspect(pane, this.state.paused, state === 'done')
+      // A clean turn end on a half-open seat closes its circuit breaker.
+      if (state === 'done') {
+        const seatKey = this.state.paneSeat[pane.terminalId]
+        if (seatKey) {
+          const h = this.healthOf(seatKey, pane.server)
+          if (h && circuitState(h, this.deps.now()) === 'half_open') {
+            h.circuit = 'closed'
+            h.consecutiveFailures = 0
+            await this.save()
+          }
+        }
+      }
     } catch (error) {
       this.deps.log(`status handling failed for ${terminalId}: ${String((error as Error)?.message ?? error)}`)
     } finally {
@@ -2900,6 +2921,7 @@ export class Rotator {
         delete h.cooldownUntil
         delete h.reason
         h.freedAt = now
+        if ((h.consecutiveFailures ?? 0) > 0) h.circuit = 'half_open'
         changed = true
       }
       if (h.cooldownUntil) continue
@@ -2910,7 +2932,8 @@ export class Rotator {
         changed = true
       }
       const presumedReset = !!h.resetKnown && h.freedAt !== undefined && now - h.freedAt < STRIKE_TTL_MS
-      if (!struck && !presumedReset) {
+      const halfOpen = h.circuit === 'half_open' && h.freedAt !== undefined && now - h.freedAt < STRIKE_TTL_MS
+      if (!struck && !presumedReset && !halfOpen) {
         delete this.state.health[key]
         changed = true
       }
@@ -3703,15 +3726,17 @@ export class Rotator {
       updatedAt,
       seats: view.seats.map((s) => {
         const h = this.healthOf(s.key, this.server)
-        const { liveKeys: _liveKeys, ...seat } = s
+        const { liveKeys: _liveKeys, codexHome: _codexHome, ...seat } = s
         // The history covers this computer's accounts only.
         const runway = this.server ? null : runwayMs(this.samples.seats[s.key]?.recent ?? [], now)
+        const circuit = circuitState(h, now)
         return {
           ...seat,
           ...(this.lastConfig && isExcluded(s, this.lastConfig) ? { excluded: true } : {}),
           ...(runway !== null ? { runwayMs: Math.round(runway) } : {}),
           ...(h?.cooldownUntil ? { cooldownUntil: h.cooldownUntil } : {}),
-          ...(h?.reason ? { cooldownReason: h.reason } : {})
+          ...(h?.reason ? { cooldownReason: h.reason } : {}),
+          ...(circuit !== 'closed' ? { circuit } : {})
         }
       }),
       waiting: this.state.waiting,
@@ -3734,5 +3759,44 @@ export class Rotator {
 
   publishNow(): void {
     this.deps.publish(this.snapshot())
+  }
+
+  /** Instant hook-driven rate-limit trigger (Claude Code `StopFailure` hook -> `oah event stop-failure`).
+   *  Finds the matching pane by terminalId or sessionId and triggers immediate inspection/hand-off. */
+  async onStopFailure(payload: { sessionId?: string; terminalId?: string; workspaceId?: string; error?: string }): Promise<{ handled: boolean; detail: string }> {
+    const err = String(payload.error ?? 'rate_limit').toLowerCase()
+    if (!err.includes('rate_limit') && !err.includes('limit') && !err.includes('quota')) {
+      return { handled: false, detail: `Ignored non-limit StopFailure (${err})` }
+    }
+    if (payload.terminalId && payload.workspaceId) {
+      await this.onAgentStatus({
+        terminalId: payload.terminalId,
+        workspaceId: payload.workspaceId,
+        sessionId: payload.sessionId,
+        state: 'done',
+        receivedAt: this.deps.now()
+      })
+      return { handled: true, detail: `Triggered inspection for terminal ${payload.terminalId}` }
+    }
+    // Locate pane by sessionId across workspaces if terminalId wasn't supplied by the hook.
+    if (payload.sessionId) {
+      const wsRes = await this.deps.host.call('workspace.list').catch(() => ({ workspaces: [] }))
+      const workspaces: { id: string }[] = Array.isArray(wsRes?.workspaces) ? wsRes.workspaces : []
+      for (const ws of workspaces) {
+        const agRes = await this.deps.host.call('agents.list', { workspaceId: ws.id }).catch(() => ({ agents: [] }))
+        const match = (agRes?.agents ?? []).find((a: any) => a?.sessionId === payload.sessionId)
+        if (match?.terminalId) {
+          await this.onAgentStatus({
+            terminalId: match.terminalId,
+            workspaceId: ws.id,
+            sessionId: payload.sessionId,
+            state: 'done',
+            receivedAt: this.deps.now()
+          })
+          return { handled: true, detail: `Triggered inspection for session ${payload.sessionId} (${match.terminalId})` }
+        }
+      }
+    }
+    return { handled: false, detail: 'No matching active pane found for StopFailure event' }
   }
 }

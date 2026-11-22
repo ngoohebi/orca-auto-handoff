@@ -1,6 +1,6 @@
 // Which seat comes next: the chain, eligibility, Smart or the account order, switch-back, earliest reset.
 import { NO_CONTEXT, candidateOf, headroom, rank, type SmartContext, type Tier } from './smart.ts'
-import { BLIND_COOLDOWN_CAP_MINUTES, STRIKE_TTL_MS, type Config, type Provider, type Seat, type SeatHealth } from './types.ts'
+import { BLIND_COOLDOWN_CAP_MINUTES, STRIKE_TTL_MS, type CircuitState, type Config, type Provider, type Seat, type SeatHealth } from './types.ts'
 
 export type { Tier }
 
@@ -52,10 +52,21 @@ function full(window: { usedPercent: number; resetsAt: number | null } | undefin
   return window.usedPercent >= 100
 }
 
+/** Formal 3-state circuit breaker for a seat: `open` (cooling), `half_open` (probing recovery), or `closed` (healthy). */
+export function circuitState(health: SeatHealth | undefined, now: number): CircuitState {
+  if (health?.cooldownUntil && health.cooldownUntil > now) return 'open'
+  if (health?.circuit === 'half_open') return 'half_open'
+  if ((health?.consecutiveFailures ?? 0) > 0 && (health?.freedAt !== undefined || health?.cooldownUntil !== undefined)) {
+    return 'half_open'
+  }
+  return 'closed'
+}
+
 /** Not cooling down, and not known to be used up. */
-export function isEligible(seat: Seat, health: SeatHealth | undefined, now: number): boolean {
-  if (health?.cooldownUntil && health.cooldownUntil > now) return false
-  return !exhausted(seat, now)
+export function isEligible(seat: Seat, health: SeatHealth | undefined, now: number, config?: Config): boolean {
+  if (circuitState(health, now) === 'open') return false
+  if (seat.usage.reason === 'sign-in') return false
+  return !exhausted(seat, now, config)
 }
 
 /** Strikes that still count: they lapse 24 h after the last one. */
@@ -89,9 +100,13 @@ export function tier(seat: Seat, health: SeatHealth | undefined, now: number): T
   return health?.resetKnown && expired && strikesOf(health, now) === 0 ? 'B+' : 'B'
 }
 
-/** Known to be at 100 % in a window that has not reset yet. */
-export function exhausted(seat: Seat, now: number): boolean {
-  return seat.usage.known && (full(seat.usage.session, now) || full(seat.usage.weekly, now))
+/** Known to be at 100 % in a window that has not reset yet, or Codex ordinaryUsageAllowed === false. */
+export function exhausted(seat: Seat, now: number, config?: Config): boolean {
+  if (!seat.usage.known) return false
+  if (seat.usage.ordinaryUsageAllowed === false) return true
+  if (full(seat.usage.session, now) || full(seat.usage.weekly, now)) return true
+  if (config?.modelWindowPolicy === 'rotate' && full(seat.usage.model, now)) return true
+  return false
 }
 
 /** Lower is better (the headroom gap). Unknown usage counts as the middle. */
@@ -188,6 +203,9 @@ export function pickNext(
       const fewest = Math.min(...pool.map((s) => strikesOf(health[s.key], now)))
       pool = pool.filter((s) => strikesOf(health[s.key], now) === fewest)
     }
+    // Prefer `closed` circuit seats over `half_open` recovering seats within the same tier.
+    const closedOnly = pool.filter((s) => circuitState(health[s.key], now) === 'closed')
+    if (closedOnly.length > 0) pool = closedOnly
   }
   if (smart) return rank(pool.map((s) => candidates.get(s)!), config)[0]!.seat
   // The account order is a ranking: the highest account in it that is known to have room, or is

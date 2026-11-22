@@ -19,6 +19,8 @@ export const STATUS_NAME = 'status.tsv'
 export const LIVE_DIR = 'live'
 /** What `.claude/settings.local.json` runs; `$HOME` stays literal so the file is portable. */
 export const STATUSLINE_COMMAND = `/bin/sh "$HOME/${DATA_DIR}/${SCRIPT_NAME}"`
+/** Claude Code `StopFailure` hook command: instantly notifies `oahd` on rate limits. */
+export const STOP_FAILURE_HOOK_COMMAND = '"$HOME/.orca/oah/bin/oah" event stop-failure'
 /** The optional header line; empty = account rows only. */
 export const DEFAULT_FORMAT = ''
 /** Seconds between Claude's re-runs of the status line besides its own events, so a pane that
@@ -119,6 +121,47 @@ export function needsUpgrade(text: string | null): boolean {
   } catch {
     return false
   }
+}
+
+/** Whether `.claude/settings.local.json` has OAH's `StopFailure` hook installed. */
+export function isStopFailureHookInstalledIn(text: string | null): boolean {
+  try {
+    const hooks = parseSettings(text).hooks as Record<string, unknown> | undefined
+    const list = Array.isArray(hooks?.StopFailure) ? hooks.StopFailure : []
+    return list.some((entry: any) =>
+      Array.isArray(entry?.hooks) && entry.hooks.some((h: any) => typeof h?.command === 'string' && h.command.includes('oah') && h.command.includes('stop-failure'))
+    )
+  } catch {
+    return false
+  }
+}
+
+/** Installs OAH's `StopFailure` hook into `.claude/settings.local.json` without clobbering user hooks. */
+export function installStopFailureHook(text: string | null): { text: string; added: boolean } {
+  const settings = parseSettings(text)
+  if (isStopFailureHookInstalledIn(text)) return { text: JSON.stringify(settings, null, 2) + '\n', added: false }
+  const hooks = (settings.hooks && typeof settings.hooks === 'object' && !Array.isArray(settings.hooks) ? { ...(settings.hooks as Record<string, unknown>) } : {}) as Record<string, unknown>
+  const existing = Array.isArray(hooks.StopFailure) ? [...hooks.StopFailure] : []
+  existing.push({ hooks: [{ type: 'command', command: STOP_FAILURE_HOOK_COMMAND }] })
+  hooks.StopFailure = existing
+  settings.hooks = hooks
+  return { text: JSON.stringify(settings, null, 2) + '\n', added: true }
+}
+
+/** Removes OAH's `StopFailure` hook from `.claude/settings.local.json`, leaving user hooks intact. */
+export function uninstallStopFailureHook(text: string | null): { text: string | null; removed: boolean } {
+  if (!text) return { text: null, removed: false }
+  const settings = parseSettings(text)
+  const hooks = settings.hooks as Record<string, unknown> | undefined
+  if (!hooks || !Array.isArray(hooks.StopFailure)) return { text, removed: false }
+  const filtered = hooks.StopFailure.filter(
+    (entry: any) => !(Array.isArray(entry?.hooks) && entry.hooks.some((h: any) => typeof h?.command === 'string' && h.command.includes('oah') && h.command.includes('stop-failure')))
+  )
+  if (filtered.length === hooks.StopFailure.length) return { text, removed: false }
+  if (filtered.length === 0) delete hooks.StopFailure
+  else hooks.StopFailure = filtered
+  if (Object.keys(hooks).length === 0) delete settings.hooks
+  return { text: Object.keys(settings).length === 0 ? null : JSON.stringify(settings, null, 2) + '\n', removed: true }
 }
 
 /** Removes the wrapper and restores what was there; `null` text means the file can be deleted. */
