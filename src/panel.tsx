@@ -42,6 +42,11 @@ import { HELD_WORDS, minLeft, percentLeft, PROVIDER_NAME, REASON_WORDS, resultWo
 import type { SettingValues, Snapshot, UnsentDraft } from './protocol'
 import { ADVANCED_SETTINGS, applies, BASIC_SETTINGS, checked, type SettingSpec } from './core/settings.ts'
 import { PROVIDERS, type Provider } from './core/types.ts'
+import { VERSION } from './core/version.ts'
+
+/** The panel's first line, the switch for everything: named as the panel is in Orca's sidebar
+ *  (orca-plugin.json), whose header shows only the panel's icon. */
+export const PANEL_TITLE = `OAH (Orca Auto Hand-off) v${VERSION}`
 
 const snapshot = atom<Snapshot | null>(null)
 /** The actions on their way, by key. Each control waits only for its own action (and a hand-off
@@ -1107,7 +1112,7 @@ export default function Panel() {
           says what is happening, and a green "on" beside it would say the opposite. */}
       <Stack gap="xs">
         <Switch
-          label="Automatic hand-off"
+          label={PANEL_TITLE}
           checked={!snap.paused}
           disabled={isBusy('pause')}
           onChange={(on: boolean) =>

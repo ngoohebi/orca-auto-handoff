@@ -1,4 +1,4 @@
-# OAH (Orca Auto Hand-off) v0.5.0
+# OAH (Orca Auto Hand-off) v0.6.0
 
 **Hit a rate limit? Auto-switch to your next account and keep working.**
 
@@ -51,7 +51,7 @@ Turn **Live quota** off in Settings if you prefer usage strictly from Orca.
 - **Per-Model Weekly Cap Policy (`model_window_policy`):** Choose `fallback-model` (try `/model <next>` first), `rotate` (proactively rotate away on model weekly caps like Claude Fable and avoid accounts with 0% left in that bucket), or `ignore`.
 
 ### Quiet 3-Tab Orca Panel
-- **Minimal header:** The global switch sits alone on the first line (`OAH (Orca Auto Hand-off) v0.5.0`), with current state, reading age, and refresh icon directly below.
+- **Minimal header:** The global switch sits alone on the first line (`OAH (Orca Auto Hand-off) v0.6.0`), with current state, reading age, and refresh icon directly below.
 - **Accounts:** Monochrome, hairline-divided rows with one-line service headers, status beside each account name, and right-aligned actions (**Early hand off**, **End cooldown**). **Early hand off** moves the on-screen session and keeps automatic hand-off ON. The focused service follows tab switches within ~1 second.
 - **History:** Entries grouped by day (failed hand-offs highlighted in danger tone).
 - **Settings:** 6 core settings up front, grouped **Advanced** fine-tuning below, and explicit **Save / Undo** buttons for typed values.

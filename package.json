@@ -1,6 +1,6 @@
 {
   "name": "orca-auto-handoff",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "OAH (Orca Auto Hand-off): CLI-first automatic account hand-off daemon and thin Orca panel plugin",
   "type": "module",
   "license": "MIT",
