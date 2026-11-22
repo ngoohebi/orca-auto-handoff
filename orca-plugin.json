@@ -1,7 +1,7 @@
 {
   "manifestVersion": 2,
   "id": "oah",
-  "name": "OAH",
+  "name": "OAH (Orca Auto Hand-off)",
   "version": "0.5.0",
   "description": "OAH (Orca Auto Hand-off): CLI-first automatic account hand-off daemon (`oah` / `oahd`) with a thin Orca panel and event bridge.",
   "author": {
@@ -20,7 +20,7 @@
     "panels": [
       {
         "id": "seats",
-        "title": "OAH",
+        "title": "OAH (Orca Auto Hand-off) v0.5.0",
         "icon": "gauge",
         "entry": "src/panel.tsx",
         "ui": "components"
