@@ -58,7 +58,7 @@ Open the **OAH** panel (gauge icon, right sidebar). Out of the box, OAH runs **A
 ## Key Features
 
 ### Direct Live Quota (`direct_quota`, on by default)
-Orca only reads usage for the account currently in use, and only while you are at Orca. When Orca's reading for an account is missing or stale, OAH fills the gap by querying the provider directly using the sign-in Orca already saved (Claude at most every 15 minutes, other providers every 10 minutes), so inactive accounts and away time stay current too:
+Orca is the primary source of usage (OAH reads account and terminal lists over Orca's local socket in **~1 ms**, asking only for stale-only refreshes within Orca's throttles and `Retry-After` — never forcing a refresh). When Orca's reading for an account is missing or older than **15 minutes** (Claude) or **10 minutes** (other providers), **Live quota** fills the gap directly using the sign-in Orca already saved:
 
 | Provider | Direct Quota Source | Notes |
 |---|---|---|
@@ -87,11 +87,15 @@ Turn **Live quota** off in Settings to rely solely on Orca's own usage readings.
 - **Unsent text guard:** Reads the input box twice before closing; aborts if typing is in progress, parks if queued messages or non-portable drafts (`[Image #1]`, `>4,000` chars) are present.
 - **Per-workspace / per-pane pinning:** `oah pin <workspaceId|terminalId> <account>` locks dedicated long-running sessions onto their pinned account.
 - **Instant `StopFailure` hook:** Claude Code's `StopFailure` hook can trigger `oah event stop-failure` immediately on rate limits (Terminal and Chat sessions).
-- **Claude status line (`console_statusline`, on by default):** One switch in Settings enables a fast (~40ms) POSIX `sh` status line across every workspace on this computer, preserving any existing status line and printing OAH's multi-account usage rows below it.
+- **Claude status line (`console_statusline`, on by default):** One global switch in Settings enables a fast (~40ms) POSIX `sh` status line across every workspace on this computer. Any status line you already configured (workspace or user level) keeps printing **above** OAH's multi-account usage rows; turning it off restores what was there. Launcher config dirs (such as ClaudeBar's) are automatically matched to the Orca account with the same sign-in so the active pane's account is marked and fed.
 
-### Redesigned Quiet Panel UI
-- **3 focused tabs:** **Accounts**, **History** (grouped by day; tab badge counts only failed hand-offs), and **Settings** (6 core settings up front, grouped Advanced settings, Save/Undo for typed values).
-- **Orca-native quiet styling:** Monochrome layout, hairline row dividers, one-line service headers, state-only status line, and per-control busy states (each action greys out only its own button).
+### Redesigned Quiet Panel UI (`Accounts`, `History`, `Settings`)
+- **Minimal header:** No repeated panel title — the global **Automatic hand-off** switch sits alone at the top, with the current state, reading age, and refresh icon directly beneath it.
+- **3 clean tabs (no clutter counts in tab names):**
+  - **Accounts:** Monochrome, hairline-divided rows with one-line service headers. Each account row puts its status beside the name and actions (`Early hand off`, `End cooldown`) on the right edge. Pressing **Early hand off** hands off the on-screen session and **keeps automatic hand-off ON** so normal rotation continues. The focused service follows tab switches within ~1 second.
+  - **History:** Entries grouped under day headings (failed hand-offs highlighted in danger tone).
+  - **Settings:** 6 core settings up front (`Pick the next account`, `When to hand off`, `When everything is used up`, `Session on screen`, `Live quota`, `Claude status line`), grouped **Advanced** settings underneath, and explicit **Save / Undo** buttons for typed values.
+- **Per-control busy states:** Each button greys out only its own control; an active hand-off blocks only other hand-offs.
 
 ### Optional Local HTTP Failover Proxy & Bench
 - Run `oah proxy start --port 4080` and point `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` at `http://127.0.0.1:4080` for transparent mid-request failover across API-key / third-party relay providers on HTTP `429` / `5xx` / `529` or timeouts.
@@ -101,50 +105,33 @@ Turn **Live quota** off in Settings to rely solely on Orca's own usage readings.
 
 ## `oah` CLI Reference
 
-Every command accepts `--json`. Set `OAH_HOME=/path` to isolate state, config, and socket.
+Every command accepts `--json` for machine-readable output and auto-starts `oahd` on demand. Account arguments match by full key (`claude:<id>`), email, or any unique substring. Set `OAH_HOME=/path` to isolate state, config, and socket.
 
-```sh
-# Status & inspection
-oah [status] [--json]               # Accounts, usage, runway, cooldowns, circuit state, waiting
-oah active [service] [--json]       # Active account(s) for scripts and external agents
-oah refresh [--json]                # Refresh usage, then show status
-oah history [--limit 50] [--json]   # Recent hand-off history (7 days, up to 1,000 entries)
-oah debug [--json]                  # Daemon health, bridge status, recent events
-oah version [--json]                # CLI and daemon version
-
-# Account & hand-off controls
-oah use <account> [--force]         # Select <account> and hand off the on-screen session
-oah handoff                         # Hand off the focused workspace session
-oah next [service]                  # Select the next healthy account for new sessions
-oah pause | oah resume              # Global automatic hand-off off or on
-oah service <service> on|off        # Per-service automatic hand-off
-oah clear <account>                 # End cooldown and reset circuit breaker
-oah order up|down <account>         # Move an account in Custom order
-oah pin <id> <account>              # Pin a workspace or terminal to one account
-oah unpin <id> | oah pins           # Remove or list pins
-
-# Waiting session responses
-oah now <terminalId>                # Hand off a waiting on-screen session now
-oah notnow <terminalId>             # Wait until you switch tabs
-oah cancel <terminalId>             # Cancel a waiting hand-off
-
-# Local HTTP proxy & API-key providers
-oah proxy start [--port 4080] | stop | status
-oah provider list
-oah provider add <anthropic|openai> <name> <baseUrl> <apiKey> [--priority N]
-oah provider on|off|rm <id>
-oah bench [--json]                  # Benchmark endpoint latency across configured providers
-
-# Configuration, hooks, sync & daemon
-oah config [get [key]]              # View ~/.orca/oah/config.json settings
-oah config set <key> <value>        # Validate and update a setting (aliases: settings, set)
-oah statusline [status|install|remove]
-oah event stop-failure [--session <id>] [--terminal <id>] [--error <kind>]
-oah sync export | import <file>     # Export/import portable config JSON (API keys redacted)
-oah session                         # Persistent bidirectional NDJSON stdio session
-oah daemon start|stop|restart|status|logs
-oah rpc <method> [jsonParams]       # Direct JSON-RPC passthrough to oahd
-```
+| Command | Arguments / Flags | What it does |
+|---|---|---|
+| `oah` / `oah status` | `[--json]` | Show all accounts, 5h/day/week usage, runway, cooldowns, circuit state, and waiting sessions |
+| `oah active` | `[service] [--json]` | Print active account(s) with key and circuit state (for scripts & external agents) |
+| `oah refresh` | `[--json]` | Ask Orca & direct quota to refresh usage, then show status |
+| `oah use` | `<account> [--force]` | Select `<account>` for new sessions and hand off the on-screen session (`--force` proceeds over non-portable unsent text) |
+| `oah handoff` | `[--json]` | Hand off the focused workspace's session to the next healthy account |
+| `oah next` | `[service] [--json]` | Select the next healthy account for new sessions (default: `claude`) |
+| `oah pause` / `oah resume` | `[--json]` | Turn global automatic hand-off off or on |
+| `oah service` | `<service> on\|off` | Turn automatic hand-off on or off for one service (`claude`, `codex`, `antigravity`, `opencode`, `devin`) |
+| `oah clear` | `<account>` | End an account's cooldown and reset its circuit breaker to `closed` |
+| `oah order` | `up\|down <account>` | Move an account up or down in Custom order (aliases: `oah up`, `oah down`) |
+| `oah pin` / `oah unpin` / `oah pins` | `<id> <account>` | Pin/unpin a workspace or terminal ID to one account, or list all pins |
+| `oah now` / `oah notnow` / `oah cancel` | `<terminalId>` | Answer a waiting on-screen hand-off: move now, wait for tab switch, or cancel |
+| `oah history` | `[--limit 50] [--json]` | Show recent hand-off history (7 days, up to 1,000 entries) |
+| `oah config` | `[get [key]] \| set <k> <v>` | View or update `~/.orca/oah/config.json` (aliases: `oah settings`, `oah set`) |
+| `oah statusline` | `[status\|install\|remove]` | Inspect, install, or remove the Claude console status line |
+| `oah event` | `stop-failure [--session <id>] [--terminal <id>] [--error <kind>]` | Instant Claude Code `StopFailure` hook trigger (reads `ORCA_AGENT_SESSION_ID` automatically) |
+| `oah proxy` | `start [--port 4080] \| stop \| status` | Control the optional `127.0.0.1` HTTP failover proxy |
+| `oah provider` | `list \| add <anthropic\|openai> <name> <url> <key> [--priority N] \| on\|off\|rm <id>` | Manage API-key / relay failover providers in `providers.json` |
+| `oah bench` | `[--json]` | Concurrently benchmark HTTP latency across all configured proxy providers |
+| `oah sync` | `export \| import <file>` | Export portable config JSON (API keys redacted) or import on another host |
+| `oah session` | — | Persistent bidirectional NDJSON stdio session attached to `oahd` |
+| `oah daemon` | `start \| stop \| restart \| status \| logs [--limit N]` | Manage the background `oahd` process and inspect logs |
+| `oah debug` / `oah rpc` / `oah version` | `[<method> [json]]` | Daemon diagnostics, raw JSON-RPC passthrough, and CLI/daemon version |
 
 ---
 

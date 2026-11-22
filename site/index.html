@@ -229,20 +229,23 @@ footer a{color:var(--fg-2)}
       <div class="svc">
         <div class="svc-head"><h4>Claude · on screen</h4><small>2 of 3 ready</small></div>
         <div class="acct">
-          <div class="row"><span>you@example.com</span><span class="pill on">active</span></div>
-          <div class="meter">5h 24% used · resets 3h40m</div><div class="bar"><i style="width:24%"></i></div>
-          <div class="meter">Week 14% used · live quota</div><div class="bar"><i style="width:14%"></i></div>
+          <div class="row"><span>you@example.com <span class="pill on">active</span></span><span style="color:var(--fg-3);font-size:.74rem">5h 24% · wk 14%</span></div>
+          <div class="bar"><i style="width:24%"></i></div>
         </div>
         <div class="acct">
-          <div class="row"><span>work@example.com</span><span class="pill cool">half-open</span></div>
-          <div class="meter">5h 88% used · week 42% used</div><div class="bar"><i class="w" style="width:88%"></i></div>
+          <div class="row"><span>work@example.com <span class="pill cool">half-open</span></span><span style="color:var(--accent);font-size:.74rem">Early hand off</span></div>
+          <div class="bar"><i class="w" style="width:88%"></i></div>
+        </div>
+        <div class="acct">
+          <div class="row"><span>backup@example.com <span class="pill cool">⏸ 1h12m</span></span><span style="color:var(--fg-2);font-size:.74rem">End cooldown</span></div>
+          <div class="bar"><i class="d" style="width:100%"></i></div>
         </div>
       </div>
       <div class="svc">
         <div class="svc-head"><h4>Codex</h4><small>2 of 2 ready</small></div>
         <div class="acct">
-          <div class="row"><span>team@example.com</span><span class="pill on">active</span></div>
-          <div class="meter">5h 10% used · week 3% used</div><div class="bar"><i style="width:10%"></i></div>
+          <div class="row"><span>team@example.com <span class="pill on">active</span></span><span style="color:var(--fg-3);font-size:.74rem">5h 10% · wk 3%</span></div>
+          <div class="bar"><i style="width:10%"></i></div>
         </div>
       </div>
     </div>
@@ -307,28 +310,28 @@ footer a{color:var(--fg-2)}
     </div>
     <div class="grid g3">
       <div class="tile">
+        <h3>Quiet 3-Tab Panel</h3>
+        <p>Monochrome Orca-native layout with hairline dividers, compact account rows (state beside name, <b>Early hand off</b> &amp; <b>End cooldown</b> on the right), day-grouped History, Save/Undo settings, and ~1s tab-focus tracking. <b>Early hand off</b> keeps automatic hand-off ON.</p>
+      </div>
+      <div class="tile">
         <h3>3-State Circuit Breaker</h3>
         <p>Formal <code>closed → open → half_open → closed</code> state machine shared by subscription accounts and proxy providers. Healthy <code>closed</code> accounts always outrank recovering <code>half_open</code> ones.</p>
       </div>
       <div class="tile">
-        <h3>Nested-Window Pacing</h3>
-        <p>Combines 2-sample burn-rate runway with whole-window projection (<code>usedPercent / elapsedFraction</code>, guarded at ≥5% elapsed) across 5h, weekly, and model windows.</p>
-      </div>
-      <div class="tile">
-        <h3>Model-Window Policy</h3>
-        <p>Configure <code>model_window_policy</code> as <code>fallback-model</code> (try <code>/model &lt;next&gt;</code> first), <code>rotate</code> (proactively rotate on Fable/Opus weekly caps), or <code>ignore</code>.</p>
+        <h3>Nested-Window Pacing &amp; Model Policy</h3>
+        <p>Combines 2-sample burn-rate runway with whole-window projection (<code>usedPercent / elapsedFraction</code>) and configurable <code>model_window_policy</code> (<code>fallback-model</code>, <code>rotate</code>, or <code>ignore</code>) for Fable/Opus weekly caps.</p>
       </div>
       <div class="tile">
         <h3>Per-Workspace Pinning</h3>
         <p>Run <code>oah pin &lt;workspace|terminal&gt; &lt;account&gt;</code> to lock dedicated sessions onto one account while the rest of your fleet rotates automatically.</p>
       </div>
       <div class="tile">
-        <h3>Claude Status Line (One Toggle)</h3>
-        <p>On by default in Settings across every workspace on this computer. Preserves any existing status line and prints OAH's live multi-account bars beneath it (~40 ms, no CLI calls).</p>
+        <h3>Global Claude Status Line</h3>
+        <p>One switch in Settings (on by default) covers every workspace on this computer, keeps any existing status line printing above OAH's account rows, and matches launcher config dirs (like ClaudeBar) automatically.</p>
       </div>
       <div class="tile">
-        <h3>Instant <code>StopFailure</code> Hook</h3>
-        <p>Zero-regex Claude limit detection via <code>oah event stop-failure</code> — catches limits immediately on both Terminal and Chat sessions.</p>
+        <h3>~1 ms Orca Socket + <code>StopFailure</code> Hook</h3>
+        <p>Reads account &amp; terminal lists over Orca's local socket in ~1 ms (no CLI spawn overhead), plus instant zero-regex Claude limit detection via <code>oah event stop-failure</code>.</p>
       </div>
     </div>
   </div>
@@ -339,6 +342,25 @@ footer a{color:var(--fg-2)}
     <div class="sec-head">
       <div class="eyebrow">CLI Reference</div>
       <h2>Scriptable, fast, <code>--json</code> everywhere</h2>
+      <p class="lede">Every command auto-starts <code>oahd</code> on demand and works on local Macs, SSH boxes, and headless <code>orca serve</code> hosts without the UI panel. Accounts match by key, email, or any unique substring.</p>
+    </div>
+    <div class="tscroll" style="margin-bottom:24px">
+      <table class="tbl">
+        <thead><tr><th>Command</th><th>Arguments &amp; Flags</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><code>oah status</code></td><td><code>[--json]</code></td><td>Accounts, 5h/day/week usage, runway, cooldowns, circuit state &amp; waiting sessions</td></tr>
+          <tr><td><code>oah active</code></td><td><code>[service] [--json]</code></td><td>Active account(s) for scripts, Hermes Agent &amp; <code>orchestration worker-start</code></td></tr>
+          <tr><td><code>oah use</code></td><td><code>&lt;account&gt; [--force]</code></td><td>Select account and hand off the on-screen session (<code>--force</code> overrides unsent text)</td></tr>
+          <tr><td><code>oah handoff</code> / <code>next</code></td><td><code>[service] [--json]</code></td><td>Hand off focused workspace session, or pick next healthy account for new launches</td></tr>
+          <tr><td><code>oah pause</code> / <code>resume</code></td><td><code>[--json]</code></td><td>Global automatic hand-off off or on (<code>oah service &lt;svc&gt; on|off</code> per service)</td></tr>
+          <tr><td><code>oah clear</code> / <code>order</code></td><td><code>&lt;account&gt;</code> / <code>up|down</code></td><td>End cooldown &amp; reset circuit breaker, or reorder Custom order</td></tr>
+          <tr><td><code>oah pin</code> / <code>unpin</code> / <code>pins</code></td><td><code>&lt;id&gt; &lt;account&gt;</code></td><td>Pin a workspace or terminal to one account so auto-handoff skips it</td></tr>
+          <tr><td><code>oah config</code></td><td><code>[get [k]] | set &lt;k&gt; &lt;v&gt;</code></td><td>Read or update <code>~/.orca/oah/config.json</code> (aliases: <code>settings</code>, <code>set</code>)</td></tr>
+          <tr><td><code>oah proxy</code> / <code>provider</code> / <code>bench</code></td><td><code>start|stop|status|add|rm</code></td><td>Run optional <code>127.0.0.1:4080</code> HTTP failover proxy and benchmark endpoint latency</td></tr>
+          <tr><td><code>oah event stop-failure</code></td><td><code>[--session] [--terminal]</code></td><td>Instant Claude Code <code>StopFailure</code> hook trigger</td></tr>
+          <tr><td><code>oah sync</code> / <code>session</code> / <code>daemon</code></td><td><code>export|import|start|stop|logs</code></td><td>Portable config export/import (keys redacted), NDJSON stdio session &amp; daemon control</td></tr>
+        </tbody>
+      </table>
     </div>
     <div class="trace">
       <div class="term">
