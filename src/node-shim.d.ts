@@ -1,4 +1,15 @@
 // Minimal Node API declarations so `tsc` passes without @types/node (zero npm dependencies).
+declare module 'node:crypto' {
+  export function createHash(algorithm: string): { update(value: string): { digest(encoding: 'hex'): string } }
+}
+declare module 'node:sqlite' {
+  export class DatabaseSync {
+    constructor(path: string, options?: { readOnly?: boolean })
+    exec(sql: string): void
+    prepare(sql: string): { all(): Record<string, unknown>[] }
+    close(): void
+  }
+}
 declare module 'node:child_process' {
   export function execFile(
     file: string,
@@ -93,6 +104,7 @@ declare module 'node:os' {
 }
 declare module 'node:path' {
   export function dirname(path: string): string
+  export function isAbsolute(path: string): boolean
   export function join(...parts: string[]): string
   export function resolve(...parts: string[]): string
 }

@@ -57,9 +57,9 @@ function openRuntimeClient(cliPath: string, server: string | null, timeoutMs = 3
   return new RuntimeClient(undefined, timeoutMs, null, server)
 }
 
-async function callListAccounts(client: any, refreshUsage: boolean): Promise<Record<string, any>> {
+async function callListAccounts(client: any, refreshUsage: boolean, refreshStaleUsage = true): Promise<Record<string, any>> {
   const [response, antigravity] = await Promise.all([
-    client.call('accounts.list', { refreshUsage, refreshStaleUsage: true }),
+    client.call('accounts.list', { refreshUsage, refreshStaleUsage }),
     client.call('accounts.antigravityList', { runtime: 'host' }).then((r: any) => r?.result ?? null, () => null)
   ])
   return antigravity ? { ...response.result, antigravity } : response.result
@@ -69,7 +69,7 @@ export async function remoteListAccounts(cliPath: string, server: string, refres
   return callListAccounts(openRuntimeClient(cliPath, server), refreshUsage)
 }
 
-export async function localListAccounts(cliPath: string, refreshUsage = false): Promise<Record<string, any>> {
+export async function localListAccounts(cliPath: string, refreshUsage = false, refreshStaleUsage = true): Promise<Record<string, any>> {
   let client: any
   try {
     client = openRuntimeClient(cliPath, null)
@@ -78,7 +78,7 @@ export async function localListAccounts(cliPath: string, refreshUsage = false): 
     return orcaJson(cliPath, ['account', 'list'])
   }
   try {
-    return await callListAccounts(client, refreshUsage)
+    return await callListAccounts(client, refreshUsage, refreshStaleUsage)
   } catch (error) {
     const code = (error as { code?: string })?.code
     if (code === 'incompatible_runtime' || code === 'invalid_params') {
@@ -211,11 +211,11 @@ function envArgs(server?: string): string[] {
 
 export function nodeCli(getPath: () => Promise<string>): Cli {
   return {
-    async listAccounts(server?: string, options?: { refreshUsage?: boolean }) {
+    async listAccounts(server, options) {
       const cli = resolveOrcaCli(await getPath())
       const refreshUsage = !!options?.refreshUsage
       if (server) return remoteListAccounts(cli, server, refreshUsage)
-      return localListAccounts(cli, refreshUsage)
+      return localListAccounts(cli, refreshUsage, options?.refreshStaleUsage)
     },
     async select(provider: Provider, accountId: string, server?: string) {
       const cli = resolveOrcaCli(await getPath())

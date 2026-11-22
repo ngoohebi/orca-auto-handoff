@@ -167,7 +167,9 @@ export function parseAccounts(result: Json): AccountView {
         accountId: a.id,
         label: name(a.email) ?? name(a.label) ?? a.id,
         active: isActive,
-        usage: isActive ? usageFrom(rl.antigravity) : { known: false, source: 'unknown', reason: 'not-reported' }
+        // Orca includes a last reading per saved Antigravity account. Keep it as fallback for
+        // inactive profiles; OAH's direct check still verifies the native agy identity separately.
+        usage: isActive ? usageFrom(rl.antigravity) : usageFrom(a.usage, a)
       })
       if (isActive) active.antigravity = `antigravity:${a.id}`
     }
@@ -188,7 +190,7 @@ export function parseAccounts(result: Json): AccountView {
     }
   }
 
-  // OpenCode and Devin: profiles, no usage numbers (reactive only).
+  // Orca supplies profile metadata for OpenCode and Devin without quota windows.
   for (const provider of ['opencode', 'devin'] as const) {
     const block: Json = block_(result[provider])
     const accounts: Json[] = rows(block.accounts)

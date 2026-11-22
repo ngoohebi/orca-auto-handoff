@@ -3,6 +3,7 @@
 import { existsSync, mkdirSync, watch, type FSWatcher } from 'node:fs'
 import { createServer, type Server, type Socket } from 'node:net'
 import { nodeCli } from '../core/cli.ts'
+import { directQuotaUnavailable, managedProfileQuota } from './probes.ts'
 import { Rotator, type Cli, type Deps, type HostLike, type StatusEvent } from '../core/engine.ts'
 import { PROVIDER_NAME } from '../core/labels.ts'
 import { liveFileName } from '../core/live-usage.ts'
@@ -98,6 +99,21 @@ export class OahDaemon {
       },
       loadUsage: async () => this.store.loadUsage(),
       saveUsage: async (c) => this.store.saveUsage(c),
+      refreshProfileQuota: opts.cli ? undefined : managedProfileQuota(this.now, {
+        load: () => this.store.loadQuotaRetries(),
+        save: (retries) => this.store.saveQuotaRetries(retries)
+      }),
+      quotaStatus: opts.cli
+        ? undefined
+        : (accounts, seats) => {
+            const unavailable: Record<string, string> = {}
+            for (const seat of seats) {
+              const why = directQuotaUnavailable(accounts, seat)
+              if (why) unavailable[seat.key] = why
+            }
+            const added = this.store.autoLinkQuota(seats.filter((seat) => !unavailable[seat.key]).map((seat) => seat.key))
+            return { added, off: this.store.getQuotaUnlinks(), unavailable }
+          },
       readLive: async (liveKey) => this.store.readLive(liveFileName(liveKey)),
       loadSamples: async () => this.store.loadSamples(),
       saveSamples: async (s) => this.store.saveSamples(s)
@@ -315,8 +331,18 @@ export class OahDaemon {
         return { ok: true, version: VERSION }
       case 'snapshot': {
         if (p.refresh) this.rotator.notePresence()
-        await Promise.all([this.rotator.accounts(!!p.refresh, !!p.refresh), this.rotator.refreshFocus()])
+        await Promise.all([this.rotator.accounts(!!p.refresh, !!p.refresh, p.directQuota === true), this.rotator.refreshFocus()])
         if (!p.refresh) await this.rotator.syncLivePanes(false)
+        return this.rotator.snapshot()
+      }
+      case 'quota.link': {
+        if (typeof p.seatKey !== 'string' || typeof p.linked !== 'boolean') throw new Error('Account and link state are required.')
+        const view = await this.rotator.accounts()
+        if (this.rotator.snapshot().server) throw new Error('Quota links are available for local accounts only.')
+        if (!view.seats.some((seat) => seat.key === p.seatKey && seat.accountId !== 'system')) throw new Error('Choose a saved Orca account.')
+        this.store.setQuotaLink(p.seatKey, p.linked)
+        await this.rotator.accounts(true)
+        this.rotator.publishNow()
         return this.rotator.snapshot()
       }
       case 'pause': {

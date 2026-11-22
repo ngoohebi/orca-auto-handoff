@@ -98,24 +98,13 @@ export const ADVANCED_SETTINGS: SettingSpec[] = [
       { value: 'ignore', label: 'Ignore model window', help: 'Only consider the shared 5-hour and weekly windows.' }
     ]
   },
-  {
-    key: 'live_probes',
-    title: 'Live fallback quota probes',
-    kind: 'choice',
-    default: 'auto',
-    help: 'When Orca readings are stale or missing, probe Codex app-server, Claude /usage, or OpenCode Go directly.',
-    options: [
-      { value: 'auto', label: 'Auto fallback', help: 'Probe live only when Orca readings are stale (>10 min) or absent.' },
-      { value: 'off', label: 'Off', help: 'Use Orca readings and pane live files only.' }
-    ]
-  },
   { key: 'default_cooldown_minutes', title: 'Cooldown when a limit gives no reset time', kind: 'number', default: 60, min: 1, max: 1440, unit: 'min', help: 'How long an account is set aside when its limit message gives no reset time.' },
   { key: 'poll_interval_seconds', title: 'Read usage every', kind: 'number', default: 60, min: 15, max: 3600, unit: 's', help: 'How often usage is read from Orca.' },
   { key: 'handoff_max_chars', title: 'Hand-off summary size', kind: 'number', default: 6000, min: 500, max: 50000, unit: 'chars', help: 'Services that cannot resume (Codex, Antigravity, OpenCode, Devin) start the new session with a summary this long at most. Orca takes at most 4,096 characters, so a larger value changes nothing.' },
   { key: 'orca_cli_path', title: 'Orca CLI path', kind: 'text', default: '', placeholder: 'found automatically', help: 'Only if the orca command is not found by itself.' }
 ]
 
-/** Shown with the Claude Status line switch in the Accounts tab, while the status line is on. */
+/** Shown with the Claude status line switch in the Settings tab. */
 export const STATUS_LINE_SETTINGS: SettingSpec[] = [
   { key: 'console_statusline_format', title: 'Status line header', kind: 'text', default: '', placeholder: '{model} │ ctx {ctxbar} │ 5h reset {reset}', help: 'An optional first line of the Claude status line. Empty = account rows only.' }
 ]

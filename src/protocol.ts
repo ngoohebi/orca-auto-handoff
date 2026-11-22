@@ -17,7 +17,7 @@ export type UnsentDraft = { terminalId: string; text: string; queued?: boolean }
 declare module 'orca' {
   interface PluginRequests {
     /** Seats, cooldowns, parked sessions and recent history. */
-    'rotator.snapshot': { input: { refresh?: boolean }; output: Snapshot }
+    'rotator.snapshot': { input: { refresh?: boolean; directQuota?: boolean }; output: Snapshot }
     /** Pause or resume automatic hand-off. */
     'rotator.pause': { input: { paused: boolean }; output: { paused: boolean } }
     /** Forget a seat's cooldown (e.g. after buying more usage). */
@@ -61,6 +61,7 @@ declare module 'orca' {
     'rotator.proxyStart': { input: { port?: number }; output: { running: boolean; host: string; port: number; providers: any[] } }
     'rotator.proxyStop': { input: Record<string, never>; output: { running: boolean; host: string; port: number; providers: any[] } }
     'rotator.bench': { input: Record<string, never>; output: { results: { id: string; name: string; kind: string; baseUrl: string; ok: boolean; latencyMs: number; band: string; error?: string }[] } }
+    'rotator.linkQuota': { input: { seatKey: string; linked: boolean }; output: Snapshot }
     'rotator.pins': { input: Record<string, never>; output: { pins: Record<string, string> } }
     'rotator.pin': { input: { target: string; seatKey: string }; output: { pins: Record<string, string> } }
     'rotator.unpin': { input: { target: string }; output: { pins: Record<string, string> } }

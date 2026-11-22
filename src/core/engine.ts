@@ -60,7 +60,7 @@ export type HostLike = { call(method: string, params?: unknown): Promise<any> }
 
 export type Cli = {
   /** `orca account list --json` (or RuntimeClient `accounts.list`) → its `result`. */
-  listAccounts(server?: string, options?: { refreshUsage?: boolean }): Promise<Record<string, any>>
+  listAccounts(server?: string, options?: { refreshUsage?: boolean; refreshStaleUsage?: boolean }): Promise<Record<string, any>>
   select(provider: Provider, accountId: string, server?: string): Promise<void>
   /** `orca terminal close`, which also closes terminals outside the focused workspace. */
   closeTerminal(terminalId: string, server?: string): Promise<void>
@@ -102,6 +102,11 @@ export type Deps = {
   /** The persisted last-known usage cache (storage key `usage`). */
   loadUsage(): Promise<unknown>
   saveUsage(cache: UsageCache): Promise<void>
+  refreshProfileQuota?(accounts: Record<string, any>, seats: Seat[], force: boolean): Promise<void>
+  /** Direct checks, account by account: turns on the ones a check can serve that are not on yet
+   *  and were not turned off by hand (`added`), and says which were turned off (`off`) and why a
+   *  check cannot serve the others (`unavailable`). */
+  quotaStatus?(accounts: Record<string, any>, seats: Seat[]): { added: string[]; off: string[]; unavailable: Record<string, string> }
   /** The text of a pane's live usage file for this key (`live/claude-<key>.tsv`, written by the
    *  console status line wrapper), or `null` when there is none. Read-only. */
   readLive(liveKey: string): Promise<string | null>
@@ -271,7 +276,7 @@ function hostFromWorkspaceIdentity(id: string | null | undefined): string | unde
   }
 }
 
-type ServerView = { view: AccountView; rawSeats?: Seat[]; at: number; error?: string }
+type ServerView = { view: AccountView; rawSeats?: Seat[]; quotaProfiles?: Record<string, any>; at: number; error?: string }
 
 /** Orca could not say what a pane's input box holds. Never taken for an empty box: whatever
  *  would close the pane or type into it treats it as unsent text. */
@@ -365,7 +370,7 @@ export class Rotator {
   private activeSinceByServer = new Map<string, Partial<Record<Provider, number>>>()
   /** One `orca account list` at a time per server: the timer, the panel and commands share the
    *  one in flight. */
-  private listings = new Map<string, { promise: Promise<AccountView>; refreshUsage: boolean }>()
+  private listings = new Map<string, { promise: Promise<AccountView>; refreshUsage: boolean; directQuota: boolean; quotaLinks: string }>()
   private followUp = 0
   private disposed = false
   /** Moves (and anything else under a provider's lock) running or queued right now. */
@@ -859,15 +864,21 @@ export class Rotator {
     }
   }
 
-  async accounts(force = false, refreshUsage = false): Promise<AccountView> {
+  async accounts(force = false, refreshUsage = false, directQuota = false): Promise<AccountView> {
     const server = await this.currentServer()
+    if (directQuota) {
+      if (server || !this.deps.refreshProfileQuota) throw new Error('Direct quota checks are available for local profiles only.')
+      if (!(await this.config()).quotaLinks.length) throw new Error('Link an Orca account before checking its connection.')
+      force = refreshUsage = true
+    }
     this.server = server
-    return this.accountsFor(server, force, refreshUsage)
+    return this.accountsFor(server, force, refreshUsage, directQuota)
   }
 
-  private async accountsFor(server: string | undefined, force = false, refreshUsage = false): Promise<AccountView> {
+  private async accountsFor(server: string | undefined, force = false, refreshUsage = false, directQuota = false): Promise<AccountView> {
     const config = await this.config()
     const key = server ?? 'local'
+    const quotaLinks = server ? '' : JSON.stringify(config.quotaLinks)
     const current = this.views.get(key)
     const fresh = current && this.deps.now() - current.at < config.pollIntervalSeconds * 1000
     if (current && fresh && !force) {
@@ -879,15 +890,17 @@ export class Rotator {
       return current.view
     }
     // One `orca account list` per server at a time: the timer, the panel and commands share it.
-    // A forced usage refresh waits for an in-flight background read and then runs with `refreshUsage: true`.
+    // A connection check and an Orca refresh use different sources and cannot share a request.
     const pending = this.listings.get(key)
     if (pending) {
-      if (!refreshUsage || pending.refreshUsage) return pending.promise
+      if (pending.quotaLinks === quotaLinks && (!refreshUsage || (pending.refreshUsage && pending.directQuota === directQuota))) {
+        return pending.promise
+      }
       await pending.promise.catch(() => undefined)
-      return this.accountsFor(server, true, true)
+      return this.accountsFor(server, true, refreshUsage, directQuota)
     }
-    const promise = this.readAccountsFor(server, key, current, config, refreshUsage).finally(() => this.listings.delete(key))
-    this.listings.set(key, { promise, refreshUsage })
+    const promise = this.readAccountsFor(server, key, current, config, refreshUsage, directQuota).finally(() => this.listings.delete(key))
+    this.listings.set(key, { promise, refreshUsage, directQuota, quotaLinks })
     return promise
   }
 
@@ -896,19 +909,68 @@ export class Rotator {
     key: string,
     current: ServerView | undefined,
     config: Config,
-    refreshUsage = false
+    refreshUsage: boolean,
+    directQuota: boolean
   ): Promise<AccountView> {
     let nextView = current?.view ?? null
     let nextRaw = current?.rawSeats
     let nextAt = current?.at ?? 0
     let nextError: string | undefined
+    const preferDirect = !server && config.quotaLinks.length > 0 && !!this.deps.refreshProfileQuota
+    let quotaProfiles = preferDirect ? current?.quotaProfiles : undefined
     try {
-      const raw = refreshUsage
-        ? await this.deps.cli.listAccounts(server, { refreshUsage: true })
-        : server
-          ? await this.deps.cli.listAccounts(server)
-          : await this.deps.cli.listAccounts()
-      const parsed = parseAccounts(raw)
+      let raw: Record<string, any>
+      let parsed: AccountView
+      try {
+        raw = preferDirect && (!refreshUsage || directQuota)
+          ? await this.deps.cli.listAccounts(undefined, { refreshStaleUsage: false })
+          : refreshUsage
+            ? await this.deps.cli.listAccounts(server, { refreshUsage: true })
+            : server
+              ? await this.deps.cli.listAccounts(server)
+              : await this.deps.cli.listAccounts()
+        parsed = parseAccounts(raw)
+        if (preferDirect) {
+          quotaProfiles = { claude: raw.claude, codex: raw.codex, antigravity: raw.antigravity, opencode: raw.opencode, devin: raw.devin }
+        }
+      } catch (error) {
+        if (!quotaProfiles || !current?.rawSeats) throw error
+        nextError = `orca account list failed: ${String((error as Error)?.message ?? error)}`
+        this.deps.log(nextError)
+        raw = quotaProfiles
+        parsed = {
+          active: current.view.active,
+          seats: current.rawSeats.map(({ directQuotaIssue: _issue, ...seat }) => ({
+            ...seat,
+            usage: { known: false }
+          }))
+        }
+      }
+      // Saved accounts a direct check can serve are linked as they appear (unless unlinked by
+      // hand), and checked in this same read.
+      let links = config.quotaLinks
+      if (!server && this.deps.refreshProfileQuota && this.deps.quotaStatus) {
+        try {
+          const { added, off, unavailable } = this.deps.quotaStatus(raw, parsed.seats)
+          const turnedOff = new Set(off)
+          for (const seat of parsed.seats) {
+            if (turnedOff.has(seat.key)) seat.quotaOff = true
+            const why = unavailable[seat.key]
+            if (why) seat.quotaUnavailable = why
+          }
+          if (added.length) {
+            links = [...new Set([...links, ...added])]
+            if (this.chosenConfig) this.chosenConfig = { ...this.chosenConfig, quotaLinks: links }
+            this.deps.log(`direct quota: linked ${added.join(', ')}`)
+          }
+        } catch (error) {
+          this.deps.log(`direct quota: automatic linking failed: ${String((error as Error)?.message ?? error)}`)
+        }
+      }
+      if (!server && links.length && this.deps.refreshProfileQuota) {
+        const linked = new Set(links)
+        await this.deps.refreshProfileQuota(raw, parsed.seats.filter((seat) => linked.has(seat.key)), directQuota)
+      }
       const now = this.deps.now()
       const rawSeats = parsed.seats.map((s) => ({ ...s, usage: { ...s.usage } }))
       const activeSince = this.activeSinceFor(server)
@@ -937,18 +999,20 @@ export class Rotator {
         for (const seat of parsed.seats) if (addSample(this.samples, seat, now)) sampled = true
         if (sampled) await this.deps.saveSamples(this.samples).catch(() => undefined)
       }
-      const freed = this.clearLeftLow(parsed.seats, now, server)
-      if (this.clearStrikesByReading(parsed.seats, now, server) || freed) await this.save()
+      if (!nextError) {
+        const freed = this.clearLeftLow(parsed.seats, now, server)
+        if (this.clearStrikesByReading(parsed.seats, now, server) || freed) await this.save()
+      }
       nextView = parsed
       nextRaw = rawSeats
       nextAt = now
-      nextError = undefined
     } catch (error) {
       nextError = `orca account list failed: ${String((error as Error)?.message ?? error)}`
       this.deps.log(nextError)
       if (!nextView) nextView = { seats: [], active: {} }
     }
     const entry: ServerView = { view: nextView, ...(nextRaw ? { rawSeats: nextRaw } : {}), at: nextAt }
+    if (quotaProfiles) entry.quotaProfiles = quotaProfiles
     if (nextError) entry.error = nextError
     this.views.set(key, entry)
     if (server === this.server) {
@@ -3732,6 +3796,7 @@ export class Rotator {
         const circuit = circuitState(h, now)
         return {
           ...seat,
+          ...(!this.server && this.chosenConfig?.quotaLinks.includes(s.key) ? { quotaLinked: true } : {}),
           ...(this.lastConfig && isExcluded(s, this.lastConfig) ? { excluded: true } : {}),
           ...(runway !== null ? { runwayMs: Math.round(runway) } : {}),
           ...(h?.cooldownUntil ? { cooldownUntil: h.cooldownUntil } : {}),

@@ -38,6 +38,22 @@ test('a live reading is remembered and used when Orca later has nothing, keeping
   assert.equal(u.reason, 'stale-token')
 })
 
+test('a monthly provider window is remembered and projected with its own duration', () => {
+  const cache = emptyUsageCache()
+  const usage: Seat['usage'] = {
+    known: true,
+    source: 'live',
+    updatedAt: T0,
+    monthly: { usedPercent: 63, resetsAt: T0 + 30 * 24 * HOUR }
+  }
+  const openCode: Seat = { key: 'opencode:go', provider: 'opencode', accountId: 'go', label: 'Go', active: false, usage }
+  assert.equal(observe(cache, [openCode], T0, {}), true)
+  const remembered: Seat = { ...openCode, usage: { known: false, source: 'unknown' } }
+  const quota = resolve(remembered, cache, T0 + 2 * 24 * HOUR, 31 * 24 * HOUR, {})
+  assert.equal(quota.monthly?.usedPercent, 63)
+  assert.equal(quota.monthly?.resetsAt, T0 + 30 * 24 * HOUR)
+})
+
 test('a remembered window whose reset time has passed counts as reset (0 %)', () => {
   const cache = emptyUsageCache()
   observe(cache, [live(100, 30)], T0, {})

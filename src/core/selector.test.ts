@@ -48,6 +48,39 @@ test('the Antigravity host login is a seat of its own when no managed account is
   assert.equal(parseAccounts(none).seats.some((s) => s.provider === 'antigravity'), false)
 })
 
+test('inactive saved Antigravity accounts keep Orca usage as fallback', () => {
+  const list = accountList()
+  list.antigravity = {
+    accounts: [
+      {
+        id: 'agy-a', email: 'one@example.test',
+        usage: {
+          provider: 'antigravity', status: 'ok', updatedAt: NOW,
+          session: { usedPercent: 12, resetsAt: NOW + 3_600_000 },
+          weekly: { usedPercent: 34, resetsAt: NOW + 86_400_000 }
+        }
+      },
+      { id: 'agy-b', email: 'two@example.test' }
+    ],
+    activeAccountId: 'agy-a',
+    selectedAccountId: 'agy-b',
+    currentAccount: { email: 'two@example.test', subject: 'subject-b', authMethod: 'consumer' }
+  }
+  list.rateLimits.antigravity = {
+    provider: 'antigravity', status: 'ok',
+    session: { usedPercent: 1, resetsAt: NOW + 3_600_000 },
+    weekly: { usedPercent: 2, resetsAt: NOW + 86_400_000 }
+  }
+  const { seats } = parseAccounts(list)
+  const inactive = seats.find((s) => s.key === 'antigravity:agy-a')!
+  const active = seats.find((s) => s.key === 'antigravity:agy-b')!
+  assert.equal(inactive.active, false)
+  assert.equal(inactive.usage.known, true)
+  assert.equal(inactive.usage.weekly?.usedPercent, 34)
+  assert.equal(active.active, true)
+  assert.equal(active.usage.weekly?.usedPercent, 2)
+})
+
 test('system login active and duplicate of a managed seat marks that seat active', () => {
   const { seats, active } = parseAccounts(accountList({ claudeActive: null }))
   assert.equal(active.claude, 'claude:c3')

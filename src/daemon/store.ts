@@ -69,8 +69,8 @@ export function configFromStored(s: Record<string, unknown>): Config {
     restoreUnsent: v.restore_unsent_text as boolean,
     awayMinutes: num('away_minutes'),
     modelWindowPolicy: v.model_window_policy as Config['modelWindowPolicy'],
-    liveProbes: v.live_probes as Config['liveProbes'],
     pins: s.pins && typeof s.pins === 'object' && !Array.isArray(s.pins) ? { ...(s.pins as Record<string, string>) } : {},
+    quotaLinks: Array.isArray(s.quotaLinks) ? s.quotaLinks.filter((key): key is string => typeof key === 'string') : [],
     services: Object.fromEntries(
       PROVIDERS.map((p) => [p, typeof s[`service_${p}`] === 'boolean' ? s[`service_${p}`] : d.services[p]])
     ) as Config['services']
@@ -185,6 +185,15 @@ export class FileStore {
     this.writeJson(this.usagePath, cache)
   }
 
+  loadQuotaRetries(): Record<string, number> {
+    const retries = this.readJson<Record<string, number>>(join(this.home, 'quota-retries.json'))
+    return retries && typeof retries === 'object' && !Array.isArray(retries) ? retries : {}
+  }
+
+  saveQuotaRetries(retries: Record<string, number>): void {
+    this.writeJson(join(this.home, 'quota-retries.json'), retries)
+  }
+
   loadSamples(): unknown {
     return this.readJson<UsageSamples>(this.samplesPath)
   }
@@ -196,6 +205,45 @@ export class FileStore {
   getPins(): Record<string, string> {
     const raw = this.loadRawConfig()
     return raw.pins && typeof raw.pins === 'object' && !Array.isArray(raw.pins) ? { ...(raw.pins as Record<string, string>) } : {}
+  }
+
+  /** Link or unlink by hand. An Unlink is remembered (`quotaUnlinks`), so automatic linking never
+   *  links that account again; a Link by hand forgets it. */
+  setQuotaLink(seatKey: string, enabled: boolean): void {
+    const raw = this.loadRawConfig()
+    const links = new Set(this.loadConfig().quotaLinks)
+    const unlinks = new Set(this.getQuotaUnlinks())
+    if (enabled) {
+      links.add(seatKey)
+      unlinks.delete(seatKey)
+    } else {
+      links.delete(seatKey)
+      unlinks.add(seatKey)
+    }
+    raw.quotaLinks = [...links].sort()
+    raw.quotaUnlinks = [...unlinks].sort()
+    this.writeJson(this.configPath, raw)
+    this.rawConfig = raw
+  }
+
+  /** Accounts the user unlinked by hand: automatic linking leaves them alone. */
+  getQuotaUnlinks(): string[] {
+    const raw = this.loadRawConfig()
+    return Array.isArray(raw.quotaUnlinks) ? raw.quotaUnlinks.filter((key): key is string => typeof key === 'string') : []
+  }
+
+  /** Links the given accounts unless they are linked already or were unlinked by hand; returns
+   *  the ones newly linked (none: nothing is written). */
+  autoLinkQuota(seatKeys: string[]): string[] {
+    const links = new Set(this.loadConfig().quotaLinks)
+    const unlinks = new Set(this.getQuotaUnlinks())
+    const added = seatKeys.filter((key) => !links.has(key) && !unlinks.has(key))
+    if (!added.length) return []
+    const raw = this.loadRawConfig()
+    raw.quotaLinks = [...new Set([...links, ...added])].sort()
+    this.writeJson(this.configPath, raw)
+    this.rawConfig = raw
+    return [...new Set(added)]
   }
 
   setPin(target: string, seatKey: string): Record<string, string> {

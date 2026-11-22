@@ -30,6 +30,7 @@ test('shows every seat with usage, cooldown and history; the panel never switche
       'rotator.snapshot': () => snapshot(),
       'rotator.clearCooldown': () => ({ ok: true as const }),
       'rotator.pause': ({ paused }) => ({ paused }),
+      'rotator.settings': () => ({}),
       'rotator.consoleLine': ({ enabled }) => {
         if (typeof enabled === 'boolean') lineOn = enabled
         return { installed: lineOn, workspace: 'app', ...(typeof enabled === 'boolean' ? { message: `line ${enabled ? 'on' : 'off'}` } : {}) }
@@ -46,7 +47,10 @@ test('shows every seat with usage, cooldown and history; the panel never switche
   assert.ok(view.find({ text: /No usage yet/ }))
   assert.ok(!view.find({ text: /Use for new/ }))
   // The Claude console status line switch, for the focused workspace.
+  assert.ok(!view.find({ label: 'Status line' }))
+  await view.select({ role: 'tablist' }, 'settings')
   assert.equal(view.valueOf({ label: 'Status line' }), false)
+  assert.ok(view.find({ label: 'Status line header' }))
   await view.toggle({ label: 'Status line' })
   assert.equal(lineOn, true)
   assert.equal(view.valueOf({ label: 'Status line' }), true)
@@ -127,7 +131,7 @@ test('worker pushes keep the panel current; waiting sessions are called out', as
   await view.press({ text: 'Cancel' })
   assert.deepEqual(cancelled, ['t1'])
   await view.post('rotator.changed', snapshot({ paused: true }))
-  assert.equal(view.valueOf({ label: 'Automatic hand-off' }), false)
+  assert.equal(view.valueOf({ label: 'Automatic hand-off, all services' }), false)
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
@@ -138,6 +142,7 @@ test('empty and error states', async () => {
   const summary = view.summary().join('\n')
   assert.match(summary, /Cannot read accounts/)
   assert.match(summary, /No accounts/)
+  assert.equal(view.find({ type: 'EmptyState' })?.props.description, 'Manage sign-ins in Orca Settings → AI Provider Accounts.')
   await view.unmount()
 })
 
@@ -221,8 +226,8 @@ test('the Settings tab: the basic choices first, the rest folded away under Adva
     }
   })
   const view = await mount(panel, { host })
-  // The badge says how accounts are picked and when sessions hand off.
-  assert.ok(view.find({ text: 'Auto · Early when away · on' }))
+  // The badge says what automatic hand-off is doing now.
+  assert.ok(view.find({ text: 'Early hand-offs on' }))
   await view.select({ label: 'View' }, 'settings')
   assert.equal(view.valueOf({ label: 'Pick the next account' }), 'smart')
   assert.equal(view.valueOf({ label: 'When to hand off' }), 'early')
@@ -273,17 +278,17 @@ test('Custom order: the accounts in that order, with arrows that move them', asy
 test('the badge is coloured by what is happening now: green while early hand-offs are on, green with a plain border while waiting for the user to leave, grey at limit only, amber when paused', async () => {
   const host = mockHost({ requests: { 'rotator.snapshot': () => snapshot({ mode: 'smart' }), 'rotator.consoleLine': () => ({ installed: false }) } })
   const view = await mount(panel, { host })
-  const pill = () => view.find({ text: /^(Auto|Custom order) · |^Paused$/ })
+  const pill = () => view.find({ text: /^(Early hand-offs on|Early once you step away|At limit only|Paused)$/ })
   const symbol = (t: string) => view.find({ text: t })
-  assert.equal(pill()?.text, 'Auto · Early when away · on')
+  assert.equal(pill()?.text, 'Early hand-offs on')
   assert.ok(symbol('●'))
   assert.equal(pill()?.props.tone, 'success')
   await view.post('rotator.changed', snapshot({ mode: 'smart', userHere: true }))
-  assert.equal(pill()?.text, 'Auto · Early when away · waiting')
-  assert.ok(view.findAll({ type: 'Image' }).some((n) => /mark-here/.test(String(n.props.src))))
+  assert.equal(pill()?.text, 'Early once you step away')
+  assert.ok(symbol('◐'))
   assert.equal(pill()?.props.tone, 'success')
   await view.post('rotator.changed', snapshot({ mode: 'my-order', atLimitOnly: true }))
-  assert.equal(pill()?.text, 'Custom order · At limit')
+  assert.equal(pill()?.text, 'At limit only')
   assert.ok(symbol('○'))
   assert.equal(pill()?.props.tone, 'neutral')
   await view.post('rotator.changed', snapshot({ mode: 'smart', paused: true }))
@@ -353,6 +358,8 @@ test('each account card of a service with several accounts has Skip (never switc
   assert.equal(view.valueOf(toggles[0]!) === true || view.valueOf(toggles[1]!) === true, true)
   await view.toggle(toggles.find((t) => view.valueOf(t) === false)!)
   assert.deepEqual(calls, [{ seatKey: 'claude:c2', excluded: true }])
+  assert.ok(!view.find({ label: 'Status line header' }))
+  await view.select({ role: 'tablist' }, 'settings')
   assert.ok(view.find({ label: 'Status line header' }))
   await view.unmount()
 })
@@ -425,9 +432,10 @@ test('a standby offers "Hand off to this account", asks first in plain words, an
   assert.ok(!view.find({ text: /Automatic hand-off for Claude is off/ }))
   await view.press({ text: 'Hand off to this account' })
   assert.ok(view.find({ text: 'Hand off Claude to spare@example.test?' }))
-  assert.ok(view.find({ text: 'New Claude sessions will start on this account.' }))
-  assert.ok(view.find({ text: 'The session on screen is handed off too if it is between turns; a busy one stays where it is. Unsent text goes with it when it can; otherwise you are asked first.' }))
-  assert.ok(view.find({ text: "Automatic hand-off for Claude turns off, so it won't hand off again on its own." }))
+  assert.ok(view.find({ text: 'New Claude sessions start on this account. The session on screen moves too if it is between turns; its unsent text goes along, or you are asked first.' }))
+  assert.ok(view.find({ text: 'Automatic hand-off for Claude turns off.' }))
+  // While it asks, the button gives way to the question; Skip stays where it was.
+  assert.equal(view.findAll({ text: 'Hand off to this account' }).length, 0)
   // Cancel backs out without switching.
   await view.press({ text: 'Cancel' })
   assert.ok(!view.find({ text: /Hand off Claude to spare@example.test/ }))
@@ -591,6 +599,7 @@ test('the Status line switch follows the focused workspace, and says why when it
   const host = mockHost({
     requests: {
       'rotator.snapshot': () => snapshot(),
+      'rotator.settings': () => ({}),
       'rotator.consoleLine': ({ enabled }) => {
         if (typeof enabled === 'boolean') toggled.push(enabled)
         return { installed: true, workspace: 'app' }
@@ -598,6 +607,7 @@ test('the Status line switch follows the focused workspace, and says why when it
     }
   })
   const view = await mount(panel, { host })
+  await view.select({ role: 'tablist' }, 'settings')
   assert.equal(view.valueOf({ label: 'Status line' }), true)
   assert.equal(view.find({ label: 'Status line' })?.disabled, false)
   assert.equal(view.findAll({ text: /^Status line: / }).length, 0)
@@ -643,6 +653,7 @@ test('a Status line read that is still being retried when its panel closes chang
     const host = mockHost({
       requests: {
         'rotator.snapshot': () => snapshot(),
+        'rotator.settings': () => ({}),
         'rotator.consoleLine': () => {
           asked++
           return { installed: true, workspace: 'app' }
@@ -650,6 +661,7 @@ test('a Status line read that is still being retried when its panel closes chang
       }
     })
     const view = await mount(panel, { host })
+    await view.select({ role: 'tablist' }, 'settings')
     assert.equal(view.valueOf({ label: 'Status line' }), true)
     await view.post('rotator.consoleLine', { installed: false, workspace: 'other' })
     assert.equal(asked, 1)
@@ -673,6 +685,7 @@ test('a first read that fails is not an unhandled error: the worker\u2019s next 
       'rotator.snapshot': () => {
         throw new Error('worker restarting')
       },
+      'rotator.settings': () => ({}),
       'rotator.consoleLine': () => ({ installed: true, workspace: 'app' })
     }
   })
@@ -680,6 +693,7 @@ test('a first read that fails is not an unhandled error: the worker\u2019s next 
   assert.deepEqual(view.summary(), ['Skeleton "Loading accounts"'])
   await view.post('rotator.changed', snapshot())
   assert.ok(view.find({ text: 'one@example.test' }))
+  await view.select({ role: 'tablist' }, 'settings')
   assert.equal(view.valueOf({ label: 'Status line' }), true)
   assert.deepEqual(view.errors, [])
   await view.unmount()
@@ -862,7 +876,7 @@ test('a snapshot with parts missing or of another version (the panel and the wor
   const view = await mount(panel, { host })
   assert.ok(view.find({ text: 'two@example.test' }))
   assert.equal(view.find({ text: /undefined/ }), null)
-  assert.ok(view.find({ text: 'Early when away · on' }))
+  assert.ok(view.find({ text: 'Early hand-offs on' }))
   await view.post('rotator.changed', { paused: true } as never)
   assert.ok(view.find({ text: 'Paused' }))
   assert.match(view.summary().join('\n'), /No accounts/)
@@ -938,7 +952,7 @@ test('while the settings are held (not read yet, or the upgrade not finished) th
   assert.match(text, /Auto Hand-off is waiting for Orca's settings/)
   assert.ok(view.find({ text: /nothing is handed off or resumed automatically\. It tries again by itself/ }))
   // No badge saying early hand-offs are on while nothing is handed off.
-  assert.ok(!view.find({ text: /Early when away|At limit/ }))
+  assert.ok(!view.find({ text: /Early hand-offs|Early once|At limit only/ }))
   // Nobody turned a service off: no switch shown as off, no "is off" callout, no "turn it on".
   assert.ok(!/Automatic hand-off for (Claude|Codex) is off/.test(text))
   assert.ok(!view.find({ testId: 'auto-claude' }) && !view.find({ testId: 'auto-codex' }))
@@ -954,11 +968,179 @@ test('while the settings are held (not read yet, or the upgrade not finished) th
   await view.post('rotator.changed', snapshot({ mode: 'smart' }))
   await new Promise((resolve) => setTimeout(resolve, 5))
   text = view.summary().join('\n')
-  assert.ok(view.find({ text: 'Auto · Early when away · on' }))
+  assert.ok(view.find({ text: 'Early hand-offs on' }))
   assert.ok(!/waiting for Orca's settings|finishing the upgrade/.test(text))
   assert.equal(view.valueOf({ label: 'When to hand off' }), 'at-limit')
   await view.select({ role: 'tablist' }, 'accounts')
   assert.ok(view.find({ testId: 'auto-claude' }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('a hand-off on its way greys out only the hand-off controls; settings and Skip stay usable, and a failure reads as one', async () => {
+  const seats: Snapshot['seats'] = [
+    { key: 'claude:a', provider: 'claude', accountId: 'a', label: 'inuse@example.test', active: true, usage: { known: true, session: { usedPercent: 50, resetsAt: NOW + 3_600_000 } } },
+    { key: 'claude:b', provider: 'claude', accountId: 'b', label: 'spare@example.test', active: false, usage: { known: true, session: { usedPercent: 5, resetsAt: NOW + 3_600_000 } } },
+    { key: 'claude:c', provider: 'claude', accountId: 'c', label: 'third@example.test', active: false, usage: { known: true, session: { usedPercent: 9, resetsAt: NOW + 3_600_000 } } }
+  ]
+  let finish: (v: { message: string }) => void = () => undefined
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snapshot({ seats }),
+      'rotator.consoleLine': () => ({ installed: false, workspace: 'app' }),
+      'rotator.settings': () => ({ pick: 'smart', timing: 'early', when_all_used: 'wait', active_terminal: 'ask' }),
+      'rotator.setExcluded': () => ({ ok: true as const }),
+      'rotator.switchTo': () => new Promise((resolve) => (finish = resolve))
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.press(view.findAll({ text: 'Hand off to this account' })[0]!)
+  const pressed = view.press({ text: 'Yes, hand off' })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  // The other standby's hand-off waits; its Skip and the refresh do not.
+  assert.equal(view.find({ text: 'Hand off to this account' })?.disabled, true)
+  assert.equal(view.findAll({ label: 'Skip' }).every((n) => !n.disabled), true)
+  assert.equal(view.find({ label: 'Refresh usage from Orca' })?.disabled, false)
+  finish({ message: 'Claude: new sessions start on spare@example.test' })
+  await pressed
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('a failed action is said in the danger tone; a setting says its result under itself, not at the top', async () => {
+  let stored: Record<string, string | number | boolean> = { pick: 'smart', timing: 'early', when_all_used: 'wait', active_terminal: 'ask', early_minutes: 10 }
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snapshot({ mode: 'smart' }),
+      'rotator.consoleLine': () => ({ installed: false, workspace: 'app' }),
+      'rotator.clearCooldown': () => {
+        throw new Error('worker restarting')
+      },
+      'rotator.settings': ({ key, value }: { key?: string; value?: string | number | boolean }) => {
+        if (key !== undefined && value !== undefined) stored = { ...stored, [key]: value }
+        return stored
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.press({ text: 'End cooldown' })
+  assert.equal(view.find({ text: 'Failed: worker restarting' })?.props.tone, 'danger')
+  await view.press({ label: 'Dismiss' })
+  await view.select({ role: 'tablist' }, 'settings')
+  // Typed and not saved: said, with Save and Undo.
+  await view.toggle({ type: 'Collapsible' })
+  await view.type({ label: 'Hand off this long before running out (min)' }, '25', { replace: true })
+  assert.ok(view.find({ text: 'Not saved yet. Press Enter or Save.' }))
+  await view.press({ text: 'Undo' })
+  assert.equal(view.find({ text: /Not saved yet/ }), null)
+  // Out of range is said as what it saves as; not a number cannot be saved.
+  await view.type({ label: 'Hand off this long before running out (min)' }, '500', { replace: true })
+  assert.ok(view.find({ text: 'Not saved yet. Saves as 120 (1–120).' }))
+  await view.type({ label: 'Hand off this long before running out (min)' }, 'soon', { replace: true })
+  assert.ok(view.find({ text: 'Not saved: enter a number, 1–120.' }))
+  assert.equal(view.find({ text: 'Save' })?.disabled, true)
+  await view.type({ label: 'Hand off this long before running out (min)' }, '25', { replace: true })
+  await view.press({ text: 'Save' })
+  assert.equal(stored.early_minutes, 25)
+  assert.ok(view.find({ text: 'Hand off this long before running out: 25' }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('Advanced groups its settings; a group none of which applies says why once', async () => {
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snapshot({ mode: 'smart' }),
+      'rotator.consoleLine': () => ({ installed: false }),
+      'rotator.settings': () => ({ pick: 'smart', timing: 'early', when_all_used: 'wait', active_terminal: 'move' })
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.select({ role: 'tablist' }, 'settings')
+  await view.toggle({ type: 'Collapsible' })
+  assert.ok(view.find({ text: 'Early hand-offs' }) && view.find({ text: 'Limits and errors' }))
+  // Session on screen is Move right away: its three settings are one line, not three greyed fields.
+  assert.equal(view.find({ label: /Countdown for the session on screen/ }), null)
+  assert.ok(view.find({ text: /Only used when Session on screen is Ask me first or Wait, then count down\./ }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('Live Quota: every saved account is on by itself; Turn off and Turn on per account; Not available says why, with no button', async () => {
+  const calls: unknown[] = []
+  let snap = snapshot()
+  snap.seats = snap.seats.map((s) =>
+    s.key === 'claude:c2'
+      ? { ...s, quotaLinked: true, usage: { ...s.usage, source: 'live', origin: 'claude-profile', asOf: NOW - 120_000 } }
+      : s.key === 'claude:c1'
+        ? { ...s, quotaOff: true }
+        : { ...s, quotaUnavailable: 'no saved sign-in on this computer' }
+  )
+  snap.seats.push({ key: 'claude:system', provider: 'claude', accountId: 'system', label: 'system', active: false, usage: { known: false } })
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () => snap,
+      'rotator.consoleLine': () => ({ installed: false }),
+      'rotator.linkQuota': (input: { seatKey: string; linked: boolean }) => {
+        calls.push(input)
+        snap = { ...snap, seats: snap.seats.map((s) => (s.key === input.seatKey ? { ...s, quotaLinked: input.linked, quotaOff: !input.linked } : s)) }
+        return snap
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  // Accounts has no direct-check controls of its own.
+  assert.equal(view.find({ text: /^Turn (on|off)$/ }), null)
+  await view.select({ role: 'tablist' }, 'proxy')
+  // The agent's own login is not listed.
+  assert.equal(view.find({ text: 'system' }), null)
+  assert.ok(view.find({ text: '1 checked directly' }))
+  assert.ok(view.find({ text: /^Live/ }) && view.find({ text: 'Off' }) && view.find({ text: 'Not available' }))
+  assert.ok(view.find({ text: 'No saved sign-in on this computer' }))
+  // One button per account that has a choice: Turn off on the live one, Turn on on the one turned off.
+  assert.equal(view.findAll({ text: /^Turn (on|off)$/ }).length, 2)
+  await view.press({ text: 'Turn off' })
+  assert.deepEqual(calls.at(-1), { seatKey: 'claude:c2', linked: false })
+  assert.ok(view.find({ text: '0 checked directly' }))
+  assert.equal(view.find({ text: 'Check now' })?.disabled, true)
+  await view.press(view.findAll({ text: 'Turn on' })[0]!)
+  assert.equal((calls.at(-1) as { linked: boolean }).linked, true)
+  // An expired sign-in says what happens next, and the tab label counts it.
+  await view.post('rotator.changed', { ...snap, seats: snap.seats.map((s) => (s.key === 'claude:c2' ? { ...s, quotaLinked: true, quotaOff: false, directQuotaIssue: { reason: 'stale-token', retryAt: 0 } } : s)) } as never)
+  assert.ok(view.find({ text: 'Sign-in expired' }))
+  assert.ok(view.find({ text: 'Updates once Claude renews it, or sign in again in Orca.' }))
+  assert.ok(view.find({ label: 'Live Quota · 1' }) ?? view.find({ text: 'Live Quota · 1' }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('Live Quota for a project on another server says direct checks are for this computer', async () => {
+  const host = mockHost({ requests: { 'rotator.snapshot': () => snapshot({ server: 'studio' }), 'rotator.consoleLine': () => ({ installed: false }) } })
+  const view = await mount(panel, { host })
+  await view.select({ role: 'tablist' }, 'proxy')
+  assert.match(view.summary().join('\n'), /Not for a remote project/)
+  assert.equal(view.find({ text: /^Turn (on|off)$/ }), null)
+  await view.unmount()
+})
+
+test('History: entries under their day, and the tab counts only failed hand-offs', async () => {
+  const host = mockHost({
+    requests: {
+      'rotator.snapshot': () =>
+        snapshot({
+          history: [
+            { at: NOW - 3 * 86_400_000, provider: 'claude', reason: 'rate_limit', result: 'failed', from: 'claude:c1', to: 'claude:c2' },
+            { at: NOW - 60_000, provider: 'claude', reason: 'rate_limit', result: 'resumed', from: 'claude:c1', to: 'claude:c2' }
+          ]
+        }),
+      'rotator.consoleLine': () => ({ installed: false })
+    }
+  })
+  const view = await mount(panel, { host })
+  assert.ok(view.find({ label: 'History · 1 failed' }) ?? view.find({ text: 'History · 1 failed' }))
+  await view.select({ role: 'tablist' }, 'history')
+  assert.ok(view.find({ text: 'Today' }))
+  assert.equal(view.findAll({ text: /^(Today|Yesterday)$/ }).length, 1)
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })

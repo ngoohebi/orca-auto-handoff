@@ -113,7 +113,7 @@ export function assess(
   if (m !== undefined) left.m = m
   // Nested whole-window pace projection across every window (zero history required).
   const projections: { window: WindowName; projectedPercent: number }[] = []
-  const ps = wholeWindowPace(session, FIVE_HOURS_MS, now)
+  const ps = wholeWindowPace(session, u.origin === 'devin-profile' ? 24 * HOUR : FIVE_HOURS_MS, now)
   const pw = wholeWindowPace(weekly, WEEK_MS, now)
   const pm = config.modelWindowPolicy !== 'ignore' ? wholeWindowPace(model, WEEK_MS, now) : null
   if (ps !== null && ps > 100) projections.push({ window: 's', projectedPercent: ps })
@@ -340,7 +340,7 @@ export function levels(seat: Pick<Seat, 'usage'>, now: number): string {
   const u = seat.usage
   if (!u.known) return 'no usage numbers yet'
   const parts: string[] = []
-  if (u.session) parts.push(`5h ${Math.round(u.session.usedPercent)} %`)
+  if (u.session) parts.push(`${u.origin === 'devin-profile' ? 'day' : '5h'} ${Math.round(u.session.usedPercent)} %`)
   if (u.weekly) parts.push(`week ${Math.round(u.weekly.usedPercent)} %`)
   const reset = u.weekly?.resetsAt
   if (typeof reset === 'number' && reset > now && reset - now < EXPIRING_WITHIN_MS) parts.push(`weekly resets in ${duration(reset - now)}`)

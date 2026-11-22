@@ -6,8 +6,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { OahClient } from '../cli/client.ts'
-import type { Cli, HostLike } from '../core/engine.ts'
+import { Rotator, type Cli, type HostLike } from '../core/engine.ts'
 import { memoryFiles } from '../core/statusline-files.ts'
+import { DEFAULT_CONFIG } from '../core/types.ts'
 import { VERSION } from '../core/version.ts'
 import { createLineParser, encodeMessage, type WireMessage } from './ipc.ts'
 import { OahDaemon } from './server.ts'
@@ -60,6 +61,66 @@ function fakeCli(accounts: Record<string, any> = {}): Cli {
   }
 }
 
+test('direct quota still updates a known profile while Orca account listing is unavailable', async () => {
+  const cli = fakeCli({
+    codex: { activeAccountId: 'c1', accounts: [{ id: 'c1' }] },
+    rateLimits: { claude: { status: 'ok', session: { usedPercent: 50, resetsAt: null } } }
+  })
+  const listAccounts = cli.listAccounts
+  let lastOrcaOptions: Parameters<Cli['listAccounts']>[1]
+  let forceProviderChecks = false
+  let offline = false
+  let now = 1_790_000_000_000
+  cli.listAccounts = async (...args) => {
+    lastOrcaOptions = args[1]
+    if (offline) throw new Error('offline')
+    return listAccounts(...args)
+  }
+  const rotator = new Rotator({
+    cli,
+    host: fakeHost(),
+    now: () => now,
+    sleep: async () => {},
+    loadState: async () => null,
+    saveState: async () => {},
+    config: async () => ({ ...DEFAULT_CONFIG, quotaLinks: ['codex:c1'] }),
+    log: () => {},
+    notify: async () => {},
+    publish: () => {},
+    loadUsage: async () => null,
+    saveUsage: async () => {},
+    readLive: async () => null,
+    loadSamples: async () => null,
+    saveSamples: async () => {},
+    refreshProfileQuota: async (profiles, seats, force) => {
+      forceProviderChecks = force
+      assert.equal(profiles.codex.accounts[0].id, 'c1')
+      assert.deepEqual(seats.map((seat) => seat.key), ['codex:c1'])
+      seats.find((seat) => seat.key === 'codex:c1')!.usage = {
+        known: true,
+        source: 'live',
+        origin: 'codex-profile',
+        updatedAt: now,
+        session: { usedPercent: offline ? 60 : 20, resetsAt: now + 3600_000 }
+      }
+    }
+  })
+  await rotator.init()
+  await rotator.accounts(true, true, true)
+  assert.deepEqual(lastOrcaOptions, { refreshStaleUsage: false })
+  assert.equal(forceProviderChecks, true)
+  offline = true
+  now += 60_000
+  await rotator.accounts(true, true)
+  assert.deepEqual(lastOrcaOptions, { refreshUsage: true })
+  assert.equal(forceProviderChecks, false)
+  const snapshot = rotator.snapshot()
+  assert.equal(snapshot.error, 'orca account list failed: offline')
+  const direct = snapshot.seats.find((seat) => seat.key === 'codex:c1')!.usage
+  assert.deepEqual([direct.source, direct.origin, direct.session?.usedPercent], ['live', 'codex-profile', 60])
+  assert.equal(snapshot.seats.find((seat) => seat.key === 'claude:a1')?.usage.source, 'cached')
+})
+
 test('FileStore persists config, state, and enforces 0700/0600 permissions', () => {
   const dir = mkdtempSync(join(tmpdir(), 'oah-store-'))
   try {
@@ -70,12 +131,23 @@ test('FileStore persists config, state, and enforces 0700/0600 permissions', () 
 
     store.setSetting('timing', 'at-limit')
     store.setSetting('service_codex', false)
+    store.setQuotaLink('codex:test-account', true)
 
     // Re-read from disk with a fresh FileStore instance
     const reloaded = new FileStore(join(dir, 'oah'))
     const cfg = reloaded.loadConfig()
     assert.equal(cfg.runningSessions, 'limit')
     assert.equal(cfg.services.codex, false)
+    assert.deepEqual(cfg.quotaLinks, ['codex:test-account'])
+    reloaded.setQuotaLink('codex:test-account', false)
+    assert.deepEqual(new FileStore(join(dir, 'oah')).loadConfig().quotaLinks, [])
+    // Automatic linking links what is new, and never an account unlinked by hand...
+    assert.deepEqual(reloaded.autoLinkQuota(['codex:test-account', 'claude:a1']), ['claude:a1'])
+    assert.deepEqual(reloaded.autoLinkQuota(['claude:a1']), [])
+    assert.deepEqual(new FileStore(join(dir, 'oah')).loadConfig().quotaLinks, ['claude:a1'])
+    // ...until it is linked by hand again.
+    reloaded.setQuotaLink('codex:test-account', true)
+    assert.deepEqual(reloaded.getQuotaUnlinks(), [])
     assert.equal(cfg.services.claude, true)
     assert.equal(statSync(reloaded.home).mode & 0o777, 0o700)
     assert.equal(statSync(reloaded.configPath).mode & 0o777, 0o600)
@@ -187,4 +259,49 @@ test('OahDaemon routes host.call requests to a registered Orca plugin bridge', a
     await daemon.stop()
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('accounts a direct check can serve are turned on automatically and checked in the same read; the others say why, or that they were turned off', async () => {
+  const cli = fakeCli({
+    codex: { activeAccountId: 'c1', accounts: [{ id: 'c1' }, { id: 'c2' }, { id: 'c3' }] },
+    rateLimits: { claude: { status: 'ok', session: { usedPercent: 50, resetsAt: null } } }
+  })
+  let links: string[] = []
+  const checked: string[][] = []
+  const rotator = new Rotator({
+    cli,
+    host: fakeHost(),
+    now: () => 1_790_000_000_000,
+    sleep: async () => {},
+    loadState: async () => null,
+    saveState: async () => {},
+    config: async () => ({ ...DEFAULT_CONFIG, quotaLinks: links }),
+    log: () => {},
+    notify: async () => {},
+    publish: () => {},
+    loadUsage: async () => null,
+    saveUsage: async () => {},
+    readLive: async () => null,
+    loadSamples: async () => null,
+    saveSamples: async () => {},
+    // Only c1 and c3 have a sign-in a check can use; c3 was turned off by hand.
+    quotaStatus: (_accounts, seats) => {
+      const added = seats.filter((s) => s.key === 'codex:c1' && !links.includes(s.key)).map((s) => s.key)
+      links = [...links, ...added]
+      return { added, off: ['codex:c3'], unavailable: { 'codex:c2': 'no saved sign-in on this computer' } }
+    },
+    refreshProfileQuota: async (_profiles, seats) => {
+      checked.push(seats.map((s) => s.key))
+    }
+  })
+  await rotator.init()
+  await rotator.accounts(true)
+  assert.deepEqual(links, ['codex:c1'])
+  assert.deepEqual(checked.at(-1), ['codex:c1'])
+  const snap = rotator.snapshot()
+  assert.equal(snap.seats.find((s) => s.key === 'codex:c1')?.quotaLinked, true)
+  assert.equal(snap.seats.find((s) => s.key === 'codex:c2')?.quotaLinked, undefined)
+  assert.equal(snap.seats.find((s) => s.key === 'codex:c2')?.quotaUnavailable, 'no saved sign-in on this computer')
+  assert.equal(snap.seats.find((s) => s.key === 'codex:c3')?.quotaOff, true)
+  assert.equal(snap.seats.find((s) => s.key === 'codex:c1')?.quotaOff, undefined)
 })

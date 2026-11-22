@@ -14,7 +14,7 @@ OAH runs a **dual-plane, current-session-attached** architecture with zero npm d
 
 1. **`oahd` Daemon (`bin/oahd`):** Owns all state, settings, usage cache, burn-rate samples, circuit breaker state, and hand-off logic in `~/.orca/oah/` (`config.json`, `state.json`, `usage.json`, `samples.json`, `providers.json`, `oahd.sock`, permissions `0700`/`0600`). Auto-starts on demand when `oah` or the Orca plugin connects.
 2. **`oah` CLI (`bin/oah`):** First-class command line with `--json` on every subcommand. Works locally, on headless `orca serve` hosts, on paired remote servers, and inside scripts/agents — even without the Orca panel.
-3. **Thin Orca Plugin (`src/plugin/worker.ts` + `src/panel.tsx`):** Zero business logic or local state. Stays attached to the focused workspace's `oah` session (local `oahd.sock` or persistent `oah session` NDJSON), forwards `agent.status.changed` / `workspace.changed` / `agent.launch.before`, provides native Claude `agent.resume` and desktop notifications, and renders the **OAH** sidebar panel (**Accounts**, **Proxy**, **History**, **Settings**).
+3. **Thin Orca Plugin (`src/plugin/worker.ts` + `src/panel.tsx`):** Zero business logic or local state. Stays attached to the focused workspace's `oah` session (local `oahd.sock` or persistent `oah session` NDJSON), forwards `agent.status.changed` / `workspace.changed` / `agent.launch.before`, provides native Claude `agent.resume` and desktop notifications, and renders the **OAH** sidebar panel (**Accounts**, **Live Quota**, **History**, **Settings**).
 4. **Optional Local HTTP Proxy (`src/daemon/proxy.ts`):** Opt-in `127.0.0.1:4080` failover gateway (`oah proxy start`) for Anthropic & OpenAI API-key/relay providers, sharing the same 3-state circuit breaker and offering one-click endpoint latency benchmarking (`oah bench`).
 
 ---
@@ -59,6 +59,7 @@ Open the **OAH** panel (gauge icon, right sidebar). The defaults (**Auto · Earl
 
 ### Subscription Pool & Proactive Forecasting
 - **Same-service pooling:** Pools all Orca-managed accounts per provider (**Claude, Codex, Antigravity, OpenCode, Devin**) without ever reading tokens or keychains.
+- **Set up Antigravity hand-offs:** Sign in with `agy` on the Orca host and save the current login in **Orca Settings → AI Provider Accounts** before switching Google accounts. Repeat for a second account, then refresh OAH. Run `orca account list --agent antigravity` to check that both profiles are saved on that host.
 - **Auto (`smart`) vs. Custom Order (`my-order`):**
   - *Auto* ranks accounts by projected runway (2-sample burn rate + nested whole-window pace `usedPercent / elapsedFraction` with a 5% minimum elapsed guard), prioritizes expiring weekly quota (`>15%` left, `<48h` to reset), and prevents flapping (`leftLow`).
   - *Custom order* follows your ranking and switches back to higher-priority accounts once they recover.
@@ -68,8 +69,12 @@ Open the **OAH** panel (gauge icon, right sidebar). The defaults (**Auto · Earl
   - Gates Codex eligibility on `ordinaryUsageAllowed` (ignoring the `codex_bengalfox` Spark decoy bucket) and classifies expired/missing logins as `sign-in` so dead logins never trigger blind failover loops.
 - **Per-Model Window Policy (`model_window_policy`):**
   - Choose how per-model weekly caps (e.g., Claude Fable/Opus) are handled: `fallback-model` (try `/model <next>` first), `rotate` (proactively rotate and avoid accounts with 0% left in that model bucket), or `ignore`.
-- **Live Fallback Quota Probes (`live_probes`):**
-  - Optional fallback probes for `codex app-server` (`account/rateLimits/read`), free `claude -p "/usage" --output-format json`, and OpenCode Go (`GET https://opencode.ai/zen/go/v1/usage`).
+- **Direct quota checks:** Manage sign-ins in **Orca Settings → AI Provider Accounts**. Every saved Orca account a direct check can use is checked automatically; **Live Quota** shows each one as **Live**, **Off** or **Not available** (with the reason), with **Turn off** / **Turn on** (an account you turn off stays off). When a Claude account's saved sign-in has expired, OAH runs Claude Code's own `claude -p /usage` for that account (at most every 15 minutes), so Claude Code renews it and OAH never writes the Keychain. OAH requests quota using that account's existing credential and continues checking linked accounts in the background; the numbers show on **Accounts**. **Check now** checks linked accounts on demand, subject to provider retry intervals. The link stores the account ID locally.
+  - Claude checks verify the profile's email and organization with Anthropic. Codex checks verify the account ID returned by the profile's app-server.
+  - On macOS, OAH matches the native Antigravity login's Google account ID to a saved Orca profile. Other Antigravity profiles use Orca readings or the cache.
+  - OpenCode Go checks use the key from the linked managed profile's `opencode-go` integration.
+  - Devin checks read daily and weekly quota using the credential in the managed CLI profile.
+  - If Orca's account list becomes unavailable, OAH can still probe profiles it already discovered in this daemon session. The Accounts panel shows the Orca error, and readings from Orca use the cache until the account list returns.
 
 ### Session Continuity & Fail-Closed Safety
 - **Exact resume vs. summary hand-off:**
@@ -79,12 +84,12 @@ Open the **OAH** panel (gauge icon, right sidebar). The defaults (**Auto · Earl
 - **Unsent text guard:** Reads the input box twice before closing; aborts if typing is in progress, parks if queued messages or non-portable drafts (`[Image #1]`, `>4,000` chars) are present.
 - **Per-workspace / per-pane pinning:** `oah pin <workspaceId|terminalId> <account>` keeps dedicated sessions on their pinned account.
 - **Instant `StopFailure` hook:** Claude Code's `StopFailure` hook can notify `oahd` immediately via `oah event stop-failure` (zero regex lag, works on Terminal and Chat sessions).
-- **Claude console status line:** Fast (~40ms) POSIX `sh` wrapper showing live multi-account 5h/7d/model bars right inside Claude panes.
+- **Claude console status line:** Fast (~40ms) POSIX `sh` wrapper showing live multi-account 5h/7d/model bars right inside Claude panes. Use **Settings → Claude status line** to toggle it for the focused workspace and customize the header.
 
-### Optional Local HTTP Failover Proxy & Bench
-- **Mid-turn failover for API-key / relay providers:** Run `oah proxy start --port 4080` (or toggle it in the panel's **Proxy** tab) and point `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` at `http://127.0.0.1:4080`.
+### API Backup and Endpoint Benchmarking
+- **Mid-turn failover for API-key / relay providers:** Run `oah proxy start --port 4080` and point `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` at `http://127.0.0.1:4080`.
 - Transparently retries the next healthy provider on HTTP `429` / `500` / `502` / `503` / `529` or timeout, shares the 3-state circuit breaker, supports per-provider `modelMap` rewriting, and streams SSE responses directly.
-- **Endpoint latency bench:** `oah bench` (or **Bench** in the Proxy tab) tests all configured endpoints concurrently and reports `<300ms` (`fast`), `300–500ms` (`ok`), `>500ms` (`slow`), or `error`.
+- **Endpoint latency bench:** `oah bench` tests all configured endpoints concurrently and reports `<300ms` (`fast`), `300–500ms` (`ok`), `>500ms` (`slow`), or `error`.
 
 ---
 
@@ -154,7 +159,6 @@ Editable via `oah config set <key> <value>` or the panel's **Settings** tab:
 | `idle_minutes` | `15` | `0–1440` min | Idle hand-off threshold (`0` = never) |
 | `switch_cooldown_minutes` | `5` | `0–240` min | Minimum interval between automatic early switches |
 | `model_window_policy` | `fallback-model` | `fallback-model`, `rotate`, `ignore` | Per-model weekly cap (Fable/Opus) behavior |
-| `live_probes` | `auto` | `auto`, `off` | Live fallback probes when Orca readings are stale/missing |
 | `model_fallback` | empty | `claude=sonnet,haiku` | In-place `/model` fallback list per service |
 | `restore_unsent_text` | `true` | boolean | Restore plain unsent text via bracketed paste (Claude) |
 | `auto_message` | `Continue.` | text | First message typed after a limit/API error interruption |
@@ -166,7 +170,7 @@ Editable via `oah config set <key> <value>` or the panel's **Settings** tab:
 
 ## Permissions & Privacy
 
-- **Never reads tokens or keychains** for Orca-managed subscription accounts — all subscription switching goes through `orca account select` and Orca's account APIs.
+- **Subscription accounts:** Orca manages sign-in and switching. For direct quota checks, OAH reads the linked profile's existing credential for the request. The credential stays in memory for the check. The provider CLI remains responsible for refreshing its credentials.
 - **Local storage (`~/.orca/oah/`):** Directory is `0700`, files (`config.json`, `state.json`, `usage.json`, `samples.json`, `providers.json`, `status.tsv`, `oahd.sock`) are `0600` (owner-only). `oah sync export` redacts `apiKey` fields automatically.
 - **CLI invocations:** Uses `execFile` with explicit argument arrays (never a shell) for `orca` (`account`, `agent`, `terminal`, `worktree`) and `git` (`status`, `diff --stat`).
 
@@ -200,7 +204,7 @@ orca plugin check . --json       # renders the panel against the real worker
 - `src/daemon/` — standalone `oahd` daemon (`server.ts`, `store.ts`, `ipc.ts`, `orca-transport.ts`, `probes.ts`, `proxy.ts`, `main.ts`).
 - `src/cli/` — `oah` CLI (`client.ts`, `commands.ts`, `format.ts`, `session.ts`, `main.ts`).
 - `src/plugin/` — thin Orca plugin worker bridge (`worker.ts`, `worker.test.ts`).
-- `src/panel.tsx`, `src/protocol.ts` — Orca sidebar panel UI (**Accounts**, **Proxy**, **History**, **Settings**).
+- `src/panel.tsx`, `src/protocol.ts` — Orca sidebar panel UI (**Accounts**, **Live Quota**, **History**, **Settings**).
 
 ## License
 

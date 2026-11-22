@@ -26,8 +26,8 @@ export type SeatUsage = {
   source?: 'live' | 'cached' | 'projected' | 'unknown'
   /** When the numbers were taken. */
   asOf?: number
-  /** Set when the numbers come from a pane's status line (live-usage.ts), not from Orca. */
-  origin?: 'pane'
+  /** Readings supplied by a pane or an independently verified provider profile. */
+  origin?: 'pane' | 'claude-profile' | 'codex-profile' | 'antigravity-profile' | 'opencode-profile' | 'devin-profile'
   reason?: UsageReason
   /** Orca's own message for the reason, shortened. */
   detail?: string
@@ -35,6 +35,8 @@ export type SeatUsage = {
   retryAt?: number
   session?: UsageWindow
   weekly?: UsageWindow
+  /** Provider monthly cap, currently exposed by OpenCode Go. */
+  monthly?: UsageWindow
   /** A model-specific weekly bucket (Claude `fableWeekly`, ...). */
   model?: UsageWindow & { name: string }
   /** Codex `account/rateLimits/read`: false when ordinary work is blocked even if Spark/other buckets show 0 %. */
@@ -52,6 +54,12 @@ export type Seat = {
   label: string
   active: boolean
   usage: SeatUsage
+  /** Direct quota check failure, kept separately from the displayed fallback reading. */
+  directQuotaIssue?: { reason: UsageReason | 'native-sign-in-required'; retryAt: number }
+  /** Why a direct check cannot serve this account, in a few words (`directQuotaUnavailable`). */
+  quotaUnavailable?: string
+  /** The direct check was turned off for this account by hand; it stays off. */
+  quotaOff?: boolean
   /** Which per-pane live files describe this account (live-usage.ts): its Claude profile id,
    *  `system` for Claude's own login, or both when a managed account is that same login. Local
    *  Claude accounts only; never part of a snapshot. */
@@ -285,10 +293,9 @@ export type Config = {
   awayMinutes: number
   /** How per-model weekly caps (e.g. Claude Fable) are handled: fallback-model, rotate, or ignore. */
   modelWindowPolicy: 'fallback-model' | 'rotate' | 'ignore'
-  /** Live fallback quota probes (`codex app-server`, `claude -p /usage`, OpenCode Go). */
-  liveProbes: 'auto' | 'off'
   /** Per-workspace or per-terminal explicit account pins (`workspaceId|terminalId` -> `seatKey`). */
   pins: Record<string, string>
+  quotaLinks: string[]
   /** Set while the settings cannot be trusted, so every service counts as off whatever was chosen
    *  (worker.ts `configReader`): `settings` = Orca could not be asked for them yet, `upgrade` = the
    *  settings of an older version are not carried over yet. The panel says so. */
@@ -338,8 +345,8 @@ export const DEFAULT_CONFIG: Config = {
   restoreUnsent: true,
   awayMinutes: 10,
   modelWindowPolicy: 'fallback-model',
-  liveProbes: 'auto',
-  pins: {}
+  pins: {},
+  quotaLinks: []
 }
 
 /** Auto (`pick: smart`) with the thresholds of Early when away, for tests. */
@@ -404,6 +411,7 @@ export type Snapshot = {
   paused: boolean
   updatedAt: number
   seats: (Seat & {
+    quotaLinked?: boolean
     cooldownUntil?: number
     cooldownReason?: string
     /** Never chosen automatically (the "Skip" switch, the `exclude` setting). */

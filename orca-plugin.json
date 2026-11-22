@@ -249,17 +249,6 @@
         "description": "How per-model weekly windows (e.g. Claude Fable) affect rotation."
       },
       {
-        "key": "live_probes",
-        "title": "Advanced: Live fallback quota probes",
-        "type": "string",
-        "default": "auto",
-        "enum": [
-          "auto",
-          "off"
-        ],
-        "description": "When Orca readings are stale or missing, probe Codex app-server, Claude /usage, or OpenCode Go directly."
-      },
-      {
         "key": "default_cooldown_minutes",
         "title": "Advanced: Cooldown when a limit gives no reset time",
         "type": "number",

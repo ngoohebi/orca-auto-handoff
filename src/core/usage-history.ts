@@ -16,8 +16,8 @@ export type Sample = {
   sReset: number | null
   wReset: number | null
   mReset?: number | null
-  /** Who took it: Orca's poll, or a pane's status line. */
-  src: 'orca' | 'pane'
+  /** Where the quota reading came from. */
+  src: NonNullable<Seat['usage']['origin']> | 'orca'
 }
 
 /** The weekly level at the end of one UTC day, kept across weekly resets for the weekly pace. */
@@ -108,7 +108,7 @@ export function sampleOf(seat: Pick<Seat, 'usage'>, now: number): Sample | null 
     w,
     sReset: s === null ? null : (u.session?.resetsAt ?? null),
     wReset: w === null ? null : (u.weekly?.resetsAt ?? null),
-    src: u.origin === 'pane' ? 'pane' : 'orca'
+    src: u.origin ?? 'orca'
   }
   if (m !== null) {
     sample.m = m

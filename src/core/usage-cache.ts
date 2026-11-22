@@ -9,13 +9,16 @@ import type { Provider, Seat, SeatUsage, UsageWindow } from './types.ts'
 export type CachedSeat = {
   session?: UsageWindow
   weekly?: UsageWindow
+  monthly?: UsageWindow
   model?: UsageWindow & { name: string }
+  ordinaryUsageAllowed?: boolean
+  rateLimitReachedType?: string
   /** When Orca took this reading (its `updatedAt`), or when the plugin first saw it. */
   asOf: number
   /** Orca's last numbers and reset times, so a repeated cached row never looks fresh. */
   sig: string
   /** Set when session and weekly come from a pane's status line (`observeLive`), not from Orca. */
-  origin?: 'pane'
+  origin?: SeatUsage['origin']
 }
 
 export type UsageCache = { v: 1; seats: Record<string, CachedSeat> }
@@ -32,7 +35,7 @@ export function loadedUsageCache(value: unknown): UsageCache {
 
 const HOUR = 3_600_000
 /** How long a window lasts when Orca gave no reset time. */
-const WINDOW_MS = { session: 5 * HOUR, weekly: 7 * 24 * HOUR, model: 7 * 24 * HOUR }
+const WINDOW_MS = { session: 5 * HOUR, weekly: 7 * 24 * HOUR, monthly: 31 * 24 * HOUR, model: 7 * 24 * HOUR }
 
 function strip(w: UsageWindow | undefined): UsageWindow | undefined {
   return w ? { usedPercent: w.usedPercent, resetsAt: w.resetsAt } : undefined
@@ -40,7 +43,8 @@ function strip(w: UsageWindow | undefined): UsageWindow | undefined {
 
 function signature(u: SeatUsage): string {
   const part = (w: UsageWindow | undefined) => (w ? `${w.usedPercent}@${w.resetsAt ?? '-'}` : '-')
-  return [part(u.session), part(u.weekly), u.model ? `${u.model.name}:${part(u.model)}` : '-'].join('|')
+  const windows = [part(u.session), part(u.weekly), part(u.monthly), u.model ? `${u.model.name}:${part(u.model)}` : '-'].join('|')
+  return u.ordinaryUsageAllowed === undefined ? windows : `${windows}|${u.ordinaryUsageAllowed}|${u.rateLimitReachedType ?? ''}`
 }
 
 /**
@@ -50,6 +54,7 @@ function signature(u: SeatUsage): string {
  */
 export function isLive(seat: Seat, activeSince: Partial<Record<Provider, number>>): boolean {
   if (!seat.usage.known) return false
+  if (seat.usage.origin && seat.usage.origin !== 'pane') return true
   const since = seat.active ? activeSince[seat.provider] : undefined
   return !(since !== undefined && seat.usage.updatedAt !== undefined && seat.usage.updatedAt < since)
 }
@@ -83,8 +88,10 @@ export function observe(
     const key = cacheKey(scope, seat.key)
     const sig = signature(seat.usage)
     const prev = cache.seats[key]
-    if (prev && prev.sig === sig) continue
     const asOf = seat.usage.updatedAt ?? now
+    const direct = seat.usage.origin && seat.usage.origin !== 'pane'
+    if (prev?.origin && prev.origin !== 'pane' && (prev.asOf > asOf || (!direct && seat.usage.updatedAt === undefined))) continue
+    if (prev && prev.sig === sig && !(direct && asOf > prev.asOf)) continue
     if (prev?.origin === 'pane' && prev.asOf >= asOf) {
       // A pane reported after Orca took this reading: its session and weekly stand. The model
       // bucket only ever comes from Orca.
@@ -95,10 +102,15 @@ export function observe(
       continue
     }
     const entry: CachedSeat = { asOf, sig }
+    if (direct) entry.origin = seat.usage.origin
+    if (seat.usage.ordinaryUsageAllowed !== undefined) entry.ordinaryUsageAllowed = seat.usage.ordinaryUsageAllowed
+    if (seat.usage.rateLimitReachedType) entry.rateLimitReachedType = seat.usage.rateLimitReachedType
     const session = strip(seat.usage.session)
     const weekly = strip(seat.usage.weekly)
+    const monthly = strip(seat.usage.monthly)
     if (session) entry.session = session
     if (weekly) entry.weekly = weekly
+    if (monthly) entry.monthly = monthly
     if (seat.usage.model) entry.model = { ...strip(seat.usage.model)!, name: seat.usage.model.name }
     cache.seats[key] = entry
     changed = true
@@ -177,7 +189,9 @@ export function resolve(
   const cachedEntry = cache.seats[key]
   const cachedPane = cachedEntry?.origin === 'pane' ? cachedEntry : undefined
   const orcaLive = isLive(seat, activeSince)
-  if (orcaLive && !(cachedPane && cachedPane.asOf > (current.updatedAt ?? 0))) {
+  const newerCachedReading = !!cachedEntry?.origin && cachedEntry.asOf > (current.updatedAt ?? 0)
+    && (!!cachedPane || (maxAgeMs > 0 && now - cachedEntry.asOf <= maxAgeMs))
+  if (orcaLive && !newerCachedReading) {
     const live: SeatUsage = { ...current, known: true, source: 'live' }
     if (current.updatedAt !== undefined) live.asOf = current.updatedAt
     return live
@@ -188,20 +202,29 @@ export function resolve(
   if (current.retryAt) keep.retryAt = current.retryAt
   const cached = cachedEntry
   const paneFresh = !!cachedPane && now - cachedPane.asOf <= LIVE_FRESH_MS
-  // Reaching here with Orca live means a newer pane reading stands in for Orca's own.
-  const upToDate = orcaLive || paneFresh
+  const upToDate = paneFresh || (orcaLive && !!cachedPane)
   if (!cached || (!upToDate && (maxAgeMs <= 0 || now - cached.asOf > maxAgeMs))) {
     return { ...keep, known: false, source: 'unknown' }
   }
-  const session = project(cached.session, cached.asOf, WINDOW_MS.session, now)
+  const session = project(cached.session, cached.asOf, seat.provider === 'devin' ? 24 * HOUR : WINDOW_MS.session, now)
   const weekly = project(cached.weekly, cached.asOf, WINDOW_MS.weekly, now)
+  const monthly = project(cached.monthly, cached.asOf, WINDOW_MS.monthly, now)
   const modelWin = project(cached.model, cached.asOf, WINDOW_MS.model, now)
-  const usage: SeatUsage = { ...keep, known: !!(session || weekly || modelWin), source: upToDate ? 'live' : 'cached', asOf: cached.asOf }
-  if (cached.origin === 'pane') usage.origin = 'pane'
+  const blockedWindow = cached.rateLimitReachedType === 'weekly' ? cached.weekly
+    : cached.rateLimitReachedType === 'session' ? cached.session : undefined
+  const knownBlocked = cached.ordinaryUsageAllowed === false
+    && (blockedWindow?.resetsAt == null || blockedWindow.resetsAt > now)
+  const usage: SeatUsage = { ...keep, known: !!(session || weekly || monthly || modelWin || knownBlocked), source: upToDate ? 'live' : 'cached', asOf: cached.asOf }
+  if (knownBlocked) {
+    usage.ordinaryUsageAllowed = false
+    if (cached.rateLimitReachedType) usage.rateLimitReachedType = cached.rateLimitReachedType
+  }
+  if (cached.origin) usage.origin = cached.origin
   if (session) usage.session = session
   if (weekly) usage.weekly = weekly
+  if (monthly) usage.monthly = monthly
   if (modelWin && cached.model) usage.model = { ...modelWin, name: cached.model.name }
-  if ([session, weekly, modelWin].some((w) => w?.reset)) usage.source = 'projected'
+  if ([session, weekly, monthly, modelWin].some((w) => w?.reset)) usage.source = 'projected'
   if (!usage.known) usage.source = 'unknown'
   return usage
 }

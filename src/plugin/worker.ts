@@ -169,8 +169,9 @@ export async function activateThin(orca: OrcaWorkerApi, opts: ThinWorkerOptions 
     return res.message ?? 'Status line removed.'
   })
 
-  // Relay every panel RPC directly to oahd.
+  // Relay account pool and daemon controls to oahd.
   orca.panels.handle('rotator.snapshot', (input) => rpc('snapshot', (input ?? {}) as Record<string, unknown>))
+  orca.panels.handle('rotator.linkQuota', (input) => rpc('quota.link', input))
   orca.panels.handle('rotator.pause', (input) => rpc('pause', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.setService', (input) => rpc('setService', (input ?? {}) as Record<string, unknown>))
   orca.panels.handle('rotator.settings', (input) => rpc('settings', (input ?? {}) as Record<string, unknown>))

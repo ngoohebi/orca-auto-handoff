@@ -41,7 +41,7 @@ export function formatStatus(snap: Snapshot, version: string, now = Date.now()):
     for (const s of snap.seats.filter((x) => x.provider === p)) {
       const cooling = s.cooldownUntil && s.cooldownUntil > now
       const usage = s.usage?.known
-        ? `5h ${pct(s.usage.session)}${s.usage.session?.resetsAt ? ` (${span(s.usage.session.resetsAt - now)})` : ''} · week ${pct(s.usage.weekly)}${s.usage.weekly?.resetsAt ? ` (${span(s.usage.weekly.resetsAt - now)})` : ''}`
+        ? `${s.provider === 'devin' ? 'day' : '5h'} ${pct(s.usage.session)}${s.usage.session?.resetsAt ? ` (${span(s.usage.session.resetsAt - now)})` : ''} · week ${pct(s.usage.weekly)}${s.usage.weekly?.resetsAt ? ` (${span(s.usage.weekly.resetsAt - now)})` : ''}`
         : 'no usage yet'
       const state = cooling ? `limited ${span(s.cooldownUntil! - now)}` : s.active ? 'active' : 'ready'
       const circuit = s.circuit && s.circuit !== 'closed' ? `  [${s.circuit.replace('_', '-')}]` : ''

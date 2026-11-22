@@ -43,15 +43,26 @@ import type { ConsoleLineState, SettingValues, Snapshot, UnsentDraft } from './p
 import { ADVANCED_SETTINGS, applies, BASIC_SETTINGS, checked, STATUS_LINE_SETTINGS, type SettingSpec } from './core/settings.ts'
 import { PROVIDERS, type Provider } from './core/types.ts'
 
-/** "Pick the next account", as the panel names it. */
-const MODE_NAME = { smart: 'Auto', 'my-order': 'Custom order' } as const
-
 const snapshot = atom<Snapshot | null>(null)
-const busy = atom<string | null>(null)
-const message = atom<string | null>(null)
+/** The actions on their way, by key. Each control waits only for its own action (and a hand-off
+ *  for another hand-off), so one slow request never greys out the whole panel. */
+const busy = atom<readonly string[]>([])
+const isBusy = (key: string): boolean => read(busy).includes(key)
+const busyWith = (prefix: string): boolean => read(busy).some((k) => k.startsWith(prefix))
+/** A hand-off, or an answer about a session that would move, is on its way: the other hand-off
+ *  controls wait for it, since two at once would race for the same session. */
+const MOVING = /^(switch|now|decline|cancel):/
+const moving = (): boolean => read(busy).some((k) => MOVING.test(k))
+/** What the last action did. `at` is where it is said: under the setting or switch that was
+ *  changed, so it is seen where the change was made; without it, at the top of the panel. */
+type Note = { text: string; tone: Tone; at?: string }
+const message = atom<Note | null>(null)
+/** The tabs there are. Any other stored tab opens Accounts. */
+const TABS = ['accounts', 'proxy', 'history', 'settings'] as const
 const tab = atom('tab', 'accounts', { persist: 'plugin' })
-/** The Claude console status line in the focused workspace; null until read. */
-const consoleLine = atom<ConsoleLineState | null>(null)
+/** The Claude console status line in the focused workspace: undefined until asked, null when it
+ *  could not be read. */
+const consoleLine = atom<ConsoleLineState | null | undefined>(undefined)
 /** The Settings tab's values, as the worker last gave them. */
 const settings = atom<SettingValues | null>(null)
 /** The standby account whose *Hand off to this account* is waiting for confirmation. */
@@ -155,9 +166,9 @@ async function showConsoleLine(): Promise<void> {
   if (mine === opening) set(consoleLine, state)
 }
 
-async function load(refresh = false): Promise<void> {
+async function load(refresh = false, directQuota = false): Promise<void> {
   const mine = opening
-  const next = await plugin.request('rotator.snapshot', { refresh })
+  const next = await plugin.request('rotator.snapshot', { refresh, ...(directQuota ? { directQuota } : {}) })
   if (mine !== opening) return
   show(next)
   await showConsoleLine()
@@ -173,15 +184,18 @@ const NOT_REFRESHED = "Couldn't refresh the list; it updates shortly."
 
 /** Runs one action and says what it did. `reload` reads the panel again afterwards: when only
  *  that fails the action still worked, so its own result is said, with the reload problem apart
- *  from it (the worker's next push brings the list up to date). */
-async function act(key: string, fn: () => Promise<string | void>, reload?: () => Promise<void>): Promise<void> {
-  set(busy, key)
+ *  from it (the worker's next push brings the list up to date). `at` says the result next to the
+ *  control that asked (see `Note`). The same action twice at once runs once. */
+async function act(key: string, fn: () => Promise<string | void>, reload?: () => Promise<void>, at?: string): Promise<void> {
+  if (isBusy(key)) return
+  set(busy, [...read(busy), key])
+  const say = (text: string, tone: Tone = 'neutral') => set(message, at ? { text, tone, at } : { text, tone })
   try {
     let text: string | void
     try {
       text = await fn()
     } catch (error) {
-      set(message, `Failed: ${String((error as Error)?.message ?? error)}`)
+      say(`Failed: ${String((error as Error)?.message ?? error)}`, 'danger')
       return
     }
     let refreshed = true
@@ -192,11 +206,25 @@ async function act(key: string, fn: () => Promise<string | void>, reload?: () =>
         refreshed = false
       }
     }
-    if (!refreshed) set(message, `${text ? text.replace(/[.\s]+$/, '') : 'Done'}. ${NOT_REFRESHED}`)
-    else if (text) set(message, text)
+    if (!refreshed) say(`${text ? text.replace(/[.\s]+$/, '') : 'Done'}. ${NOT_REFRESHED}`)
+    else if (text) say(text)
   } finally {
-    set(busy, null)
+    set(busy, read(busy).filter((k) => k !== key))
   }
+}
+
+/** The result of an action said next to the control it came from (`at`), with a way to dismiss it. */
+function NoteLine({ at }: { at?: string }) {
+  const note = read(message)
+  if (!note || note.at !== at) return null
+  return (
+    <Row justify="between" align="center" gap="sm">
+      <Text size="xs" tone={note.tone} muted={note.tone === 'neutral'}>
+        {note.text}
+      </Text>
+      <IconButton icon="close" label="Dismiss" variant="ghost" size="xs" onPress={() => set(message, null)} />
+    </Row>
+  )
 }
 
 /** Switching terminal tabs raises no event, so while the panel is open it asks which service the
@@ -258,18 +286,16 @@ const brandMark = (p: Provider) => `assets/brand/${p}-mark.png`
 /** The title badge's marks: geometric shapes of one width, ● early hand-offs on, ○ only at a
  *  limit, ■ paused, and ◐ (Early when away, the user is here), which is drawn so it can be a
  *  brighter, lighter green than Orca's one green for text. */
-const BADGE_SYMBOL = { away: '●', limit: '○', paused: '■' } as const
-const HERE_MARK = 'assets/mark-here.png'
+const BADGE_SYMBOL = { away: '●', here: '◐', limit: '○', paused: '■' } as const
 
-/** The service block's wash. Orca only paints theme tints, so each service takes the tone nearest
- *  its brand: amber for Claude's terracotta, green for Codex; the blue brands have no blue tint
- *  and sit on the quiet accent wash, with the brand tile carrying their colour. */
-const BRAND_TINT: Record<Provider, 'muted' | Tone> = {
-  claude: 'warning',
-  codex: 'success',
-  antigravity: 'accent',
-  opencode: 'muted',
-  devin: 'accent'
+/** What automatic hand-off is doing right now, in the title badge: the state only, in words that
+ *  need no legend (how accounts are picked is on the Settings tab). */
+function badgeState(snap: Snapshot): { mark: keyof typeof BADGE_SYMBOL; label: string; tone: Tone; plain: boolean } {
+  if (snap.paused) return { mark: 'paused', label: 'Paused', tone: 'warning', plain: false }
+  if (snap.atLimitOnly) return { mark: 'limit', label: 'At limit only', tone: 'neutral', plain: true }
+  // Early when away, the user is here: green, without the solid border of early hand-offs on.
+  if (snap.userHere) return { mark: 'here', label: 'Early once you step away', tone: 'success', plain: true }
+  return { mark: 'away', label: 'Early hand-offs on', tone: 'success', plain: false }
 }
 
 /** Why Orca has no live numbers for this account, in plain words. */
@@ -391,17 +417,40 @@ function UsageBar({ name, window }: { name: string; window: Window | undefined }
   )
 }
 
+/** Where the numbers come from, on one muted line, when it is worth saying. */
+function SourceLine({ seat }: { seat: SeatRow }) {
+  const { usage } = seat
+  if (!usage.known) return null
+  if (usage.source === 'live' && usage.origin && usage.origin !== 'pane') {
+    return (
+      <Text muted size="xs">
+        Checked with {PROVIDER_NAME[seat.provider]} {usage.asOf ? <RelativeTime at={usage.asOf} muted /> : null}
+      </Text>
+    )
+  }
+  if (usage.source === 'cached' || usage.source === 'projected') {
+    return (
+      <Text muted size="xs">
+        Last reading {usage.asOf ? <RelativeTime at={usage.asOf} muted /> : null}
+        {usage.source === 'projected' ? ' · a window has reset since' : ''}
+        {reasonText(seat) ? ` · ${reasonText(seat)}` : ''}
+      </Text>
+    )
+  }
+  return null
+}
+
 function SeatCard({ seat, now, switchable, place, skippable }: { seat: SeatRow; now: number; switchable: boolean; place?: { first: boolean; last: boolean }; skippable?: boolean }) {
   const cooling = !!seat.cooldownUntil && seat.cooldownUntil > now
   const status = seatStatus(seat, now)
   const name = PROVIDER_NAME[seat.provider]
-  // "Skip": never chosen automatically (a hand-off by hand still can). It shares the last row
-  // with "Hand off to this account".
+  // "Skip": never chosen automatically (a hand-off by hand still can). Always first on the last
+  // row, so it never moves while a question is open.
   const skip = skippable ? (
     <Switch
       label="Skip"
       checked={!!seat.excluded}
-      disabled={read(busy) !== null}
+      disabled={isBusy(`exclude:${seat.key}`)}
       onChange={(excluded: boolean) =>
         act(`exclude:${seat.key}`, async () => {
           await plugin.request('rotator.setExcluded', { seatKey: seat.key, excluded })
@@ -411,11 +460,13 @@ function SeatCard({ seat, now, switchable, place, skippable }: { seat: SeatRow; 
     />
   ) : null
   const handOff = switchable && !seat.active && !cooling
-  const asking = read(draftAsk)?.seatKey === seat.key || read(confirming) === seat.key
+  const draft = read(draftAsk)?.seatKey === seat.key ? read(draftAsk)!.draft : undefined
+  const confirm = !draft && read(confirming) === seat.key
+  const asking = !!draft || confirm
   return (
-    <Box border radius="md" gap="none" background="card">
+    <Box gap="xs" paddingY="xs">
       {/* Who: the account on its own line, then its usage right under it. */}
-      <Box direction="row" justify="between" align="center" gap="sm" paddingX="sm" paddingY="xs">
+      <Box direction="row" justify="between" align="center" gap="sm">
         <Row gap="xs" align="center">
           <StatusDot tone={status.tone} filled={status.filled} dim={status.dim} />
           <Text truncate>{seat.label}</Text>
@@ -427,138 +478,128 @@ function SeatCard({ seat, now, switchable, place, skippable }: { seat: SeatRow; 
           {/* Custom order: the account's place in its service's ranking. */}
           {place ? (
             <>
-              <IconButton icon="collapse" label="Move up in custom order" variant="ghost" size="xs" disabled={place.first || read(busy) !== null} onPress={() => moveSeat(seat.key, -1)} />
-              <IconButton icon="expand" label="Move down in custom order" variant="ghost" size="xs" disabled={place.last || read(busy) !== null} onPress={() => moveSeat(seat.key, 1)} />
+              <IconButton icon="collapse" label="Move up in custom order" variant="ghost" size="xs" disabled={place.first || busyWith('move:')} onPress={() => moveSeat(seat.key, -1)} />
+              <IconButton icon="expand" label="Move down in custom order" variant="ghost" size="xs" disabled={place.last || busyWith('move:')} onPress={() => moveSeat(seat.key, 1)} />
             </>
           ) : null}
         </Row>
       </Box>
-      <Box paddingX="sm" paddingY="xs" gap="xs">
-        {seat.usage.known ? (
-          <Stack gap="xs">
-            <UsageBar name="5h" window={seat.usage.session} />
-            <UsageBar name="Week" window={seat.usage.weekly} />
-            {seat.usage.model ? <UsageBar name={capital(seat.usage.model.name)} window={seat.usage.model} /> : null}
-            {/* The pace of use, when the last readings show one; half an hour or less takes a colour. */}
-            {seat.runwayMs !== undefined ? (
-              <Text size="xs" tone={seat.runwayMs <= 10 * 60_000 ? 'danger' : seat.runwayMs <= 30 * 60_000 ? 'warning' : 'neutral'} muted={seat.runwayMs > 30 * 60_000}>
-                {capital(runwayWords(seat.runwayMs))}
-              </Text>
-            ) : null}
-            {seat.usage.source === 'cached' || seat.usage.source === 'projected' ? (
-              <Text muted size="xs">
-                Last reading {seat.usage.asOf ? <RelativeTime at={seat.usage.asOf} muted /> : null}
-                {seat.usage.source === 'projected' ? ' · a window has reset since' : ''}
-                {reasonText(seat) ? ` · ${reasonText(seat)}` : ''}
-              </Text>
-            ) : null}
-          </Stack>
-        ) : (
-          <Text muted size="xs">
-            {reasonText(seat) ?? 'No usage yet: Orca reports it once this account runs.'}
-          </Text>
-        )}
-        {cooling ? (
-          <Row justify="between" align="center" gap="sm">
-            <Text size="xs" tone="danger">
-              {cooldownWords(seat.cooldownReason)} · ends <RelativeTime at={seat.cooldownUntil!} tone="danger" />
+      {seat.usage.known ? (
+        <Stack gap="xs">
+          <UsageBar name={seat.provider === 'devin' ? 'Day' : '5h'} window={seat.usage.session} />
+          <UsageBar name="Week" window={seat.usage.weekly} />
+          {seat.usage.monthly ? <UsageBar name="Month" window={seat.usage.monthly} /> : null}
+          {seat.usage.model ? <UsageBar name={capital(seat.usage.model.name)} window={seat.usage.model} /> : null}
+          {/* The pace of use, when the last readings show one; half an hour or less takes a colour. */}
+          {seat.runwayMs !== undefined ? (
+            <Text size="xs" tone={seat.runwayMs <= 10 * 60_000 ? 'danger' : seat.runwayMs <= 30 * 60_000 ? 'warning' : 'neutral'} muted={seat.runwayMs > 30 * 60_000}>
+              {capital(runwayWords(seat.runwayMs))}
             </Text>
+          ) : null}
+        </Stack>
+      ) : (
+        <Text muted size="xs">
+          {reasonText(seat) ?? 'No usage yet: Orca reports it once this account runs.'}
+        </Text>
+      )}
+      {/* Where the numbers come from. */}
+      <SourceLine seat={seat} />
+      {cooling ? (
+        <Row justify="between" align="center" gap="sm">
+          <Text size="xs" tone="danger">
+            {cooldownWords(seat.cooldownReason)} · ends <RelativeTime at={seat.cooldownUntil!} tone="danger" />
+          </Text>
+          <Button
+            size="xs"
+            variant="ghost"
+            tooltip="Count this account as free again now"
+            disabled={isBusy(`clear:${seat.key}`)}
+            onPress={() => act(`clear:${seat.key}`, async () => {
+              await plugin.request('rotator.clearCooldown', { seatKey: seat.key })
+            })}
+          >
+            End cooldown
+          </Button>
+        </Row>
+      ) : null}
+      {/* Skip on the left, the hand-off by hand on the right; while it asks, the question sits
+          below the row and the row stays where it is. */}
+      {skip || handOff ? (
+        <Row justify="between" align="center">
+          {skip ?? <Box />}
+          {handOff && !asking ? (
             <Button
               size="xs"
-              variant="ghost"
-              disabled={read(busy) !== null}
-              onPress={() => act(`clear:${seat.key}`, async () => {
-                await plugin.request('rotator.clearCooldown', { seatKey: seat.key })
-              })}
+              variant="outline"
+              icon="next"
+              tooltip={`Hand ${name} off to this account now, instead of waiting for automatic hand-off`}
+              disabled={moving()}
+              onPress={() => {
+                // One question at a time: an older one about unsent text is dropped.
+                set(draftAsk, null)
+                set(confirming, seat.key)
+              }}
             >
-              Clear
+              Hand off to this account
+            </Button>
+          ) : null}
+        </Row>
+      ) : null}
+      {handOff && draft ? (
+        <Box border="accent" radius="md" padding="sm" gap="sm">
+          <Text size="sm" weight="medium">
+            {draft.queued
+              ? 'This session has queued messages that would be lost.'
+              : `This session shows unsent text that cannot go along: “${shownDraft(draft.text)}”.`}
+          </Text>
+          <Text size="xs" muted>
+            {draft.queued ? 'Hand off anyway?' : 'Hand off anyway? The text would be lost.'}
+          </Text>
+          <Row justify="end" gap="xs">
+            <Button size="sm" variant="ghost" onPress={() => set(draftAsk, null)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={moving()}
+              onPress={() => {
+                const asked = read(draftAsk)
+                set(draftAsk, null)
+                if (asked) void switchTo(seat.key, asked.draft)
+              }}
+            >
+              Hand off anyway
             </Button>
           </Row>
-        ) : null}
-        {/* A standby can be chosen by hand; it asks first. Automatic hand-off for the service
-            then stops, so the plugin never undoes the choice; the block says so. */}
-        {skip && (!handOff || asking) ? skip : null}
-        {handOff ? (
-          <Box>
-            {read(draftAsk)?.seatKey === seat.key ? (
-              <Box border="accent" radius="md" padding="sm" gap="sm">
-                <Text size="sm" weight="medium">
-                  {read(draftAsk)!.draft.queued
-                    ? 'This session has queued messages that would be lost.'
-                    : `This session shows unsent text that cannot go along: “${shownDraft(read(draftAsk)!.draft.text)}”.`}
-                </Text>
-                <Text size="xs" muted>
-                  {read(draftAsk)!.draft.queued ? 'Hand off anyway?' : 'Hand off anyway? The text would be lost.'}
-                </Text>
-                <Row justify="end" gap="xs">
-                  <Button size="sm" variant="ghost" onPress={() => set(draftAsk, null)}>
-                    Cancel
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={read(busy) !== null}
-                    onPress={() => {
-                      const asked = read(draftAsk)
-                      set(draftAsk, null)
-                      if (asked) void switchTo(seat.key, asked.draft)
-                    }}
-                  >
-                    Hand off anyway
-                  </Button>
-                </Row>
-              </Box>
-            ) : read(confirming) === seat.key ? (
-              <Box border="accent" radius="md" padding="sm" gap="sm">
-                <Text size="sm" weight="medium">{`Hand off ${name} to ${seat.label}?`}</Text>
-                <Text size="xs" muted>
-                  New {name} sessions will start on this account.
-                </Text>
-                <Text size="xs" muted>
-                  The session on screen is handed off too if it is between turns; a busy one stays where it is. Unsent text goes with it when it can; otherwise you are asked first.
-                </Text>
-                <Text size="xs" muted>
-                  Automatic hand-off for {name} turns off, so it won't hand off again on its own.
-                </Text>
-                <Row justify="end" gap="xs">
-                  <Button size="sm" variant="ghost" onPress={() => set(confirming, null)}>
-                    Cancel
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={read(busy) !== null}
-                    onPress={() => {
-                      set(confirming, null)
-                      void switchTo(seat.key)
-                    }}
-                  >
-                    Yes, hand off
-                  </Button>
-                </Row>
-              </Box>
-            ) : (
-              <Row justify="between" align="center">
-                {skip ?? <Box />}
-                <Button
-                  size="xs"
-                  variant="outline"
-                  icon="next"
-                  tooltip={`Hand ${name} off to this account now, instead of waiting for automatic hand-off`}
-                  disabled={read(busy) !== null}
-                  onPress={() => {
-                    // One question at a time: an older one about unsent text is dropped.
-                    set(draftAsk, null)
-                    set(confirming, seat.key)
-                  }}
-                >
-                  Hand off to this account
-                </Button>
-              </Row>
-            )}
-          </Box>
-        ) : null}
-      </Box>
+        </Box>
+      ) : handOff && confirm ? (
+        <Box border="accent" radius="md" padding="sm" gap="sm">
+          <Text size="sm" weight="medium">{`Hand off ${name} to ${seat.label}?`}</Text>
+          <Text size="xs" muted>
+            {`New ${name} sessions start on this account. The session on screen moves too if it is between turns; its unsent text goes along, or you are asked first.`}
+          </Text>
+          <Text size="xs" muted>
+            {`Automatic hand-off for ${name} turns off.`}
+          </Text>
+          <Row justify="end" gap="xs">
+            <Button size="sm" variant="ghost" onPress={() => set(confirming, null)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={moving()}
+              onPress={() => {
+                set(confirming, null)
+                void switchTo(seat.key)
+              }}
+            >
+              Yes, hand off
+            </Button>
+          </Row>
+        </Box>
+      ) : null}
     </Box>
   )
 }
@@ -571,44 +612,54 @@ function moveSeat(seatKey: string, by: -1 | 1): void {
   })
 }
 
-/** What is typed in a number or text setting and not saved yet (Enter saves it). */
+/** What is typed in a number or text setting and not saved yet (Enter or Save saves it). */
 const drafts = atom<Record<string, string>>({})
 
-function saveSetting(spec: SettingSpec, value: string | number | boolean): void {
-  void act(`setting:${spec.key}`, async () => {
-    set(settings, await plugin.request('rotator.settings', { key: spec.key, value }))
-    const rest = { ...read(drafts) }
-    delete rest[spec.key]
-    set(drafts, rest)
-    const shown = spec.kind === 'choice' ? (spec.options.find((o) => o.value === value)?.label ?? String(value)) : spec.kind === 'boolean' ? (value ? 'on' : 'off') : String(value) || 'empty'
-    return `${spec.title}: ${shown}`
-  })
+function dropDraft(key: string): void {
+  const rest = { ...read(drafts) }
+  delete rest[key]
+  set(drafts, rest)
 }
 
-/** One setting: its control, and one muted line saying what the current value does (or why it
- *  does not apply right now). */
+function saveSetting(spec: SettingSpec, value: string | number | boolean): void {
+  void act(
+    `setting:${spec.key}`,
+    async () => {
+      set(settings, await plugin.request('rotator.settings', { key: spec.key, value }))
+      dropDraft(spec.key)
+      const shown = spec.kind === 'choice' ? (spec.options.find((o) => o.value === value)?.label ?? String(value)) : spec.kind === 'boolean' ? (value ? 'on' : 'off') : String(value) || 'empty'
+      return `${spec.title}: ${shown}`
+    },
+    undefined,
+    `setting:${spec.key}`
+  )
+}
+
+/** One setting: its control, one muted line saying what the current value does (or why it does
+ *  not apply right now), and the result of the last change made to it. */
 function SettingRow({ spec, values }: { spec: SettingSpec; values: SettingValues }) {
   const value = values[spec.key] ?? spec.default
   const off = !applies(spec.when, values)
-  const disabled = off || read(busy) !== null
+  const disabled = off || isBusy(`setting:${spec.key}`)
   let control: OrcaNode
   let help = spec.help
+  let unsaved: OrcaNode = null
   if (spec.kind === 'choice') {
-    control = <Select label={spec.title} value={String(value)} options={[...spec.options]
-          .sort((a, b) => Number(b.value === spec.default) - Number(a.value === spec.default))
-          .map((o) => ({ value: o.value, label: o.value === spec.default ? `${o.label} (Default)` : o.label }))} disabled={disabled} onChange={(v: string) => saveSetting(spec, v)} />
+    // The options in their own order (as on Orca's Settings page), the default named.
+    control = <Select label={spec.title} value={String(value)} options={spec.options.map((o) => ({ value: o.value, label: o.value === spec.default ? `${o.label} (Default)` : o.label }))} disabled={disabled} onChange={(v: string) => saveSetting(spec, v)} />
     help = spec.options.find((o) => o.value === value)?.help ?? spec.help
   } else if (spec.kind === 'boolean') {
     control = <Switch label={spec.title} checked={value === true} disabled={disabled} onChange={(v: boolean) => saveSetting(spec, v)} />
   } else {
     const typed = read(drafts)[spec.key]
     const label = spec.kind === 'number' && spec.unit ? `${spec.title} (${spec.unit})` : spec.title
+    const valid = typed === undefined ? undefined : checked(spec, typed)
     control = (
       <Input
         label={label}
         value={typed ?? String(value)}
         {...(spec.kind === 'text' && spec.placeholder ? { placeholder: spec.placeholder } : {})}
-        invalid={spec.kind === 'number' && typed !== undefined && checked(spec, typed) === undefined}
+        invalid={spec.kind === 'number' && typed !== undefined && valid === undefined}
         disabled={disabled}
         onChange={(v: string) => set(drafts, { ...read(drafts), [spec.key]: v })}
         onSubmit={(v: string) => {
@@ -618,19 +669,77 @@ function SettingRow({ spec, values }: { spec: SettingSpec; values: SettingValues
       />
     )
     if (spec.kind === 'number') help = `${help} ${spec.min}–${spec.max}${spec.unit ? ` ${spec.unit}` : ''}.`
-    if (typed !== undefined && typed !== String(value)) help = `Press Enter to save (${spec.kind === 'number' ? `${spec.min}–${spec.max}` : 'or change it back'}).`
+    // Typed and not saved: said in the accent, with Save and Undo, so it is not left behind.
+    if (typed !== undefined && typed !== String(value)) {
+      unsaved = (
+        <Row justify="between" align="center" gap="sm">
+          <Text size="xs" tone={valid === undefined ? 'danger' : 'accent'}>
+            {valid === undefined && spec.kind === 'number'
+              ? `Not saved: enter a number, ${spec.min}–${spec.max}.`
+              : spec.kind === 'number' && String(valid) !== typed.trim()
+                ? `Not saved yet. Saves as ${valid} (${spec.min}–${spec.max}).`
+                : 'Not saved yet. Press Enter or Save.'}
+          </Text>
+          <Row gap="xs">
+            <Button size="xs" variant="ghost" onPress={() => dropDraft(spec.key)}>
+              Undo
+            </Button>
+            <Button size="xs" variant="outline" disabled={disabled || valid === undefined} onPress={() => valid !== undefined && saveSetting(spec, valid)}>
+              Save
+            </Button>
+          </Row>
+        </Row>
+      )
+    }
   }
   return (
     <Stack gap="xs">
       {control}
-      <Text size="xs" muted>
-        {off ? spec.when!.why : help}
-      </Text>
+      {unsaved ?? (
+        <Text size="xs" muted>
+          {off ? spec.when!.why : help}
+        </Text>
+      )}
       {spec.key === 'timing' && value === 'early' && read(snapshot)?.userHere ? (
         <Text size="xs" tone="warning">
           Right now you are using Orca, so sessions hand off only at a limit.
         </Text>
       ) : null}
+      <NoteLine at={`setting:${spec.key}`} />
+    </Stack>
+  )
+}
+
+/** Advanced, in groups. A key not named here (a setting added later) goes under Other. */
+const ADVANCED_GROUPS: { title: string; keys: string[] }[] = [
+  { title: 'Early hand-offs', keys: ['away_minutes', 'early_minutes', 'early_percent_left', 'idle_minutes', 'switch_cooldown_minutes'] },
+  { title: 'Session on screen', keys: ['active_countdown_seconds', 'active_presence_seconds', 'active_reminder_minutes'] },
+  { title: 'Limits and errors', keys: ['restore_unsent_text', 'auto_message', 'max_api_retries', 'model_fallback', 'model_window_policy', 'default_cooldown_minutes'] },
+  { title: 'Other', keys: [] }
+]
+
+function advancedGroups(): { title: string; specs: SettingSpec[] }[] {
+  const named = new Set(ADVANCED_GROUPS.flatMap((g) => g.keys))
+  return ADVANCED_GROUPS.map((g) => ({
+    title: g.title,
+    specs: g.keys.length ? ADVANCED_SETTINGS.filter((s) => g.keys.includes(s.key)) : ADVANCED_SETTINGS.filter((s) => !named.has(s.key))
+  })).filter((g) => g.specs.length > 0)
+}
+
+/** One group of advanced settings. When none of them applies, the group says why once instead of
+ *  showing a column of greyed-out fields. */
+function SettingGroup({ title, specs, values }: { title: string; specs: SettingSpec[]; values: SettingValues }) {
+  const allOff = specs.every((s) => s.when && !applies(s.when, values))
+  return (
+    <Stack gap="sm">
+      <Heading level={3}>{title}</Heading>
+      {allOff ? (
+        <Text size="xs" muted>
+          {[...new Set(specs.map((s) => s.when!.why))].join(' ')}
+        </Text>
+      ) : (
+        specs.map((spec) => <SettingRow key={spec.key} spec={spec} values={values} />)
+      )}
     </Stack>
   )
 }
@@ -640,16 +749,26 @@ function SettingsView() {
   if (!values) return <Skeleton shape="text" lines={4} label="Loading settings" />
   return (
     <Stack gap="md">
+      {/* What matters most first: how and when sessions hand off. */}
+      <Heading level={2}>Hand-off</Heading>
       {BASIC_SETTINGS.map((spec) => (
         <SettingRow key={spec.key} spec={spec} values={values} />
       ))}
       <Collapsible title="Advanced" description="Fine-tuning. The defaults suit most people.">
-        <Stack gap="md">
-          {ADVANCED_SETTINGS.map((spec) => (
-            <SettingRow key={spec.key} spec={spec} values={values} />
+        <Stack gap="lg">
+          {advancedGroups().map((g) => (
+            <SettingGroup key={g.title} title={g.title} specs={g.specs} values={values} />
           ))}
         </Stack>
       </Collapsible>
+      <Separator />
+      <Stack gap="xs">
+        <Heading level={2}>Claude status line</Heading>
+        <ConsoleLineRow />
+        <ConsoleLineReason />
+        <NoteLine at="consoleLine" />
+        {STATUS_LINE_SETTINGS.map((spec) => <SettingRow key={spec.key} spec={spec} values={values} />)}
+      </Stack>
       <Text size="xs" muted>
         The same settings are on Orca's Settings page under Plugins → Auto Hand-off.
       </Text>
@@ -657,22 +776,35 @@ function SettingsView() {
   )
 }
 
-/** Claude only: the console status line is per workspace, so the switch names the focused one. */
+/** Claude only: the console status line is per workspace, so the switch names the focused one.
+ *  A placeholder while it is read, so the section does not jump; a line when it could not be. */
 function ConsoleLineRow() {
   const state = read(consoleLine)
-  if (!state) return null
+  if (state === undefined) return <Skeleton shape="text" lines={1} label="Loading status line" />
+  if (state === null) {
+    return (
+      <Text size="xs" muted>
+        Couldn't read the status line for this workspace. It updates when you switch workspaces.
+      </Text>
+    )
+  }
   return (
     <Row gap="xs" align="center">
       <Switch
         label="Status line"
         checked={state.installed}
-        disabled={read(busy) !== null || !state.workspace}
+        disabled={isBusy('consoleLine') || !state.workspace}
         onChange={(enabled: boolean) =>
-          act('consoleLine', async () => {
-            const next = await plugin.request('rotator.consoleLine', { enabled })
-            set(consoleLine, next)
-            return next.message
-          })
+          act(
+            'consoleLine',
+            async () => {
+              const next = await plugin.request('rotator.consoleLine', { enabled })
+              set(consoleLine, next)
+              return next.message
+            },
+            undefined,
+            'consoleLine'
+          )
         }
       />
     </Row>
@@ -693,6 +825,7 @@ function ConsoleLineReason() {
 function ServiceSection({ provider, snap, now }: { provider: Provider; snap: Snapshot; now: number }) {
   const seats = snap.seats.filter((s) => s.provider === provider)
   const on = snap.services?.[provider] !== false
+  const name = PROVIDER_NAME[provider]
   // Ready means there is room to hand off to: a limited account (cooling down) and a drained one
   // (10 % or less left in a window) are not, and are counted apart.
   const states = seats.map((s) => seatStatus(s, now).word)
@@ -712,18 +845,21 @@ function ServiceSection({ provider, snap, now }: { provider: Provider; snap: Sna
     ? seatStatus(active, now)
     : { tone: rank.find((t) => seats.some((s) => seatStatus(s, now).tone === t)) ?? 'neutral', word: '', filled: false, dim: true }
   // The service of the agent the user is working with (see `Snapshot.focused`) is outlined in
-  // the accent so it stands out from the other services at a glance.
+  // the accent so it stands out from the other services at a glance. No wash behind any service:
+  // colour is kept for state, and the brand tile carries the brand.
   const focused = snap.focused === provider
   const order = snap.order?.[provider]
+  const sorted = order ? [...seats].sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key)) : [...seats].sort(seatOrder(now))
   return (
-    <Box background={BRAND_TINT[provider]} border={focused ? 'accent' : undefined} radius="lg" padding="sm" gap="xs">
-      <Row justify="between" align="center" gap="sm">
+    <Box border={focused ? 'accent' : true} radius="lg" padding="sm" gap="xs">
+      {/* One header line: the service on the left, how many accounts have room on the right. */}
+      <Row justify="between" align="center" gap="sm" wrap>
         <Row gap="xs" align="center">
           <Box width={12} height={12} shrink={false}>
             <Image src={brandMark(provider)} alt="" size="full" fit="contain" />
           </Box>
           <Text size="xs" weight="semibold" muted>
-            {PROVIDER_NAME[provider].toUpperCase()}
+            {name.toUpperCase()}
           </Text>
           {/* Right after the service name: the service of the agent in the focused terminal. */}
           {focused ? (
@@ -732,29 +868,6 @@ function ServiceSection({ provider, snap, now }: { provider: Provider; snap: Sna
             </Text>
           ) : null}
         </Row>
-      </Row>
-      {/* The same words as the switch at the top, for this service alone, on a line of its own
-          (beside the service name they would not fit). With one account there is nothing to
-          switch to, so no switch, unless it was turned off elsewhere (Orca's Settings page): then
-          it is shown, so it can be seen and turned on again. Not while every service only counts
-          as off (`Snapshot.held`): nobody turned it off, and the callout at the top says why. */}
-      {!snap.held && (seats.length > 1 || !on) ? (
-        <Switch
-          key={`auto-${provider}`}
-          label="Automatic hand-off"
-          checked={on}
-          disabled={read(busy) !== null}
-          onChange={(enabled: boolean) =>
-            act(`service:${provider}`, async () => {
-              const { services } = await plugin.request('rotator.setService', { provider, enabled })
-              const current = read(snapshot)
-              if (current) show({ ...current, services })
-              return `${PROVIDER_NAME[provider]}: automatic hand-off ${enabled ? 'on' : 'off'}`
-            })
-          }
-        />
-      ) : null}
-      <Row justify="between" align="center" gap="sm">
         <Row gap="xs" align="center">
           {/* The service light: it follows the account in use, as the summary beside it does. */}
           <StatusDot tone={light.tone} filled={light.filled} dim={light.dim} />
@@ -762,30 +875,57 @@ function ServiceSection({ provider, snap, now }: { provider: Provider; snap: Sna
             {summary}
           </Text>
         </Row>
-        {provider === 'claude' ? <ConsoleLineRow /> : null}
       </Row>
-      {provider === 'claude' ? <ConsoleLineReason /> : null}
-      {/* The status line's own setting sits with its switch, while the line is on. */}
-      {provider === 'claude' && read(consoleLine)?.installed && read(settings)
-        ? STATUS_LINE_SETTINGS.map((spec) => <SettingRow key={spec.key} spec={spec} values={read(settings)!} />)
-        : null}
+      {provider === 'antigravity' && seats.length < 2 ? (
+        <Text muted size="xs">
+          To add another Antigravity account: save the current sign-in in Orca Settings → AI Provider Accounts, sign in with the other account in Antigravity, save it there too, then refresh.
+        </Text>
+      ) : null}
+      {/* This service alone. With one account there is nothing to switch to, so no switch,
+          unless it was turned off elsewhere (Orca's Settings page): then it is shown, so it can be
+          turned on again. Not while every service only counts as off (`Snapshot.held`): nobody
+          turned it off, and the callout at the top says why. */}
+      {!snap.held && (seats.length > 1 || !on) ? (
+        <Switch
+          key={`auto-${provider}`}
+          label={`Automatic hand-off for ${name}`}
+          checked={on}
+          disabled={isBusy(`service:${provider}`)}
+          onChange={(enabled: boolean) =>
+            act(`service:${provider}`, async () => {
+              const { services } = await plugin.request('rotator.setService', { provider, enabled })
+              const current = read(snapshot)
+              if (current) show({ ...current, services })
+              return `${name}: automatic hand-off ${enabled ? 'on' : 'off'}`
+            })
+          }
+        />
+      ) : null}
       {!on && !snap.held ? (
-        <Callout tone="warning" title={`Automatic hand-off for ${PROVIDER_NAME[provider]} is off`}>
-          Sessions are not handed off and limits are not handled. Turn Automatic hand-off on for {PROVIDER_NAME[provider]} to resume.
-        </Callout>
+        <Text size="xs" tone="warning">
+          {`Automatic hand-off for ${name} is off: sessions are not handed off and limits are not handled.`}
+        </Text>
       ) : null}
       {/* "Hand off to this account" moves the session in the focused terminal, so only the
-          service of that terminal's agent offers it. */}
-      {/* Custom order: the accounts in that order, with arrows to change it; otherwise in use first, then by room. */}
-      {(order ? [...seats].sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key)) : [...seats].sort(seatOrder(now))).map((s, i, all) => (
-        <SeatCard
-          key={s.key}
-          seat={s}
-          now={now}
-          switchable={focused && seats.length > 1}
-          skippable={seats.length > 1}
-          {...(order && all.length > 1 ? { place: { first: i === 0, last: i === all.length - 1 } } : {})}
-        />
+          service of that terminal's agent offers it; the others say how to get it. */}
+      {!focused && seats.length > 1 ? (
+        <Text size="xs" muted>
+          {`To hand off by hand, focus a ${name} terminal.`}
+        </Text>
+      ) : null}
+      {/* Custom order: the accounts in that order, with arrows to change it; otherwise in use
+          first, then by room. Rows split by hairlines, not cards inside the block. */}
+      {sorted.map((s, i, all) => (
+        <Stack key={s.key} gap="none">
+          <Separator />
+          <SeatCard
+            seat={s}
+            now={now}
+            switchable={focused && seats.length > 1}
+            skippable={seats.length > 1}
+            {...(order && all.length > 1 ? { place: { first: i === 0, last: i === all.length - 1 } } : {})}
+          />
+        </Stack>
       ))}
     </Box>
   )
@@ -797,32 +937,216 @@ function Accounts({ snap }: { snap: Snapshot }) {
   const providers = PROVIDERS.filter((p) => snap.seats.some((s) => s.provider === p)).sort(
     (a, b) => Number(b === snap.focused) - Number(a === snap.focused)
   )
+  // Accounts belong to the Orca that runs the agent: for a project on a paired server the tab
+  // shows that server's accounts and says so, since they differ from this computer's.
+  const where = (
+    <>
+      {snap.server ? (
+        <Text size="xs" muted>
+          This project runs on Orca server {snap.server}; the accounts below are that server's.
+        </Text>
+      ) : null}
+      {snap.sshHost ? (
+        <Callout tone="warning" title={`This project runs on SSH target ${snap.sshHost}`}>
+          Orca manages no accounts there: its agents use that machine's own login, so the accounts below do not apply to it and its sessions are left alone.
+        </Callout>
+      ) : null}
+    </>
+  )
   if (providers.length === 0) {
     return (
-      <EmptyState title="No accounts" description="Add one in the terminal, then refresh." icon="agent">
-        <Code>orca account add</Code>
-        <Button size="sm" variant="outline" icon="refresh" disabled={read(busy) !== null} onPress={() => act('refresh', () => load(true))}>
-          Refresh
-        </Button>
-      </EmptyState>
+      <Stack gap="md">
+        {where}
+        <EmptyState title="No accounts" description="Manage sign-ins in Orca Settings → AI Provider Accounts." icon="agent">
+          <Button size="sm" variant="outline" icon="refresh" disabled={isBusy('refresh')} onPress={() => act('refresh', () => load(true))}>
+            Refresh
+          </Button>
+        </EmptyState>
+      </Stack>
     )
   }
-  const notLive = snap.seats.some((s) => s.usage.source !== undefined && s.usage.source !== 'live' && s.usage.reason !== 'no-usage-api')
   return (
     <Stack gap="md">
+      {where}
       {providers.map((p) => (
         <ServiceSection key={p} provider={p} snap={snap} now={now} />
       ))}
-      {notLive ? (
-        <Text muted size="xs">
-          Orca refreshes accounts that are not in use when its usage view is open or right after the account in use changes; until then the last reading is shown.
+    </Stack>
+  )
+}
+
+// ---- live quota ---------------------------------------------------------------------------
+
+/** An account that can be checked directly: one saved in Orca (not the agent's own login). */
+const checkable = (s: SeatRow): boolean => s.accountId !== 'system'
+
+/** One account's direct check: on (and how it went), off by hand, or not available (and why).
+ *  `button` is what the row offers: Turn off, Turn on, or nothing (a check cannot serve it). */
+type QuotaState = { word: string; tone: Tone; dim: boolean; filled: boolean; detail?: string; button?: 'off' | 'on' }
+function quotaState(seat: SeatRow): QuotaState {
+  const name = PROVIDER_NAME[seat.provider]
+  if (seat.quotaUnavailable) return { word: 'Not available', tone: 'neutral', dim: true, filled: false, detail: capital(seat.quotaUnavailable) }
+  if (seat.quotaOff || !seat.quotaLinked) {
+    // Off by hand: stays off. Neither on nor off: turned on at the next read.
+    return seat.quotaOff ? { word: 'Off', tone: 'neutral', dim: true, filled: false, button: 'on' } : { word: 'Starting', tone: 'neutral', dim: true, filled: false }
+  }
+  const on = (s: Omit<QuotaState, 'button' | 'filled'>): QuotaState => ({ ...s, filled: true, button: 'off' })
+  switch (seat.directQuotaIssue?.reason) {
+    case undefined:
+      break
+    case 'rate-limited':
+      return on({ word: 'Rate-limited', tone: 'warning', dim: false })
+    case 'stale-token':
+      return on({ word: 'Sign-in expired', tone: 'warning', dim: false, detail: `Updates once ${name} renews it, or sign in again in Orca.` })
+    case 'sign-in':
+      return on({ word: 'Sign-in needed', tone: 'warning', dim: false, detail: 'Sign in to this account again in Orca.' })
+    case 'native-sign-in-required':
+      return on({ word: 'Sign-in needed', tone: 'warning', dim: false, detail: `Sign in to this account in ${name} first.` })
+    case 'no-usage-api':
+      return { word: 'Not available', tone: 'neutral', dim: true, filled: false, detail: `${name} offers no direct check.` }
+    default:
+      return on({ word: 'Check failed', tone: 'warning', dim: false })
+  }
+  const { source, origin } = seat.usage
+  if (origin && origin !== 'pane') return on(source === 'live' ? { word: 'Live', tone: 'success', dim: false } : { word: 'Checked', tone: 'neutral', dim: true })
+  return on({ word: 'Pending', tone: 'neutral', dim: true })
+}
+
+/** Accounts whose direct check is on and needs a look, for the tab's label. */
+function quotaIssues(snap: Snapshot): number {
+  return snap.seats.filter((s) => checkable(s) && quotaState(s).tone === 'warning').length
+}
+
+/** One account: its name, the state of its direct check, and Turn off or Turn on; a second line
+ *  only when there is something to say (why not, what to do, or when it retries). */
+function QuotaRow({ seat, now }: { seat: SeatRow; now: number }) {
+  const state = quotaState(seat)
+  const issue = seat.directQuotaIssue
+  const checkedAt = state.word === 'Live' || state.word === 'Checked' ? seat.usage.asOf : undefined
+  const retryAt = issue?.reason === 'rate-limited' && issue.retryAt > now ? issue.retryAt : undefined
+  return (
+    <Stack gap="none">
+      <Row justify="between" align="center" gap="sm">
+        <Row gap="xs" align="center">
+          <StatusDot tone={state.tone} filled={state.filled} dim={state.dim} />
+          <Text size="sm" truncate>
+            {seat.label}
+          </Text>
+        </Row>
+        <Row gap="xs" align="center">
+          <Text size="xs" tone={state.tone} muted={state.dim}>
+            {state.word}
+            {checkedAt ? (
+              <>
+                {' · '}
+                <RelativeTime at={checkedAt} format="short" muted />
+              </>
+            ) : null}
+          </Text>
+          {state.button ? (
+            <Button
+              size="xs"
+              variant={state.button === 'on' ? 'outline' : 'ghost'}
+              tooltip={state.button === 'off' ? 'Stop checking this account directly. It stays off until you turn it on.' : "Check this account's usage directly again"}
+              disabled={isBusy(`quotaLink:${seat.key}`)}
+              onPress={() =>
+                act(`quotaLink:${seat.key}`, async () => {
+                  show(await plugin.request('rotator.linkQuota', { seatKey: seat.key, linked: state.button === 'on' }))
+                })
+              }
+            >
+              {state.button === 'off' ? 'Turn off' : 'Turn on'}
+            </Button>
+          ) : null}
+        </Row>
+      </Row>
+      {state.detail || retryAt ? (
+        <Text size="xs" muted>
+          {state.detail ?? null}
+          {retryAt ? (
+            <>
+              {state.detail ? ' ' : ''}Retries <RelativeTime at={retryAt} muted />.
+            </>
+          ) : null}
         </Text>
       ) : null}
     </Stack>
   )
 }
 
+/** Live Quota: ask the providers for usage directly. Every saved account a check can serve is on
+ *  by itself (the daemon's `quotaStatus`); Turn off is remembered. One line of why, one button
+ *  for all, then one row per account. The numbers stay on the Accounts tab. */
+function QuotaView({ snap }: { snap: Snapshot }) {
+  const now = Date.now()
+  const seats = snap.seats.filter(checkable)
+  if (snap.server) {
+    return (
+      <EmptyState
+        title="Not for a remote project"
+        description={`This project runs on Orca server ${snap.server}. Direct checks work for accounts on this computer.`}
+        icon="activity"
+      />
+    )
+  }
+  if (seats.length === 0) {
+    return <EmptyState title="No saved accounts" description="Save sign-ins in Orca Settings → AI Provider Accounts; they are checked directly once saved." icon="activity" />
+  }
+  const on = seats.filter((s) => quotaState(s).button === 'off').length
+  const checking = isBusy('directQuota')
+  const providers = PROVIDERS.filter((p) => seats.some((s) => s.provider === p))
+  return (
+    <Stack gap="md">
+      <Stack gap="xs">
+        <Row justify="between" align="center" gap="sm">
+          <Text size="sm" weight="medium">
+            {`${on} checked directly`}
+          </Text>
+          <Button size="xs" variant="outline" icon="refresh" disabled={on === 0 || checking} onPress={() => act('directQuota', () => load(true, true))}>
+            {checking ? 'Checking…' : 'Check now'}
+          </Button>
+        </Row>
+        <Text size="xs" muted>
+          Saved accounts are checked with their provider in the background, so accounts not in use stay current too. The numbers show on Accounts.
+        </Text>
+      </Stack>
+      {providers.map((p) => (
+        <Stack key={p} gap="xs">
+          <Row gap="xs" align="center">
+            <Box width={12} height={12} shrink={false}>
+              <Image src={brandMark(p)} alt="" size="full" fit="contain" />
+            </Box>
+            <Text size="xs" weight="semibold" muted>
+              {PROVIDER_NAME[p].toUpperCase()}
+            </Text>
+          </Row>
+          {seats
+            .filter((s) => s.provider === p)
+            .map((s) => (
+              <Stack key={s.key} gap="xs">
+                <Separator />
+                <QuotaRow seat={s} now={now} />
+              </Stack>
+            ))}
+        </Stack>
+      ))}
+    </Stack>
+  )
+}
+
 // ---- history ------------------------------------------------------------------------------
+
+/** The day an entry belongs to, as a heading: Today, Yesterday, then the weekday and date. */
+function dayLabel(at: number, now: number): string {
+  const start = (t: number) => {
+    const d = new Date(t)
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  }
+  const days = Math.round((start(now) - start(at)) / 86_400_000)
+  if (days <= 0) return 'Today'
+  if (days === 1) return 'Yesterday'
+  return new Date(at).toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })
+}
 
 function History({ snap }: { snap: Snapshot }) {
   const label = (key: string | undefined) => snap.seats.find((s) => s.key === key)?.label ?? key ?? ''
@@ -830,47 +1154,59 @@ function History({ snap }: { snap: Snapshot }) {
   if (entries.length === 0) {
     return <EmptyState title="No hand-offs yet" description="Hand-offs of the last 7 days appear here." icon="activity" />
   }
+  const now = Date.now()
   return (
     <Stack gap="xs">
       <Text size="xs" muted>
         {`Last 7 days · ${entries.length} ${entries.length === 1 ? 'entry' : 'entries'}`}
       </Text>
-      {/* The whole tab: the panel scrolls, not a box of its own. */}
+      {/* The whole tab: the panel scrolls, not a box of its own. Entries under their day. */}
       <Stack gap="none">
-        {entries.map((h, i) => (
-          <Stack key={`${h.at}-${i}`} gap="none">
-            {i > 0 ? <Separator /> : null}
-            <Box paddingY="sm" gap="none">
-              <Row justify="between" align="center" gap="sm">
-                <Row gap="xs" align="center" wrap>
-                  <Text size="sm" weight="medium">
-                    {PROVIDER_NAME[h.provider] ?? h.provider} · {REASON_WORDS[h.reason] ?? h.reason}
+        {entries.map((h, i) => {
+          const day = dayLabel(h.at, now)
+          const first = i === 0 || dayLabel(entries[i - 1]!.at, now) !== day
+          return (
+            <Stack key={`${h.at}-${i}`} gap="none">
+              {first ? (
+                <Box paddingY={i === 0 ? 'none' : 'sm'}>
+                  <Text size="xs" weight="semibold" muted>
+                    {day}
                   </Text>
-                  <Badge tone={RESULT_TONE[h.result] ?? 'neutral'}>{resultWords(h)}</Badge>
+                </Box>
+              ) : null}
+              <Separator />
+              <Box paddingY="sm" gap="none">
+                <Row justify="between" align="center" gap="sm">
+                  <Row gap="xs" align="center" wrap>
+                    <Text size="sm" weight="medium">
+                      {PROVIDER_NAME[h.provider] ?? h.provider} · {REASON_WORDS[h.reason] ?? h.reason}
+                    </Text>
+                    <Badge tone={RESULT_TONE[h.result] ?? 'neutral'}>{resultWords(h)}</Badge>
+                  </Row>
+                  <RelativeTime at={h.at} format="short" muted />
                 </Row>
-                <RelativeTime at={h.at} format="short" muted />
-              </Row>
-              <Text size="xs" muted truncate>
-                {h.to && h.to !== h.from ? `${label(h.from)} → ${label(h.to)}` : label(h.from)}
-              </Text>
-              {h.why ? <Text size="xs">{capital(h.why)}</Text> : null}
-              {h.detail ? (
-                <Text size="xs" muted>
-                  {h.detail}
+                <Text size="xs" muted truncate>
+                  {h.to && h.to !== h.from ? `${label(h.from)} → ${label(h.to)}` : label(h.from)}
                 </Text>
-              ) : null}
-              {/* Unsent text that went with the session and could not be put back: kept whole, to copy. */}
-              {h.unsent ? (
-                <Stack gap="xs">
-                  <Text size="xs" tone="warning">
-                    Your unsent text, not put back:
+                {h.why ? <Text size="xs">{capital(h.why)}</Text> : null}
+                {h.detail ? (
+                  <Text size="xs" muted>
+                    {h.detail}
                   </Text>
-                  <Code block>{h.unsent}</Code>
-                </Stack>
-              ) : null}
-            </Box>
-          </Stack>
-        ))}
+                ) : null}
+                {/* Unsent text that went with the session and could not be put back: kept whole, to copy. */}
+                {h.unsent ? (
+                  <Stack gap="xs">
+                    <Text size="xs" tone="warning">
+                      Your unsent text, not put back:
+                    </Text>
+                    <Code block>{h.unsent}</Code>
+                  </Stack>
+                ) : null}
+              </Box>
+            </Stack>
+          )
+        })}
       </Stack>
     </Stack>
   )
@@ -938,12 +1274,12 @@ function Waiting({ snap }: { snap: Snapshot }) {
                 <Button
                   size="sm"
                   variant="ghost"
-                  disabled={read(busy) !== null}
+                  disabled={moving()}
                   onPress={() => notNow(w.terminalId)}
                 >
                   Not now
                 </Button>
-                <Button size="sm" variant="outline" disabled={read(busy) !== null} onPress={() => handOffNow(w.terminalId)}>
+                <Button size="sm" variant="outline" disabled={moving()} onPress={() => handOffNow(w.terminalId)}>
                   Hand off now
                 </Button>
               </Row>
@@ -984,20 +1320,21 @@ function Waiting({ snap }: { snap: Snapshot }) {
                 <Button
                   size="xs"
                   variant="ghost"
-                  disabled={read(busy) !== null}
+                  disabled={moving()}
                   onPress={() => notNow(w.terminalId)}
                 >
                   Not now
                 </Button>
               ) : null}
               {w.activeSince !== undefined ? (
-                <Button size="xs" variant="outline" disabled={read(busy) !== null} onPress={() => handOffNow(w.terminalId)}>
+                <Button size="xs" variant="outline" disabled={moving()} onPress={() => handOffNow(w.terminalId)}>
                   Hand off now
                 </Button>
               ) : null}
               <Button
                 size="xs"
                 variant="ghost"
+                disabled={moving()}
                 onPress={() => act(`cancel:${w.terminalId}`, async () => {
                   await plugin.request('rotator.cancelWaiting', { terminalId: w.terminalId })
                 })}
@@ -1013,145 +1350,37 @@ function Waiting({ snap }: { snap: Snapshot }) {
   )
 }
 
-/** Local HTTP proxy state & latency bench results, loaded when the Proxy tab opens. */
-const proxyState = atom<{ running: boolean; host: string; port: number; providers: any[] } | null>(null)
-const benchResults = atom<{ id: string; name: string; kind: string; latencyMs: number; band: string; ok: boolean; error?: string }[] | null>(null)
-
-function loadProxy(): Promise<void> {
-  return plugin
-    .request('rotator.proxyStatus', {})
-    .then((st) => set(proxyState, st), () => undefined)
-}
-
-function ProxyView() {
-  const st = read(proxyState)
-  const bench = read(benchResults)
-  if (st === null) {
-    void loadProxy()
-    return <Skeleton shape="text" lines={4} label="Loading proxy status" />
-  }
-  return (
-    <Stack gap="md">
-      <Row justify="between" align="center" gap="sm">
-        <Stack gap="xs">
-          <Text weight="semibold">Local HTTP Failover Proxy</Text>
-          <Text size="xs" muted>
-            {st.running ? `Listening on http://${st.host}:${st.port}` : 'Stopped (opt-in for API-key & relay providers)'}
-          </Text>
-        </Stack>
-        <Row gap="xs">
-          <Button
-            size="sm"
-            variant={st.running ? 'ghost' : 'solid'}
-            disabled={read(busy) !== null}
-            onPress={() =>
-              act('proxy', async () => {
-                const next = st.running ? await plugin.request('rotator.proxyStop', {}) : await plugin.request('rotator.proxyStart', {})
-                set(proxyState, next)
-                return next.running ? `Proxy started on http://${next.host}:${next.port}` : 'Proxy stopped'
-              })
-            }
-          >
-            {st.running ? 'Stop' : 'Start'}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={read(busy) !== null || st.providers.length === 0}
-            onPress={() =>
-              act('bench', async () => {
-                const res = await plugin.request('rotator.bench', {})
-                set(benchResults, res.results)
-                return `Benchmarked ${res.results.length} providers`
-              })
-            }
-          >
-            Bench
-          </Button>
-        </Row>
-      </Row>
-      {st.providers.length === 0 ? (
-        <EmptyState
-          title="No API-key providers configured"
-          description="Add relay or API-key endpoints with `oah provider add <anthropic|openai> <name> <baseUrl> <apiKey>`."
-        />
-      ) : (
-        <Stack gap="sm">
-          {st.providers.map((p: any) => {
-            const b = bench?.find((x) => x.id === p.id)
-            const tone: Tone = p.circuit === 'open' ? 'danger' : p.circuit === 'half_open' ? 'warning' : 'success'
-            return (
-              <Box key={p.id} border radius="md" padding="sm">
-                <Row justify="between" align="center" gap="sm">
-                  <Stack gap="xs">
-                    <Text weight="semibold">{p.name}</Text>
-                    <Text size="xs" muted>
-                      {p.kind} · #{p.priority} · {p.baseUrl}
-                    </Text>
-                  </Stack>
-                  <Row gap="xs" align="center">
-                    {b ? <Badge tone={b.band === 'fast' ? 'success' : b.band === 'ok' ? 'warning' : 'danger'}>{b.ok ? `${b.latencyMs}ms` : 'err'}</Badge> : null}
-                    <Badge tone={tone}>{p.circuit}</Badge>
-                  </Row>
-                </Row>
-              </Box>
-            )
-          })}
-        </Stack>
-      )}
-    </Stack>
-  )
-}
-
 export default function Panel() {
   const snap = read(snapshot)
   if (!snap) return <Skeleton shape="text" lines={6} label="Loading accounts" />
-  const note = read(message)
+  const stored = read(tab)
+  const current = (TABS as readonly string[]).includes(stored) ? stored : 'accounts'
+  // The History tab counts only what needs a look: hand-offs that failed.
+  const failed = snap.history.filter((h) => h.result === 'failed').length
+  // Live Quota counts only what needs a look: linked accounts whose check is in trouble.
+  const issues = quotaIssues(snap)
   return (
     <Stack gap="md">
       <Row justify="between" align="center" gap="sm">
         {/* On a narrow panel the badge goes under the title, whole, rather than split both. */}
         <Row gap="sm" align="center" wrap>
           <Heading>Auto Hand-off</Heading>
-          {/* The settings in one pill (Orca's Badge colours only a dot, so it is drawn). One badge, coloured by what is happening now: amber while automatic hand-off is paused,
-              green while early hand-offs are on (Early when away, and the user is away), grey while
-              sessions move only at a limit (At limit, or the user is at Orca). */}
-          {/* Not while every service only counts as off (`Snapshot.held`): the callout below says
-              what is happening, and a green "on" beside it would say the opposite. */}
+          {/* What automatic hand-off is doing now, in one pill (Orca's Badge colours only a dot,
+              so it is drawn): amber while paused, green while early hand-offs are on or wait for
+              the user to step away, grey while sessions move only at a limit. Not while every
+              service only counts as off (`Snapshot.held`): the callout below says what is
+              happening, and a green "on" beside it would say the opposite. */}
           {snap.paused || (snap.mode && !snap.held) ? (
             (() => {
-              const early = !snap.paused && !snap.atLimitOnly && !snap.userHere
-              // Early when away, waiting for the user to leave: green, without the solid green border
-              // it has once early hand-offs are on.
-              const waiting = !snap.paused && !snap.atLimitOnly && !!snap.userHere
-              const tone: Tone = snap.paused ? 'warning' : early || waiting ? 'success' : 'neutral'
-              // A mark says the state, the colour backs it: ● early hand-offs on, ◐ waiting for the
-              // user to leave, ○ only at a limit, ■ paused.
-              const mark: keyof typeof BADGE_SYMBOL | 'here' = snap.paused ? 'paused' : early ? 'away' : snap.atLimitOnly ? 'limit' : 'here'
-              // Early when away: the style, and whether early hand-offs wait for the user to leave, or are on.
-              const state = snap.atLimitOnly ? 'At limit' : waiting ? 'Early when away · waiting' : 'Early when away · on'
-              // (A mode this version does not know, from a worker of another version: the state alone.)
-              const mode = snap.mode ? MODE_NAME[snap.mode] : undefined
-              const label = snap.paused ? 'Paused' : mode ? `${mode} · ${state}` : state
+              const state = badgeState(snap)
               return (
-                <Box background={tone === 'neutral' ? 'muted' : tone} border={tone === 'neutral' || waiting ? true : tone} radius="full" paddingX="sm" shrink={false}>
-                  {/* Every state the same: a fixed slot for the symbol, then the text, so the text
-                      starts at the same place whatever the state. */}
+                <Box background={state.tone === 'neutral' ? 'muted' : state.tone} border={state.plain ? true : state.tone} radius="full" paddingX="sm" shrink={false}>
                   <Row gap="xs" align="center">
-                    {/* One fixed slot for every mark, so the text starts at the same place. */}
-                    <Box width={12} height={14} shrink={false} align="center" justify="center">
-                      {mark === 'here' ? (
-                        <Box width={11} height={11}>
-                          <Image src={HERE_MARK} alt="" size="full" fit="contain" />
-                        </Box>
-                      ) : (
-                        <Text size="xs" tone={tone}>
-                          {BADGE_SYMBOL[mark]}
-                        </Text>
-                      )}
-                    </Box>
-                    <Text size="xs" weight="semibold" tone={tone}>
-                      {label}
+                    <Text size="xs" tone={state.tone}>
+                      {BADGE_SYMBOL[state.mark]}
+                    </Text>
+                    <Text size="xs" weight="semibold" tone={state.tone}>
+                      {state.label}
                     </Text>
                   </Row>
                 </Box>
@@ -1161,18 +1390,19 @@ export default function Panel() {
         </Row>
         <IconButton
           icon="refresh"
-          label="Refresh usage"
+          label="Refresh usage from Orca"
           variant="ghost"
           size="sm"
-          disabled={read(busy) !== null}
+          disabled={isBusy('refresh')}
           onPress={() => act('refresh', () => load(true))}
         />
       </Row>
 
       <Row justify="between" align="center" gap="sm">
         <Switch
-          label="Automatic hand-off"
+          label="Automatic hand-off, all services"
           checked={!snap.paused}
+          disabled={isBusy('pause')}
           onChange={(on: boolean) =>
             act('pause', async () => {
               await plugin.request('rotator.pause', { paused: !on })
@@ -1186,18 +1416,6 @@ export default function Panel() {
         ) : null}
       </Row>
 
-      {/* Accounts belong to the Orca that runs the agent: for a project on a paired server the
-          panel shows that server's accounts and says so, since they differ from this computer's. */}
-      {snap.server ? (
-        <Text size="xs" muted>
-          This project runs on Orca server {snap.server}; the accounts below are that server's.
-        </Text>
-      ) : null}
-      {snap.sshHost ? (
-        <Callout tone="warning" title={`This project runs on SSH target ${snap.sshHost}`}>
-          Orca manages no accounts there: its agents use that machine's own login, so the accounts below do not apply to it and its sessions are left alone.
-        </Callout>
-      ) : null}
       {/* Every service counts as off though nobody turned one off: why, and that it ends by itself. */}
       {snap.held && HELD_WORDS[snap.held] ? (
         <Callout tone="warning" title={HELD_WORDS[snap.held].title}>
@@ -1210,23 +1428,16 @@ export default function Panel() {
         </Callout>
       ) : null}
       <Waiting snap={snap} />
-      {note ? (
-        <Row justify="between" align="center" gap="sm">
-          <Text size="xs" muted>
-            {note}
-          </Text>
-          <IconButton icon="close" label="Dismiss" variant="ghost" size="xs" onPress={() => set(message, null)} />
-        </Row>
-      ) : null}
+      <NoteLine />
 
-      <Tabs label="View" value={read(tab)} onChange={(v: string) => set(tab, v)}>
+      <Tabs label="View" value={current} onChange={(v: string) => set(tab, v)}>
         <Tab value="accounts" label="Accounts">
           <Accounts snap={snap} />
         </Tab>
-        <Tab value="proxy" label="Proxy">
-          <ProxyView />
+        <Tab value="proxy" label={issues ? `Live Quota · ${issues}` : 'Live Quota'}>
+          <QuotaView snap={snap} />
         </Tab>
-        <Tab value="history" label={`History (${snap.history.length})`}>
+        <Tab value="history" label={failed ? `History · ${failed} failed` : 'History'}>
           <History snap={snap} />
         </Tab>
         <Tab value="settings" label="Settings">

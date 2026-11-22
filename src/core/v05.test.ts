@@ -3,13 +3,38 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { parseAccounts } from './accounts.ts'
-import { circuitState, exhausted, isEligible, pickNext } from './selector.ts'
+import { emptyUsageCache, observe, resolve } from './usage-cache.ts'
+import { buildChain, circuitState, exhausted, isEligible, pickNext } from './selector.ts'
 import { assess, wholeWindowPace } from './smart.ts'
 import { installStopFailureHook, isStopFailureHookInstalledIn, uninstallStopFailureHook } from './statusline.ts'
 import { DEFAULT_CONFIG, SMART_CONFIG, type Seat, type SeatHealth } from './types.ts'
 
 const HOUR = 3_600_000
 const WEEK = 7 * 24 * HOUR
+
+test('a newer direct Codex block survives a stale Orca reading until its reported reset', () => {
+  const now = 1_790_000_000_000
+  const reset = now + HOUR
+  const saved: Seat = {
+    key: 'codex:a', provider: 'codex', accountId: 'a', label: 'A', active: false,
+    usage: {
+      known: true, origin: 'codex-profile', updatedAt: now,
+      ordinaryUsageAllowed: false, rateLimitReachedType: 'weekly',
+      weekly: { usedPercent: 0, resetsAt: reset }
+    }
+  }
+  const cache = emptyUsageCache()
+  observe(cache, [saved], now, {})
+  const stale: Seat = { ...saved, usage: { known: true, weekly: { usedPercent: 0, resetsAt: reset } } }
+  observe(cache, [stale], now + 1000, {})
+  const before = resolve(stale, cache, now + 1000, WEEK, {})
+  assert.equal(before.source, 'cached')
+  assert.equal(before.ordinaryUsageAllowed, false)
+  assert.equal(exhausted({ ...stale, usage: before }, now + 1000), true)
+  const after = resolve(stale, cache, reset + 1000, WEEK, {})
+  assert.equal(after.source, 'projected')
+  assert.equal(after.ordinaryUsageAllowed, undefined)
+})
 
 test('circuitState transitions: closed -> open -> half_open -> closed, and pickNext prefers closed over half_open', () => {
   const now = 1_790_000_000_000
@@ -26,6 +51,26 @@ test('circuitState transitions: closed -> open -> half_open -> closed, and pickN
   }
   const picked = pickNext([s1, s2, s3], 'claude:a', health, DEFAULT_CONFIG, now)
   assert.equal(picked?.key, 'claude:c')
+})
+
+test('Antigravity hand-off picks another saved Antigravity account after a quota limit', () => {
+  const now = 1_790_000_000_000
+  const { seats, active } = parseAccounts({
+    antigravity: {
+      selectedAccountId: 'first',
+      accounts: [{ id: 'first' }, { id: 'backup' }],
+      currentAccount: { authMethod: 'consumer', identityKnown: false }
+    },
+    codex: { accounts: [{ id: 'other' }] },
+    rateLimits: {
+      antigravity: { status: 'ok', session: { usedPercent: 100, resetsAt: now + HOUR } }
+    }
+  })
+  const chain = buildChain(seats, 'antigravity', DEFAULT_CONFIG)
+  assert.deepEqual(chain.map((seat) => seat.key), ['antigravity:first', 'antigravity:backup'])
+  assert.equal(active.antigravity, 'antigravity:first')
+  assert.equal(exhausted(chain[0]!, now), true)
+  assert.equal(pickNext(chain, active.antigravity, {}, DEFAULT_CONFIG, now)?.key, 'antigravity:backup')
 })
 
 test('Codex ordinaryUsageAllowed: false marks seat exhausted even when secondary buckets are 0 %', () => {
