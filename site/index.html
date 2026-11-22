@@ -213,7 +213,7 @@ footer a{color:var(--fg-2)}
     </div>
 
     <div class="panel" aria-label="The quiet 3-tab OAH panel">
-      <div class="row" style="margin-bottom:6px"><strong>Automatic hand-off</strong><span class="toggle"></span></div>
+      <div class="row" style="margin-bottom:6px"><strong>OAH (Orca Auto Hand-off) v0.5.0</strong><span class="toggle"></span></div>
       <div class="row"><span class="state">Early hand-offs on</span><span style="color:var(--fg-3);font-size:.75rem">just now ↻</span></div>
       <div class="tabs"><b>Accounts</b><span>History</span><span>Settings</span></div>
       <div class="svc">
@@ -301,7 +301,7 @@ footer a{color:var(--fg-2)}
         <thead><tr><th>Provider</th><th>Direct Quota Source</th><th>Safeguards</th></tr></thead>
         <tbody>
           <tr><td>Claude</td><td>OAuth profile verification → Anthropic usage API</td><td>At most every 15 min. Expired sign-ins run Claude Code's own <code>claude -p /usage</code> so Claude Code renews them cleanly.</td></tr>
-          <tr><td>Codex</td><td><code>codex app-server</code> → <code>account/rateLimits/read</code></td><td>Verified by backend <code>accountId</code>; gates on <code>ordinaryUsageAllowed</code> (ignoring the <code>codex_bengalfox</code> Spark bucket).</td></tr>
+          <tr><td>Codex</td><td>Direct Codex usage API per managed profile</td><td>Verified by account ID; gates on <code>ordinaryUsageAllowed</code> (ignoring the <code>codex_bengalfox</code> Spark bucket).</td></tr>
           <tr><td>Antigravity</td><td>Google identity verification → Cloud Code quota API</td><td>Direct check for the account signed in on this Mac; falls back to Orca's cached readings for other saved profiles.</td></tr>
           <tr><td>OpenCode Go</td><td>OpenCode Go usage API</td><td>Reports rolling, weekly, and monthly windows.</td></tr>
           <tr><td>Devin</td><td>Devin status API</td><td>Reports daily (<code>day</code>) and weekly (<code>week</code>) windows.</td></tr>

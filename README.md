@@ -36,7 +36,7 @@ Orca is the primary source of usage (OAH reads Orca's local socket in ~1 ms, usi
 | Provider | Direct Quota Source | Notes |
 |---|---|---|
 | **Claude** | OAuth profile check → Anthropic usage API | If a saved sign-in is expired, OAH runs Claude Code's own `claude -p /usage` for that profile (at most every 15 min) so Claude Code renews it. OAH never writes the Keychain. |
-| **Codex** | `codex app-server` → `account/rateLimits/read` per managed `CODEX_HOME` | Verified by backend `accountId`; gates on `ordinaryUsageAllowed` (ignoring the `codex_bengalfox` Spark bucket). |
+| **Codex** | Direct Codex usage API per managed profile | Verified by account ID; gates on `ordinaryUsageAllowed` (ignoring the `codex_bengalfox` Spark bucket). |
 | **Antigravity** | Google identity check → Cloud Code quota API | Direct check for the account signed in on this Mac; falls back to Orca's cached readings for other saved profiles. |
 | **OpenCode Go** | OpenCode Go usage API | Reports rolling, weekly, and monthly windows. |
 | **Devin** | Devin status API | Reports daily (`day`) and weekly (`week`) windows. |
@@ -51,7 +51,7 @@ Turn **Live quota** off in Settings if you prefer usage strictly from Orca.
 - **Per-Model Weekly Cap Policy (`model_window_policy`):** Choose `fallback-model` (try `/model <next>` first), `rotate` (proactively rotate away on model weekly caps like Claude Fable and avoid accounts with 0% left in that bucket), or `ignore`.
 
 ### Quiet 3-Tab Orca Panel
-- **Minimal header:** The global **Automatic hand-off** switch sits alone at the top, with current state, reading age, and refresh icon directly below.
+- **Minimal header:** The global switch sits alone on the first line (`OAH (Orca Auto Hand-off) v0.5.0`), with current state, reading age, and refresh icon directly below.
 - **Accounts:** Monochrome, hairline-divided rows with one-line service headers, status beside each account name, and right-aligned actions (**Early hand off**, **End cooldown**). **Early hand off** moves the on-screen session and keeps automatic hand-off ON. The focused service follows tab switches within ~1 second.
 - **History:** Entries grouped by day (failed hand-offs highlighted in danger tone).
 - **Settings:** 6 core settings up front, grouped **Advanced** fine-tuning below, and explicit **Save / Undo** buttons for typed values.
@@ -114,8 +114,8 @@ You never need the command line for everyday use in Orca. Under the hood, OAH ru
 ## Permissions & Privacy
 
 - **Credentials stay with Orca and provider CLIs:** OAH never writes the macOS Keychain, never creates accounts, and never copies subscription tokens into its own config.
-- **Owner-only local storage (`~/.orca/oah/`):** Directory mode `0700`, files mode `0600`. `oah sync export` redacts API keys automatically.
-- **No shell interpolation:** Runs external CLIs (`orca`, `codex`, `claude`, `git`) via argument arrays only.
+- **Owner-only local storage (`~/.orca/oah/`):** Directory mode `0700`, files mode `0600`.
+- **No shell interpolation:** Runs external CLIs (`orca`, `claude`, `git`) via argument arrays only.
 
 ## Known Limitations
 
